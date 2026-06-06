@@ -104,6 +104,37 @@ python3 /path/to/agentic-factory/scripts/factory.py agent packet \
 Use `--format json` when another tool needs structured packet data. See
 [Agent Packets](agent-packets.md) for packet fields and runtime guidance.
 
+## Spawn Through Experimental Adapters
+
+Adapters are optional process-level bridges for runtimes that need to launch an
+external agent CLI with a packet file. Prefer Codex-native orchestration when
+available.
+
+Preview first:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py agent spawn \
+  --adapter custom \
+  --role builder \
+  --baton B-001 \
+  --command "my-agent run --prompt-file {packet}" \
+  --dry-run
+```
+
+Execute only after reviewing the packet, command, lock ownership, timeout, and
+workspace risk:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py agent spawn \
+  --adapter custom \
+  --role builder \
+  --baton B-001 \
+  --command "my-agent run --prompt-file {packet}" \
+  --experimental
+```
+
+Use [Agent Adapters](agent-adapters.md) for the full safety contract.
+
 ## Record Verification
 
 ```bash

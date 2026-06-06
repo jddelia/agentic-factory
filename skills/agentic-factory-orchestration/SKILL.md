@@ -55,8 +55,8 @@ user request, project docs, tests, risk surface, and local tool constraints.
    - `serial_single_agent`: use when delegation is unavailable, ambiguous, or
      unsafe.
    - `manual_protocol`: use for tests, demos, and human debugging.
-   - `adapter_spawn`: future/experimental only; do not use unless explicitly
-     configured.
+   - `adapter_spawn`: experimental process-level adapter; dry-run first and use
+     only when explicitly configured.
 3. Choose or confirm a compact configuration:
    - `work_mode`: default `balanced` unless the request clearly implies another
      mode.
@@ -90,9 +90,9 @@ enough signal, infer and proceed.
   evidence.
 - `manual_protocol`: human or test harness runs CLI commands directly to
   exercise the factory protocol.
-- `adapter_spawn`: reserved for future explicit adapters that launch external
-  agent CLI processes. Do not run process-level adapters unless the user or
-  project configuration explicitly authorizes them.
+- `adapter_spawn`: explicit experimental adapters that launch external agent
+  CLI processes from generated packets. Always dry-run first. Do not execute
+  unless the user or project configuration explicitly authorizes them.
 
 Read `docs/runtime-modes.md` when explaining or changing runtime behavior.
 
@@ -114,7 +114,8 @@ running arbitrary external agent processes:
 
 If worker capability or ownership is ambiguous, use `serial_single_agent` until
 the ambiguity is resolved. Do not spawn external agent CLI processes directly
-unless operating in an explicitly configured adapter mode.
+unless operating in an explicitly configured adapter mode, after a dry-run
+inspection.
 
 ## Delegation Protocol
 
@@ -265,6 +266,8 @@ acceptance.
 - Keep hard invariants explicit in every baton.
 - Keep Codex-native orchestration first when available; use other runtimes as
   compatibility modes.
+- Treat `factory.py agent spawn` as experimental and opt-in. Prefer packets
+  without process spawning when runtime safety is unclear.
 - If push/auth fails, keep local commits and record remote status.
 - If a design, browser, document, spreadsheet, GitHub, or other domain skill is
   explicitly named, use that skill for the relevant work.
@@ -279,3 +282,4 @@ acceptance.
   boundaries.
 - `../../docs/agent-packets.md`: portable packet generation and generic CLI
   delegation flow.
+- `../../docs/agent-adapters.md`: experimental process adapter safety contract.

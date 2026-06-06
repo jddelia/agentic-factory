@@ -63,6 +63,8 @@ handoff, review, and verification protocol with their own delegation features.
 When delegation is unavailable or unsafe, one agent can run the roles serially.
 Use [Agent Packets](agent-packets.md) when a non-Codex runtime needs a concrete
 role prompt for Builder, Reviewer, or Executive work.
+Use [Agent Adapters](agent-adapters.md) only when an experimental process-level
+bridge to an external agent CLI is explicitly desired.
 
 See [Runtime Modes](runtime-modes.md) for the full mode contract.
 

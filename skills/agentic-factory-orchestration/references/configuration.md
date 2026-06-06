@@ -79,7 +79,8 @@ instead of stalling silently.
 sub-agent capabilities are available. Use `agent_cli_subagents` only after
 confirming the host CLI's delegation, workspace, permission, and recovery
 semantics. Use `serial_single_agent` when delegation is unavailable or unclear.
-Treat `adapter_spawn` as future/experimental unless explicitly configured.
+Treat `adapter_spawn` as experimental and explicitly configured; dry-run before
+execution.
 
 ## User Involvement
 

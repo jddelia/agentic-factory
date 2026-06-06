@@ -36,6 +36,9 @@ Agent packets do not add tables. `factory.py agent packet` renders bounded
 views over existing run, baton, event, verification, review, lock, and config
 state.
 
+Agent adapters also do not add tables. `factory.py agent spawn` records adapter
+execution attempts through events.
+
 ## Tables
 
 ### `schema_migrations`
@@ -275,6 +278,8 @@ The CLI writes these event types directly:
 | `factory.resumed` | `resume` | Resume reason. | `reason`. |
 | `lock.acquired` | `lock acquire` | Lock holder summary. | `lock`. |
 | `lock.released` | `lock release` | Lock release summary. | `lock`. |
+| `agent.spawn.started` | `agent spawn` | Adapter, role, and start status. | `adapter`, `role`, `baton_id`, `packet_path`, `timeout_seconds`, `command_preview`. |
+| `agent.spawn.completed` | `agent spawn` | Adapter, role, and terminal status. | `adapter`, `role`, `baton_id`, `packet_path`, `timeout_seconds`, `command_preview`, `status`, `returncode`, `duration_ms`. |
 
 `event append` can write custom event types. Custom event names should be
 namespaced with dot notation, for example:
@@ -313,6 +318,9 @@ Read-only inspection commands use the same tables:
   current run.
 - `review list`: bounded query on `reviews` and `review_findings`, scoped by
   baton or current run.
+
+Adapter spawn commands write packet files under `.agentic-factory/packets/` by
+default. That directory is local workflow state and should not be committed.
 
 Project config is file-based, not stored in SQLite. See
 `docs/configuration.md` for `.agentic-factory/config.json`.

@@ -87,12 +87,16 @@ not the primary user experience.
 ### `adapter_spawn`
 
 This mode is reserved for future optional adapters that may launch external
-agent CLI processes. It is not part of the core runtime contract today.
+agent CLI processes. It is experimental and opt-in.
 
 Adapters should remain opt-in because process-level spawning has additional
 risks: authentication differences, sandbox mismatch, command hangs,
 unstructured output, cancellation complexity, shared-worktree collisions, and
 unclear credential inheritance.
+
+Use `factory.py agent spawn --dry-run` before execution, and require
+`--experimental` for real adapter runs. See [Agent Adapters](agent-adapters.md)
+for the full safety contract.
 
 ## Capability Preflight
 
@@ -140,4 +144,4 @@ Prefer modes in this order:
 2. `agent_cli_subagents` when the host CLI has clear, safe delegation support.
 3. `serial_single_agent` when delegation is unavailable or ambiguous.
 4. `manual_protocol` for tests, examples, and debugging.
-5. `adapter_spawn` only for future explicit adapters.
+5. `adapter_spawn` only for explicit experimental adapters.

@@ -202,14 +202,15 @@ Common failures:
 ## `factory.py agent`
 
 ```text
-usage: factory.py agent [-h] {packet} ...
+usage: factory.py agent [-h] {packet,spawn} ...
 
 positional arguments:
-  {packet}
-    packet    Generate a role packet for delegation.
+  {packet,spawn}
+    packet        Generate a role packet for delegation.
+    spawn         Experimentally spawn a packet through an adapter.
 
 options:
-  -h, --help  show this help message and exit
+  -h, --help      show this help message and exit
 ```
 
 ## `factory.py agent packet`
@@ -268,6 +269,90 @@ Common failures:
 - Unknown baton when `--baton` is supplied.
 - `--baton` is missing for Builder or Reviewer packets.
 - `--recent` is outside the allowed range.
+
+## `factory.py agent spawn`
+
+```text
+usage: factory.py agent spawn [-h] --adapter {codex-cli,custom} [--experimental] [--dry-run]
+                              --role {builder,executive,reviewer} [--baton BATON]
+                              [--recent RECENT] [--packet-format {json,markdown}]
+                              [--packet-dir PACKET_DIR] [--write-policy {auto,read-only,write}]
+                              [--allowed ALLOWED] [--restricted RESTRICTED]
+                              [--invariant INVARIANT] [--required-check REQUIRED_CHECK]
+                              [--non-goal NON_GOAL] [--command COMMAND]
+                              [--timeout-seconds TIMEOUT_SECONDS] [--output-limit OUTPUT_LIMIT]
+                              [--allow-unlocked] [--no-event] [--actor ACTOR]
+                              [--codex-bin CODEX_BIN] [--codex-model CODEX_MODEL]
+                              [--codex-profile CODEX_PROFILE]
+                              [--codex-sandbox {auto,read-only,workspace-write}]
+                              [--codex-approval {never,on-failure,on-request,untrusted}]
+                              [--codex-skip-git-repo-check]
+
+options:
+  -h, --help            show this help message and exit
+  --adapter {codex-cli,custom}
+  --experimental        Required to execute the adapter.
+  --dry-run             Write packet and print argv without execution.
+  --role {builder,executive,reviewer}
+  --baton BATON
+  --recent RECENT
+  --packet-format {json,markdown}
+  --packet-dir PACKET_DIR
+  --write-policy {auto,read-only,write}
+  --allowed ALLOWED     Allowed file or area; repeat or comma-separate.
+  --restricted RESTRICTED
+                        Restricted file or area; repeat or comma-separate.
+  --invariant INVARIANT
+                        Hard invariant to include.
+  --required-check REQUIRED_CHECK
+                        Required check to include.
+  --non-goal NON_GOAL   Non-goal to include.
+  --command COMMAND     Custom adapter command template; must include {packet}.
+  --timeout-seconds TIMEOUT_SECONDS
+  --output-limit OUTPUT_LIMIT
+  --allow-unlocked      Allow write-capable spawn without a held baton lock.
+  --no-event            Do not record agent.spawn events.
+  --actor ACTOR
+  --codex-bin CODEX_BIN
+  --codex-model CODEX_MODEL
+  --codex-profile CODEX_PROFILE
+  --codex-sandbox {auto,read-only,workspace-write}
+  --codex-approval {never,on-failure,on-request,untrusted}
+  --codex-skip-git-repo-check
+```
+
+Required arguments: `--adapter`, `--role`.
+
+Builder and Reviewer spawns also require `--baton`. Custom spawns require
+`--command` with a `{packet}` placeholder. Real execution requires
+`--experimental`; use `--dry-run` to preview without execution.
+
+Example dry run:
+
+```bash
+python3 scripts/factory.py agent spawn --adapter custom --role builder --baton B-001 --command "my-agent run --prompt-file {packet}" --dry-run
+```
+
+Example Codex CLI execution:
+
+```bash
+python3 scripts/factory.py agent spawn --adapter codex-cli --role builder --baton B-001 --experimental
+```
+
+Example output shape:
+
+```json
+{"status": "completed", "adapter": "custom", "packet_path": "...", "returncode": 0}
+```
+
+Common failures:
+
+- Missing `--experimental` for real execution.
+- Missing `{packet}` in a custom command.
+- Unknown baton or missing baton for Builder/Reviewer.
+- Write-capable spawn has no held baton lock and `--allow-unlocked` was not supplied.
+- Timeout returns status `timed_out` and exit code `124`.
+- Missing executable returns exit code `127`.
 
 ## `factory.py event`
 

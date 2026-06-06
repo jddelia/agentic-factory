@@ -364,6 +364,158 @@ class FactoryCliTest(unittest.TestCase):
             self.assertEqual(missing_baton.returncode, 2)
             self.assertIn("--baton is required", missing_baton.stderr)
 
+    def test_agent_spawn_custom_adapter_is_explicit_and_records_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual(self.run_cli(root, "init", "--run-id", "spawn").returncode, 0)
+            self.assertEqual(
+                self.run_cli(root, "baton", "create", "B-001", "--title", "Spawn baton").returncode,
+                0,
+            )
+            command = (
+                f"{sys.executable} -c "
+                "'import pathlib,sys; print(pathlib.Path(sys.argv[1]).read_text(encoding=\"utf-8\")[:24])' "
+                "{packet}"
+            )
+
+            preview = self.run_cli(
+                root,
+                "agent",
+                "spawn",
+                "--adapter",
+                "custom",
+                "--role",
+                "builder",
+                "--baton",
+                "B-001",
+                "--command",
+                command,
+                "--dry-run",
+            )
+            self.assertEqual(preview.returncode, 0, preview.stderr)
+            preview_payload = json.loads(preview.stdout)
+            self.assertEqual(preview_payload["status"], "dry_run")
+            self.assertFalse(preview_payload["events_recorded"])
+            self.assertTrue(Path(preview_payload["packet_path"]).is_file())
+            self.assertIn(str(root), preview_payload["command_preview"])
+
+            blocked = self.run_cli(
+                root,
+                "agent",
+                "spawn",
+                "--adapter",
+                "custom",
+                "--role",
+                "builder",
+                "--baton",
+                "B-001",
+                "--command",
+                command,
+            )
+            self.assertEqual(blocked.returncode, 2)
+            self.assertIn("pass --experimental", blocked.stderr)
+
+            executed = self.run_cli(
+                root,
+                "agent",
+                "spawn",
+                "--adapter",
+                "custom",
+                "--role",
+                "builder",
+                "--baton",
+                "B-001",
+                "--command",
+                command,
+                "--experimental",
+                "--timeout-seconds",
+                "10",
+            )
+            self.assertEqual(executed.returncode, 0, executed.stderr)
+            executed_payload = json.loads(executed.stdout)
+            self.assertEqual(executed_payload["status"], "completed")
+            self.assertEqual(executed_payload["returncode"], 0)
+            self.assertIn("# Agent Packet: Builder", executed_payload["stdout"])
+            events = json.loads(
+                self.run_cli(root, "events", "list", "--type", "agent.spawn.completed", "--json").stdout
+            )
+            self.assertEqual(events["count"], 1)
+            self.assertEqual(events["events"][0]["payload"]["status"], "completed")
+
+            missing_placeholder = self.run_cli(
+                root,
+                "agent",
+                "spawn",
+                "--adapter",
+                "custom",
+                "--role",
+                "builder",
+                "--baton",
+                "B-001",
+                "--command",
+                "echo no-packet",
+                "--dry-run",
+            )
+            self.assertEqual(missing_placeholder.returncode, 2)
+            self.assertIn("{packet}", missing_placeholder.stderr)
+
+    def test_agent_spawn_codex_cli_dry_run_and_lock_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual(self.run_cli(root, "init", "--run-id", "codex-spawn").returncode, 0)
+            self.assertEqual(
+                self.run_cli(root, "baton", "create", "B-001", "--title", "Codex spawn").returncode,
+                0,
+            )
+            dry_run = self.run_cli(
+                root,
+                "agent",
+                "spawn",
+                "--adapter",
+                "codex-cli",
+                "--role",
+                "builder",
+                "--baton",
+                "B-001",
+                "--dry-run",
+                "--codex-bin",
+                "codex-test",
+            )
+            self.assertEqual(dry_run.returncode, 0, dry_run.stderr)
+            payload = json.loads(dry_run.stdout)
+            self.assertEqual(payload["status"], "dry_run")
+            self.assertEqual(payload["command"][:2], ["codex-test", "exec"])
+            self.assertIn("--sandbox", payload["command"])
+            self.assertIn("workspace-write", payload["command"])
+
+            self.assertEqual(
+                self.run_cli(
+                    root,
+                    "baton",
+                    "handoff",
+                    "B-001",
+                    "--summary",
+                    "Release lock",
+                ).returncode,
+                0,
+            )
+            guarded = self.run_cli(
+                root,
+                "agent",
+                "spawn",
+                "--adapter",
+                "custom",
+                "--role",
+                "builder",
+                "--baton",
+                "B-001",
+                "--command",
+                "echo {packet}",
+                "--dry-run",
+            )
+            self.assertEqual(guarded.returncode, 2)
+            self.assertIn("requires a held lock", guarded.stderr)
+
     def test_project_config_controls_defaults_and_doctor(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

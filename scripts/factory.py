@@ -11,11 +11,13 @@ import argparse
 import copy
 import json
 import os
+import re
 import shlex
 from pathlib import PurePosixPath
 import sqlite3
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -37,8 +39,16 @@ AGENT_PACKET_RUNTIME_MODES = {
     "adapter_spawn",
 }
 AGENT_PACKET_WRITE_POLICIES = {"auto", "read-only", "write"}
+AGENT_SPAWN_ADAPTERS = {"codex-cli", "custom"}
+CODEX_SPAWN_SANDBOXES = {"auto", "read-only", "workspace-write"}
+CODEX_APPROVAL_POLICIES = {"never", "on-request", "untrusted", "on-failure"}
 DEFAULT_LIST_LIMIT = 20
 MAX_LIST_LIMIT = 500
+DEFAULT_SPAWN_TIMEOUT_SECONDS = 1800
+MAX_SPAWN_TIMEOUT_SECONDS = 86400
+DEFAULT_SPAWN_OUTPUT_LIMIT = 20000
+MAX_SPAWN_OUTPUT_LIMIT = 200000
+DEFAULT_PACKET_DIR = ".agentic-factory/packets"
 DEFAULT_PROJECT_CONFIG: dict[str, Any] = {
     "default_mode": "balanced",
     "default_topology": "executive_as_ledger",
@@ -108,17 +118,23 @@ def config_path_for(root: Path, config: str | None) -> Path:
     return root / DEFAULT_DB_DIR / DEFAULT_CONFIG_NAME
 
 
-def safe_relative_path(raw: Any, *, field: str, allow_empty: bool = False) -> str:
+def safe_relative_path(
+    raw: Any,
+    *,
+    field: str,
+    allow_empty: bool = False,
+    label: str = "Config field",
+) -> str:
     if not isinstance(raw, str):
-        raise FactoryError(f"Config field `{field}` must be a string.")
+        raise FactoryError(f"{label} `{field}` must be a string.")
     stripped = raw.strip()
     if not stripped:
         if allow_empty:
             return ""
-        raise FactoryError(f"Config field `{field}` must not be empty.")
+        raise FactoryError(f"{label} `{field}` must not be empty.")
     candidate = PurePosixPath(stripped.replace("\\", "/"))
     if candidate.is_absolute() or candidate.as_posix() == "." or ".." in candidate.parts:
-        raise FactoryError(f"Config field `{field}` must be a relative path inside the project.")
+        raise FactoryError(f"{label} `{field}` must be a relative path inside the project.")
     return candidate.as_posix()
 
 
@@ -311,6 +327,19 @@ def shell_join(parts: Iterable[Any]) -> str:
     return " ".join(shlex.quote(str(part)) for part in parts if part is not None and str(part) != "")
 
 
+def truncate_text(value: str | None, limit: int) -> tuple[str, bool]:
+    text = value or ""
+    if len(text) <= limit:
+        return text, False
+    return text[:limit] + "\n...[truncated]", True
+
+
+def safe_slug(value: str | None, *, fallback: str = "none") -> str:
+    text = (value or fallback).strip() or fallback
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", text).strip("-._")
+    return (slug or fallback)[:80]
+
+
 def command_prefix(root: Path, args: argparse.Namespace) -> list[str]:
     parts = ["python3", str(Path(__file__).resolve()), "--root", str(root)]
     db = getattr(args, "db", None)
@@ -320,6 +349,22 @@ def command_prefix(root: Path, args: argparse.Namespace) -> list[str]:
     if config:
         parts.extend(["--config", config])
     return parts
+
+
+def require_timeout(value: int) -> int:
+    if value < 1:
+        raise FactoryError("--timeout-seconds must be greater than 0")
+    if value > MAX_SPAWN_TIMEOUT_SECONDS:
+        raise FactoryError(f"--timeout-seconds must be less than or equal to {MAX_SPAWN_TIMEOUT_SECONDS}")
+    return value
+
+
+def require_output_limit(value: int) -> int:
+    if value < 1:
+        raise FactoryError("--output-limit must be greater than 0")
+    if value > MAX_SPAWN_OUTPUT_LIMIT:
+        raise FactoryError(f"--output-limit must be less than or equal to {MAX_SPAWN_OUTPUT_LIMIT}")
+    return value
 
 
 def emit_event(
@@ -1454,6 +1499,288 @@ def cmd_agent_packet(args: argparse.Namespace) -> int:
     return 0
 
 
+def agent_packet_text(packet: dict[str, Any], packet_format: str) -> str:
+    if packet_format == "json":
+        return json.dumps(packet, indent=2, sort_keys=True) + "\n"
+    return format_agent_packet_markdown(packet)
+
+
+def packet_dir_for(root: Path, raw_dir: str) -> Path:
+    relative = safe_relative_path(raw_dir, field="packet_dir", label="Argument")
+    return root / relative
+
+
+def write_agent_packet_file(root: Path, packet: dict[str, Any], packet_format: str, packet_dir: str) -> Path:
+    out_dir = packet_dir_for(root, packet_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    extension = "json" if packet_format == "json" else "md"
+    stamp = utc_now().replace(":", "").replace("-", "").replace("Z", "")
+    baton = packet.get("baton") or {}
+    filename = "-".join(
+        [
+            "packet",
+            stamp,
+            safe_slug(str(packet.get("role", "")), fallback="role"),
+            safe_slug(str(baton.get("id") or "no-baton"), fallback="no-baton"),
+        ]
+    )
+    path = out_dir / f"{filename}.{extension}"
+    path.write_text(agent_packet_text(packet, packet_format), encoding="utf-8")
+    return path
+
+
+def has_held_baton_lock(conn: sqlite3.Connection, run_id: str, baton_id: str | None) -> bool:
+    if not baton_id:
+        return False
+    row = conn.execute(
+        """
+        SELECT 1 FROM locks
+        WHERE run_id = ? AND baton_id = ? AND status = 'held'
+        LIMIT 1
+        """,
+        (run_id, baton_id),
+    ).fetchone()
+    return row is not None
+
+
+def build_codex_spawn_command(root: Path, packet: dict[str, Any], args: argparse.Namespace) -> list[str]:
+    sandbox = args.codex_sandbox
+    if sandbox == "auto":
+        sandbox = "workspace-write" if packet["worker_policy"]["may_edit_files"] else "read-only"
+    command = [
+        args.codex_bin,
+        "exec",
+        "--cd",
+        str(root),
+        "--sandbox",
+        sandbox,
+        "--ask-for-approval",
+        args.codex_approval,
+        "--ephemeral",
+    ]
+    if args.codex_model:
+        command.extend(["--model", args.codex_model])
+    if args.codex_profile:
+        command.extend(["--profile", args.codex_profile])
+    if args.codex_skip_git_repo_check:
+        command.append("--skip-git-repo-check")
+    command.append("-")
+    return command
+
+
+CUSTOM_PLACEHOLDER_RE = re.compile(r"\{[A-Za-z_][A-Za-z0-9_]*\}")
+
+
+def build_custom_spawn_command(root: Path, packet_path: Path, args: argparse.Namespace) -> list[str]:
+    if not args.command.strip():
+        raise FactoryError("--command is required for --adapter custom.")
+    if "{packet}" not in args.command:
+        raise FactoryError("Custom adapter --command must include the {packet} placeholder.")
+    try:
+        tokens = shlex.split(args.command)
+    except ValueError as exc:
+        raise FactoryError(f"Invalid custom adapter command: {exc}") from exc
+    if not tokens:
+        raise FactoryError("Custom adapter command must not be empty.")
+    replacements = {
+        "{packet}": str(packet_path),
+        "{root}": str(root),
+        "{role}": args.role,
+        "{baton}": args.baton or "",
+    }
+    expanded: list[str] = []
+    for token in tokens:
+        for placeholder, value in replacements.items():
+            token = token.replace(placeholder, value)
+        unknown = CUSTOM_PLACEHOLDER_RE.search(token)
+        if unknown:
+            raise FactoryError(f"Unknown custom adapter placeholder: {unknown.group(0)}")
+        expanded.append(token)
+    return expanded
+
+
+def build_spawn_command(root: Path, packet: dict[str, Any], packet_path: Path, args: argparse.Namespace) -> tuple[list[str], str | None]:
+    if args.adapter == "codex-cli":
+        return build_codex_spawn_command(root, packet, args), agent_packet_text(packet, args.packet_format)
+    if args.adapter == "custom":
+        return build_custom_spawn_command(root, packet_path, args), None
+    raise FactoryError(f"--adapter must be one of {', '.join(sorted(AGENT_SPAWN_ADAPTERS))}")
+
+
+def run_spawn_command(
+    *,
+    command: list[str],
+    stdin: str | None,
+    root: Path,
+    timeout_seconds: int,
+    output_limit: int,
+) -> dict[str, Any]:
+    started = time.monotonic()
+    try:
+        proc = subprocess.run(
+            command,
+            cwd=root,
+            input=stdin,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout_seconds,
+            check=False,
+        )
+        stdout, stdout_truncated = truncate_text(proc.stdout, output_limit)
+        stderr, stderr_truncated = truncate_text(proc.stderr, output_limit)
+        return {
+            "status": "completed" if proc.returncode == 0 else "failed",
+            "returncode": proc.returncode,
+            "duration_ms": int((time.monotonic() - started) * 1000),
+            "stdout": stdout,
+            "stderr": stderr,
+            "stdout_truncated": stdout_truncated,
+            "stderr_truncated": stderr_truncated,
+        }
+    except subprocess.TimeoutExpired as exc:
+        stdout, stdout_truncated = truncate_text(exc.stdout if isinstance(exc.stdout, str) else "", output_limit)
+        stderr, stderr_truncated = truncate_text(exc.stderr if isinstance(exc.stderr, str) else "", output_limit)
+        return {
+            "status": "timed_out",
+            "returncode": 124,
+            "duration_ms": int((time.monotonic() - started) * 1000),
+            "stdout": stdout,
+            "stderr": stderr,
+            "stdout_truncated": stdout_truncated,
+            "stderr_truncated": stderr_truncated,
+        }
+    except OSError as exc:
+        return {
+            "status": "failed",
+            "returncode": 127,
+            "duration_ms": int((time.monotonic() - started) * 1000),
+            "stdout": "",
+            "stderr": str(exc),
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+        }
+
+
+def spawn_event_payload(
+    *,
+    adapter: str,
+    role: str,
+    baton_id: str | None,
+    packet_path: Path,
+    command: list[str],
+    timeout_seconds: int,
+    status: str | None = None,
+    returncode: int | None = None,
+    duration_ms: int | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "adapter": adapter,
+        "role": role,
+        "baton_id": baton_id or "",
+        "packet_path": str(packet_path),
+        "timeout_seconds": timeout_seconds,
+        "command_preview": shorten(shell_join(command), 500),
+    }
+    if status is not None:
+        payload["status"] = status
+    if returncode is not None:
+        payload["returncode"] = returncode
+    if duration_ms is not None:
+        payload["duration_ms"] = duration_ms
+    return payload
+
+
+def cmd_agent_spawn(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    if not args.experimental and not args.dry_run:
+        raise FactoryError("agent spawn is experimental; pass --experimental to execute or --dry-run to preview.")
+    timeout_seconds = require_timeout(args.timeout_seconds)
+    output_limit = require_output_limit(args.output_limit)
+    args.format = args.packet_format
+    args.runtime_mode = "adapter_spawn"
+
+    config = config_for_args(root, args)
+    conn = connect(root, args.db)
+    run = require_run(conn)
+    packet = build_agent_packet(root=root, conn=conn, run=run, config=config, args=args)
+    if packet["worker_policy"]["may_edit_files"] and args.baton and not args.allow_unlocked:
+        if not has_held_baton_lock(conn, run["id"], args.baton):
+            raise FactoryError("Write-capable spawn requires a held lock for --baton, or pass --allow-unlocked.")
+    packet_path = write_agent_packet_file(root, packet, args.packet_format, args.packet_dir)
+    command, stdin = build_spawn_command(root, packet, packet_path, args)
+    result: dict[str, Any] = {
+        "adapter": args.adapter,
+        "role": args.role,
+        "baton": args.baton,
+        "packet_path": str(packet_path),
+        "command": command,
+        "command_preview": shell_join(command),
+        "timeout_seconds": timeout_seconds,
+        "experimental": args.experimental,
+        "dry_run": args.dry_run,
+        "events_recorded": False,
+    }
+    if args.dry_run:
+        result.update({"status": "dry_run", "returncode": 0})
+        print_json(result)
+        return 0
+
+    if not args.no_event:
+        emit_event(
+            conn,
+            event_type="agent.spawn.started",
+            actor=args.actor,
+            run_id=run["id"],
+            baton_id=args.baton,
+            summary=f"{args.adapter} spawn started for {args.role}",
+            payload=spawn_event_payload(
+                adapter=args.adapter,
+                role=args.role,
+                baton_id=args.baton,
+                packet_path=packet_path,
+                command=command,
+                timeout_seconds=timeout_seconds,
+            ),
+        )
+        conn.commit()
+        result["events_recorded"] = True
+
+    execution = run_spawn_command(
+        command=command,
+        stdin=stdin,
+        root=root,
+        timeout_seconds=timeout_seconds,
+        output_limit=output_limit,
+    )
+    result.update(execution)
+
+    if not args.no_event:
+        emit_event(
+            conn,
+            event_type="agent.spawn.completed",
+            actor=args.actor,
+            run_id=run["id"],
+            baton_id=args.baton,
+            summary=f"{args.adapter} spawn {execution['status']} for {args.role}",
+            payload=spawn_event_payload(
+                adapter=args.adapter,
+                role=args.role,
+                baton_id=args.baton,
+                packet_path=packet_path,
+                command=command,
+                timeout_seconds=timeout_seconds,
+                status=execution["status"],
+                returncode=execution["returncode"],
+                duration_ms=execution["duration_ms"],
+            ),
+        )
+        conn.commit()
+
+    print_json(result)
+    return int(execution["returncode"])
+
+
 def cmd_event_append(args: argparse.Namespace) -> int:
     root = resolve_root(args.root)
     conn = connect(root, args.db)
@@ -2140,6 +2467,46 @@ def build_parser() -> argparse.ArgumentParser:
     agent_packet.add_argument("--required-check", action="append", default=[], help="Required check to include.")
     agent_packet.add_argument("--non-goal", action="append", default=[], help="Non-goal to include.")
     agent_packet.set_defaults(func=cmd_agent_packet)
+
+    agent_spawn = agent_sub.add_parser("spawn", help="Experimentally spawn a packet through an adapter.")
+    agent_spawn.add_argument("--adapter", required=True, choices=sorted(AGENT_SPAWN_ADAPTERS))
+    agent_spawn.add_argument("--experimental", action="store_true", help="Required to execute the adapter.")
+    agent_spawn.add_argument("--dry-run", action="store_true", help="Write packet and print argv without execution.")
+    agent_spawn.add_argument("--role", required=True, choices=sorted(AGENT_PACKET_ROLES))
+    agent_spawn.add_argument("--baton", default=None)
+    agent_spawn.add_argument("--recent", type=int, default=DEFAULT_LIST_LIMIT)
+    agent_spawn.add_argument("--packet-format", choices=sorted(AGENT_PACKET_FORMATS), default="markdown")
+    agent_spawn.add_argument("--packet-dir", default=DEFAULT_PACKET_DIR)
+    agent_spawn.add_argument(
+        "--runtime-mode",
+        choices=sorted(AGENT_PACKET_RUNTIME_MODES),
+        default="adapter_spawn",
+        help=argparse.SUPPRESS,
+    )
+    agent_spawn.add_argument("--write-policy", choices=sorted(AGENT_PACKET_WRITE_POLICIES), default="auto")
+    agent_spawn.add_argument("--allowed", action="append", default=[], help="Allowed file or area; repeat or comma-separate.")
+    agent_spawn.add_argument(
+        "--restricted",
+        action="append",
+        default=[],
+        help="Restricted file or area; repeat or comma-separate.",
+    )
+    agent_spawn.add_argument("--invariant", action="append", default=[], help="Hard invariant to include.")
+    agent_spawn.add_argument("--required-check", action="append", default=[], help="Required check to include.")
+    agent_spawn.add_argument("--non-goal", action="append", default=[], help="Non-goal to include.")
+    agent_spawn.add_argument("--command", default="", help="Custom adapter command template; must include {packet}.")
+    agent_spawn.add_argument("--timeout-seconds", type=int, default=DEFAULT_SPAWN_TIMEOUT_SECONDS)
+    agent_spawn.add_argument("--output-limit", type=int, default=DEFAULT_SPAWN_OUTPUT_LIMIT)
+    agent_spawn.add_argument("--allow-unlocked", action="store_true", help="Allow write-capable spawn without a held baton lock.")
+    agent_spawn.add_argument("--no-event", action="store_true", help="Do not record agent.spawn events.")
+    agent_spawn.add_argument("--actor", default="Executive")
+    agent_spawn.add_argument("--codex-bin", default="codex")
+    agent_spawn.add_argument("--codex-model", default="")
+    agent_spawn.add_argument("--codex-profile", default="")
+    agent_spawn.add_argument("--codex-sandbox", choices=sorted(CODEX_SPAWN_SANDBOXES), default="auto")
+    agent_spawn.add_argument("--codex-approval", choices=sorted(CODEX_APPROVAL_POLICIES), default="never")
+    agent_spawn.add_argument("--codex-skip-git-repo-check", action="store_true")
+    agent_spawn.set_defaults(func=cmd_agent_spawn)
 
     event = subparsers.add_parser("event", help="Record a raw event.")
     event_sub = event.add_subparsers(dest="event_command", required=True)

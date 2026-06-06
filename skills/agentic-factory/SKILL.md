@@ -1,6 +1,6 @@
 ---
 name: agentic-factory
-description: "Use when directly recording, querying, validating, rendering, or generating portable packets from Agentic Factory SQLite state with scripts/factory.py: init, status, doctor, baton, agent packet, verification, review, pause/resume, lock, event, and render-ledger commands."
+description: "Use when directly recording, querying, validating, rendering, generating portable packets, or dry-running/using experimental adapters from Agentic Factory SQLite state with scripts/factory.py: init, status, doctor, baton, agent packet, agent spawn, verification, review, pause/resume, lock, event, and render-ledger commands."
 ---
 
 # Agentic Factory
@@ -16,7 +16,7 @@ This skill does not spawn agents or choose worker topology. In Codex-native
 factory runs, the orchestration skill uses host delegation capabilities and this
 skill records the resulting state transitions. In other runtimes, the lead
 agent may use an agent CLI's own sub-agent mechanism, generated agent packets,
-or serial role simulation while using the same records.
+experimental adapters, or serial role simulation while using the same records.
 
 ## Contract
 
@@ -174,6 +174,48 @@ python3 <plugin-root>/scripts/factory.py agent packet \
 
 Use `--format json` when another tool needs structured packet data. Packets are
 rendered instructions and command templates; they do not spawn workers.
+
+## Experimental Adapters
+
+Use adapters only when the host runtime cannot provide safer native delegation
+and the user or project explicitly wants a process-level bridge. Always dry-run
+first:
+
+```bash
+python3 <plugin-root>/scripts/factory.py agent spawn \
+  --adapter custom \
+  --role builder \
+  --baton B-001 \
+  --command "my-agent run --prompt-file {packet}" \
+  --dry-run
+```
+
+Execute only after checking the packet, command, lock ownership, timeout, and
+workspace risk:
+
+```bash
+python3 <plugin-root>/scripts/factory.py agent spawn \
+  --adapter custom \
+  --role builder \
+  --baton B-001 \
+  --command "my-agent run --prompt-file {packet}" \
+  --experimental
+```
+
+For the Codex CLI adapter:
+
+```bash
+python3 <plugin-root>/scripts/factory.py agent spawn \
+  --adapter codex-cli \
+  --role builder \
+  --baton B-001 \
+  --experimental
+```
+
+Adapters write packet files under `.agentic-factory/packets/`, run without
+`shell=True`, enforce timeouts, capture bounded output, and record
+`agent.spawn.started` / `agent.spawn.completed` events for real executions
+unless `--no-event` is supplied.
 
 ## Pause, Resume, And Ledger
 

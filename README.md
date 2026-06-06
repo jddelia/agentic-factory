@@ -25,6 +25,7 @@ protocol execution for testing and debugging.
 - Baton assignment, handoff, acceptance, and lock commands
 - Direct inspection commands for batons, events, verification, and reviews
 - Agent packet generation for portable Builder, Reviewer, and Executive handoffs
+- Experimental adapter spawning for packet-based external agent CLI delegation
 - Project-local config through `.agentic-factory/config.json`
 - Review findings and verification records
 - Pause/resume checkpoints
@@ -55,6 +56,7 @@ Detailed docs:
 - [Usage](docs/usage.md)
 - [Runtime modes](docs/runtime-modes.md)
 - [Agent packets](docs/agent-packets.md)
+- [Agent adapters](docs/agent-adapters.md)
 - [Project configuration](docs/configuration.md)
 - [CLI reference](docs/cli.md)
 - [Schema and event contract](docs/schema.md)

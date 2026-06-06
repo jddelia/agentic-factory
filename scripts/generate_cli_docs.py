@@ -23,6 +23,7 @@ COMMANDS: tuple[tuple[str, ...], ...] = (
     ("status",),
     ("agent",),
     ("agent", "packet"),
+    ("agent", "spawn"),
     ("event",),
     ("event", "append"),
     ("baton",),
@@ -175,6 +176,40 @@ NOTES: dict[tuple[str, ...], str] = {
         - Unknown baton when `--baton` is supplied.
         - `--baton` is missing for Builder or Reviewer packets.
         - `--recent` is outside the allowed range.
+    """,
+    ("agent", "spawn"): """
+        Required arguments: `--adapter`, `--role`.
+
+        Builder and Reviewer spawns also require `--baton`. Custom spawns require
+        `--command` with a `{packet}` placeholder. Real execution requires
+        `--experimental`; use `--dry-run` to preview without execution.
+
+        Example dry run:
+
+        ```bash
+        python3 scripts/factory.py agent spawn --adapter custom --role builder --baton B-001 --command "my-agent run --prompt-file {packet}" --dry-run
+        ```
+
+        Example Codex CLI execution:
+
+        ```bash
+        python3 scripts/factory.py agent spawn --adapter codex-cli --role builder --baton B-001 --experimental
+        ```
+
+        Example output shape:
+
+        ```json
+        {"status": "completed", "adapter": "custom", "packet_path": "...", "returncode": 0}
+        ```
+
+        Common failures:
+
+        - Missing `--experimental` for real execution.
+        - Missing `{packet}` in a custom command.
+        - Unknown baton or missing baton for Builder/Reviewer.
+        - Write-capable spawn has no held baton lock and `--allow-unlocked` was not supplied.
+        - Timeout returns status `timed_out` and exit code `124`.
+        - Missing executable returns exit code `127`.
     """,
     ("event", "append"): """
         Required arguments: `--type`.

@@ -93,6 +93,23 @@ non_goals:
 packet_format: markdown | json
 ```
 
+## Adapter Spawn Request
+
+```text
+adapter: codex-cli | custom
+role:
+baton_id:
+dry_run_required: true
+experimental_authorized:
+command_template:
+timeout_seconds:
+packet_path:
+workspace_lock_status:
+sandbox_or_permission_profile:
+expected_output_contract:
+recovery_plan:
+```
+
 ## Handoff Bundle
 
 ```text

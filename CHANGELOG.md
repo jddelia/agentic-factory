@@ -10,4 +10,6 @@
   manual protocol examples.
 - Added agent packet generation for portable Builder, Reviewer, and Executive
   delegation contracts.
+- Added experimental adapter spawning for packet-based external agent CLI
+  delegation.
 - Added SQLite-backed factory CLI, schema migration, templates, and tests.
