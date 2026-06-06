@@ -54,8 +54,13 @@ def validate(plugin_root: Path) -> list[str]:
         "SECURITY.md",
         "docs/installation.md",
         "docs/usage.md",
+        "docs/runtime-modes.md",
+        "docs/agent-packets.md",
+        "docs/agent-adapters.md",
+        "docs/configuration.md",
         "docs/cli.md",
         "docs/schema.md",
+        "examples/codex-orchestrated-session.md",
         "examples/basic-factory/session.md",
     ):
         if not (plugin_root / required_file).is_file():

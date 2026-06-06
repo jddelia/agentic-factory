@@ -52,6 +52,22 @@ other factory doctrines.
 The plugin intentionally does not ship a skill named `software-factory-v2`, so
 it will not collide with private or marketplace skills using that name.
 
+## Runtime Model
+
+The primary runtime is the Codex app, where the orchestration skill can use
+native thread or sub-agent capabilities when the host exposes them. The CLI
+remains the durable state layer in every mode.
+
+Other agent CLIs can still use the plugin by following the same baton,
+handoff, review, and verification protocol with their own delegation features.
+When delegation is unavailable or unsafe, one agent can run the roles serially.
+Use [Agent Packets](agent-packets.md) when a non-Codex runtime needs a concrete
+role prompt for Builder, Reviewer, or Executive work.
+Use [Agent Adapters](agent-adapters.md) only when an experimental process-level
+bridge to an external agent CLI is explicitly desired.
+
+See [Runtime Modes](runtime-modes.md) for the full mode contract.
+
 ## Validation
 
 From the plugin repository:

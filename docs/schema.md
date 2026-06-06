@@ -32,6 +32,13 @@ The database has three layers:
 The `events` table is the chronological audit trail. Current-state tables are
 optimized for quick inspection and rendering.
 
+Agent packets do not add tables. `factory.py agent packet` renders bounded
+views over existing run, baton, event, verification, review, lock, and config
+state.
+
+Agent adapters also do not add tables. `factory.py agent spawn` records adapter
+execution attempts through events.
+
 ## Tables
 
 ### `schema_migrations`
@@ -271,6 +278,8 @@ The CLI writes these event types directly:
 | `factory.resumed` | `resume` | Resume reason. | `reason`. |
 | `lock.acquired` | `lock acquire` | Lock holder summary. | `lock`. |
 | `lock.released` | `lock release` | Lock release summary. | `lock`. |
+| `agent.spawn.started` | `agent spawn` | Adapter, role, and start status. | `adapter`, `role`, `baton_id`, `packet_path`, `timeout_seconds`, `command_preview`. |
+| `agent.spawn.completed` | `agent spawn` | Adapter, role, and terminal status. | `adapter`, `role`, `baton_id`, `packet_path`, `timeout_seconds`, `command_preview`, `status`, `returncode`, `duration_ms`. |
 
 `event append` can write custom event types. Custom event names should be
 namespaced with dot notation, for example:
@@ -296,6 +305,25 @@ The current CLI reads:
 
 When adding new inspection commands, prefer indexed access paths and bounded
 queries. Avoid commands that require loading the entire event log by default.
+
+Read-only inspection commands use the same tables:
+
+- `baton list`: bounded query on `batons` by current `run_id` and optional
+  status filters.
+- `baton show`: one baton plus related handoffs, verification, reviews,
+  findings, commits, and recent events.
+- `events list`: bounded query on `events` by current `run_id`, optional baton,
+  and optional event type.
+- `verification list`: bounded query on `verification_runs`, scoped by baton or
+  current run.
+- `review list`: bounded query on `reviews` and `review_findings`, scoped by
+  baton or current run.
+
+Adapter spawn commands write packet files under `.agentic-factory/packets/` by
+default. That directory is local workflow state and should not be committed.
+
+Project config is file-based, not stored in SQLite. See
+`docs/configuration.md` for `.agentic-factory/config.json`.
 
 ## Migration Checklist
 

@@ -8,11 +8,16 @@ without installing project dependencies.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
+import re
+import shlex
+from pathlib import PurePosixPath
 import sqlite3
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -21,7 +26,53 @@ from typing import Any, Iterable
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DB_DIR = ".agentic-factory"
 DEFAULT_DB_NAME = "factory.db"
+DEFAULT_CONFIG_NAME = "config.json"
 ACTIVE_BATON_STATUSES = {"assigned", "active", "in_progress", "handed_off", "review"}
+VERIFICATION_RESULTS = {"pass", "fail", "not_run", "blocked"}
+AGENT_PACKET_ROLES = {"builder", "reviewer", "executive"}
+AGENT_PACKET_FORMATS = {"markdown", "json"}
+AGENT_PACKET_RUNTIME_MODES = {
+    "codex_native",
+    "agent_cli_subagents",
+    "serial_single_agent",
+    "manual_protocol",
+    "adapter_spawn",
+}
+AGENT_PACKET_WRITE_POLICIES = {"auto", "read-only", "write"}
+AGENT_SPAWN_ADAPTERS = {"codex-cli", "custom"}
+CODEX_SPAWN_SANDBOXES = {"auto", "read-only", "workspace-write"}
+CODEX_APPROVAL_POLICIES = {"never", "on-request", "untrusted", "on-failure"}
+DEFAULT_LIST_LIMIT = 20
+MAX_LIST_LIMIT = 500
+DEFAULT_SPAWN_TIMEOUT_SECONDS = 1800
+MAX_SPAWN_TIMEOUT_SECONDS = 86400
+DEFAULT_SPAWN_OUTPUT_LIMIT = 20000
+MAX_SPAWN_OUTPUT_LIMIT = 200000
+DEFAULT_PACKET_DIR = ".agentic-factory/packets"
+DEFAULT_PROJECT_CONFIG: dict[str, Any] = {
+    "default_mode": "balanced",
+    "default_topology": "executive_as_ledger",
+    "default_lock_name": "main-worktree",
+    "ledger_output_path": "",
+    "verification_policy": {
+        "default_level": "focused",
+        "require_baton": False,
+        "require_summary_for_not_run": False,
+    },
+    "protected_generated_files": [],
+}
+CONFIG_FILE_TEMPLATE: dict[str, Any] = {
+    "default_mode": "balanced",
+    "default_topology": "executive_as_ledger",
+    "default_lock_name": "main-worktree",
+    "ledger_output_path": "docs/build_ledger.md",
+    "verification_policy": {
+        "default_level": "focused",
+        "require_baton": False,
+        "require_summary_for_not_run": True,
+    },
+    "protected_generated_files": [],
+}
 
 
 class FactoryError(RuntimeError):
@@ -56,6 +107,124 @@ def db_path_for(root: Path, db: str | None) -> Path:
             path = root / path
         return path.resolve()
     return root / DEFAULT_DB_DIR / DEFAULT_DB_NAME
+
+
+def config_path_for(root: Path, config: str | None) -> Path:
+    if config:
+        path = Path(config).expanduser()
+        if not path.is_absolute():
+            path = root / path
+        return path.resolve()
+    return root / DEFAULT_DB_DIR / DEFAULT_CONFIG_NAME
+
+
+def safe_relative_path(
+    raw: Any,
+    *,
+    field: str,
+    allow_empty: bool = False,
+    label: str = "Config field",
+) -> str:
+    if not isinstance(raw, str):
+        raise FactoryError(f"{label} `{field}` must be a string.")
+    stripped = raw.strip()
+    if not stripped:
+        if allow_empty:
+            return ""
+        raise FactoryError(f"{label} `{field}` must not be empty.")
+    candidate = PurePosixPath(stripped.replace("\\", "/"))
+    if candidate.is_absolute() or candidate.as_posix() == "." or ".." in candidate.parts:
+        raise FactoryError(f"{label} `{field}` must be a relative path inside the project.")
+    return candidate.as_posix()
+
+
+def require_config_string(payload: dict[str, Any], key: str) -> str:
+    value = payload.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise FactoryError(f"Config field `{key}` must be a non-empty string.")
+    return value.strip()
+
+
+def require_config_bool(payload: dict[str, Any], key: str) -> bool:
+    value = payload.get(key)
+    if not isinstance(value, bool):
+        raise FactoryError(f"Config field `verification_policy.{key}` must be a boolean.")
+    return value
+
+
+def load_project_config(root: Path, config: str | None = None) -> tuple[dict[str, Any], Path, bool]:
+    path = config_path_for(root, config)
+    effective = copy.deepcopy(DEFAULT_PROJECT_CONFIG)
+    if not path.is_file():
+        return effective, path, False
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise FactoryError(f"Invalid config JSON at {path}: {exc}") from exc
+    except OSError as exc:
+        raise FactoryError(f"Unable to read config at {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise FactoryError("Project config must contain a JSON object.")
+
+    allowed = {
+        "default_mode",
+        "default_topology",
+        "default_lock_name",
+        "ledger_output_path",
+        "verification_policy",
+        "protected_generated_files",
+    }
+    unknown = sorted(set(payload) - allowed)
+    if unknown:
+        raise FactoryError(f"Unknown config field(s): {', '.join(unknown)}")
+
+    for key in ("default_mode", "default_topology", "default_lock_name"):
+        if key in payload:
+            effective[key] = require_config_string(payload, key)
+
+    if "ledger_output_path" in payload:
+        effective["ledger_output_path"] = safe_relative_path(
+            payload["ledger_output_path"],
+            field="ledger_output_path",
+            allow_empty=True,
+        )
+
+    if "protected_generated_files" in payload:
+        protected = payload["protected_generated_files"]
+        if not isinstance(protected, list):
+            raise FactoryError("Config field `protected_generated_files` must be an array.")
+        effective["protected_generated_files"] = [
+            safe_relative_path(value, field="protected_generated_files[]")
+            for value in protected
+        ]
+
+    if "verification_policy" in payload:
+        policy = payload["verification_policy"]
+        if not isinstance(policy, dict):
+            raise FactoryError("Config field `verification_policy` must be an object.")
+        allowed_policy = {"default_level", "require_baton", "require_summary_for_not_run"}
+        unknown_policy = sorted(set(policy) - allowed_policy)
+        if unknown_policy:
+            raise FactoryError(
+                f"Unknown config field(s) under `verification_policy`: {', '.join(unknown_policy)}"
+            )
+        if "default_level" in policy:
+            effective["verification_policy"]["default_level"] = require_config_string(policy, "default_level")
+        if "require_baton" in policy:
+            effective["verification_policy"]["require_baton"] = require_config_bool(policy, "require_baton")
+        if "require_summary_for_not_run" in policy:
+            effective["verification_policy"]["require_summary_for_not_run"] = require_config_bool(
+                policy,
+                "require_summary_for_not_run",
+            )
+
+    return effective, path, True
+
+
+def config_for_args(root: Path, args: argparse.Namespace) -> dict[str, Any]:
+    config, _, _ = load_project_config(root, getattr(args, "config", None))
+    return config
 
 
 def connect(root: Path, db: str | None = None) -> sqlite3.Connection:
@@ -105,6 +274,97 @@ def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
 
 def print_json(value: Any) -> None:
     print(json.dumps(value, indent=2, sort_keys=True))
+
+
+def parse_json_field(raw: str | None) -> Any:
+    fallback: Any = [] if raw and raw.strip().startswith("[") else {}
+    return json_loads_or_empty(raw, fallback)
+
+
+def row_to_public_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    payload = dict(row)
+    for key, value in list(payload.items()):
+        if key.endswith("_json"):
+            payload[key[:-5]] = parse_json_field(value)
+    return payload
+
+
+def require_limit(value: int, *, field: str) -> int:
+    if value < 1:
+        raise FactoryError(f"--{field} must be greater than 0")
+    if value > MAX_LIST_LIMIT:
+        raise FactoryError(f"--{field} must be less than or equal to {MAX_LIST_LIMIT}")
+    return value
+
+
+def shorten(value: Any, max_len: int = 80) -> str:
+    text = "" if value is None else str(value).replace("\n", " ")
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3] + "..."
+
+
+def print_table(rows: list[dict[str, Any]], columns: list[tuple[str, str]], *, empty: str) -> None:
+    if not rows:
+        print(empty)
+        return
+    widths = {
+        key: min(
+            max(len(label), *(len(shorten(row.get(key), 80)) for row in rows)),
+            80,
+        )
+        for key, label in columns
+    }
+    print("  ".join(label.ljust(widths[key]) for key, label in columns))
+    print("  ".join("-" * widths[key] for key, _label in columns))
+    for row in rows:
+        print("  ".join(shorten(row.get(key), widths[key]).ljust(widths[key]) for key, _label in columns))
+
+
+def shell_join(parts: Iterable[Any]) -> str:
+    return " ".join(shlex.quote(str(part)) for part in parts if part is not None and str(part) != "")
+
+
+def truncate_text(value: str | None, limit: int) -> tuple[str, bool]:
+    text = value or ""
+    if len(text) <= limit:
+        return text, False
+    return text[:limit] + "\n...[truncated]", True
+
+
+def safe_slug(value: str | None, *, fallback: str = "none") -> str:
+    text = (value or fallback).strip() or fallback
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", text).strip("-._")
+    return (slug or fallback)[:80]
+
+
+def command_prefix(root: Path, args: argparse.Namespace) -> list[str]:
+    parts = ["python3", str(Path(__file__).resolve()), "--root", str(root)]
+    db = getattr(args, "db", None)
+    config = getattr(args, "config", None)
+    if db:
+        parts.extend(["--db", db])
+    if config:
+        parts.extend(["--config", config])
+    return parts
+
+
+def require_timeout(value: int) -> int:
+    if value < 1:
+        raise FactoryError("--timeout-seconds must be greater than 0")
+    if value > MAX_SPAWN_TIMEOUT_SECONDS:
+        raise FactoryError(f"--timeout-seconds must be less than or equal to {MAX_SPAWN_TIMEOUT_SECONDS}")
+    return value
+
+
+def require_output_limit(value: int) -> int:
+    if value < 1:
+        raise FactoryError("--output-limit must be greater than 0")
+    if value > MAX_SPAWN_OUTPUT_LIMIT:
+        raise FactoryError(f"--output-limit must be less than or equal to {MAX_SPAWN_OUTPUT_LIMIT}")
+    return value
 
 
 def emit_event(
@@ -205,10 +465,32 @@ def csv_values(values: Iterable[str] | None) -> list[str]:
     return result
 
 
+def clean_values(values: Iterable[str] | None) -> list[str]:
+    return [value.strip() for value in values or [] if value.strip()]
+
+
+def unique_values(values: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        stripped = value.strip()
+        if stripped and stripped not in seen:
+            seen.add(stripped)
+            result.append(stripped)
+    return result
+
+
 def require_baton(conn: sqlite3.Connection, baton_id: str) -> sqlite3.Row:
     baton = conn.execute("SELECT * FROM batons WHERE id = ?", (baton_id,)).fetchone()
     if baton is None:
         raise FactoryError(f"Unknown baton: {baton_id}")
+    return baton
+
+
+def require_current_baton(conn: sqlite3.Connection, run: sqlite3.Row, baton_id: str) -> sqlite3.Row:
+    baton = require_baton(conn, baton_id)
+    if baton["run_id"] != run["id"]:
+        raise FactoryError(f"Baton {baton_id} does not belong to current run {run['id']}.")
     return baton
 
 
@@ -219,6 +501,7 @@ def markdown_cell(value: Any) -> str:
 
 def cmd_init(args: argparse.Namespace) -> int:
     root = resolve_root(args.root)
+    config = config_for_args(root, args)
     conn = connect(root, args.db)
     existing = current_run(conn)
     if existing and not args.force:
@@ -234,6 +517,8 @@ def cmd_init(args: argparse.Namespace) -> int:
 
     now = utc_now()
     run_id = args.run_id or f"factory-{now.replace(':', '').replace('-', '').replace('Z', '')}"
+    work_mode = args.mode or config["default_mode"]
+    topology = args.topology or config["default_topology"]
     conn.execute(
         """
         INSERT INTO factory_runs
@@ -244,8 +529,8 @@ def cmd_init(args: argparse.Namespace) -> int:
             run_id,
             str(root),
             args.objective or "",
-            args.mode,
-            args.topology,
+            work_mode,
+            topology,
             now,
             now,
             json_dump({"created_by": "agentic-factory"}),
@@ -256,8 +541,8 @@ def cmd_init(args: argparse.Namespace) -> int:
         event_type="factory.started",
         actor=args.actor,
         run_id=run_id,
-        summary=args.objective or f"Factory started in {args.mode} mode",
-        payload={"work_mode": args.mode, "topology": args.topology, "project_root": str(root)},
+        summary=args.objective or f"Factory started in {work_mode} mode",
+        payload={"work_mode": work_mode, "topology": topology, "project_root": str(root)},
     )
     conn.commit()
     print_json({"status": "initialized", "db": str(db_path_for(root, args.db)), "run_id": run_id})
@@ -334,6 +619,1168 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_config_init(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    path = config_path_for(root, args.config)
+    if path.exists() and not args.force:
+        print_json(
+            {
+                "status": "exists",
+                "path": str(path),
+                "message": "Project config already exists. Use --force to overwrite it.",
+            }
+        )
+        return 0
+    config = copy.deepcopy(CONFIG_FILE_TEMPLATE)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print_json({"status": "created", "path": str(path), "config": config})
+    return 0
+
+
+def cmd_config_show(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    config, path, exists = load_project_config(root, args.config)
+    print_json({"path": str(path), "exists": exists, "config": config})
+    return 0
+
+
+def cmd_baton_list(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    conn = connect(root, args.db)
+    run = require_run(conn)
+    limit = require_limit(args.limit, field="limit")
+    statuses = csv_values(args.status)
+    params: list[Any] = [run["id"]]
+    where = ["run_id = ?"]
+    if statuses:
+        where.append(f"status IN ({','.join('?' for _ in statuses)})")
+        params.extend(statuses)
+    elif not args.all:
+        active = sorted(ACTIVE_BATON_STATUSES)
+        where.append(f"status IN ({','.join('?' for _ in active)})")
+        params.extend(active)
+    params.append(limit)
+    rows = list(
+        conn.execute(
+            f"""
+            SELECT * FROM batons
+            WHERE {' AND '.join(where)}
+            ORDER BY assigned_at DESC
+            LIMIT ?
+            """,
+            params,
+        )
+    )
+    batons = [row_to_public_dict(row) for row in rows]
+    if args.json:
+        print_json({"count": len(batons), "batons": batons})
+        return 0
+    print_table(
+        [baton for baton in batons if baton is not None],
+        [
+            ("id", "Baton"),
+            ("status", "Status"),
+            ("title", "Title"),
+            ("owner", "Owner"),
+            ("assigned_at", "Assigned"),
+            ("commit_sha", "Commit"),
+        ],
+        empty="No batons found.",
+    )
+    return 0
+
+
+def review_with_findings(conn: sqlite3.Connection, review: sqlite3.Row) -> dict[str, Any]:
+    payload = row_to_public_dict(review) or {}
+    findings = list(
+        conn.execute(
+            "SELECT * FROM review_findings WHERE review_id = ? ORDER BY id",
+            (review["id"],),
+        )
+    )
+    payload["findings"] = [row_to_public_dict(row) for row in findings]
+    return payload
+
+
+def collect_baton_detail(
+    conn: sqlite3.Connection,
+    run: sqlite3.Row,
+    baton_id: str,
+    *,
+    recent_events: int,
+) -> dict[str, Any]:
+    baton = require_current_baton(conn, run, baton_id)
+    handoffs = list(
+        conn.execute(
+            "SELECT * FROM handoffs WHERE baton_id = ? ORDER BY created_at DESC",
+            (baton_id,),
+        )
+    )
+    verification = list(
+        conn.execute(
+            "SELECT * FROM verification_runs WHERE baton_id = ? ORDER BY created_at DESC",
+            (baton_id,),
+        )
+    )
+    reviews = list(
+        conn.execute(
+            "SELECT * FROM reviews WHERE baton_id = ? ORDER BY created_at DESC, id DESC",
+            (baton_id,),
+        )
+    )
+    commits = list(
+        conn.execute(
+            "SELECT * FROM commits WHERE baton_id = ? ORDER BY created_at DESC",
+            (baton_id,),
+        )
+    )
+    events = list(
+        conn.execute(
+            """
+            SELECT * FROM events
+            WHERE baton_id = ?
+            ORDER BY occurred_at DESC, id DESC
+            LIMIT ?
+            """,
+            (baton_id, recent_events),
+        )
+    )
+    return {
+        "baton": row_to_public_dict(baton),
+        "handoffs": [row_to_public_dict(row) for row in handoffs],
+        "verification": [row_to_public_dict(row) for row in verification],
+        "reviews": [review_with_findings(conn, row) for row in reviews],
+        "commits": [row_to_public_dict(row) for row in commits],
+        "events": [row_to_public_dict(row) for row in events],
+    }
+
+
+def cmd_baton_show(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    conn = connect(root, args.db)
+    run = require_run(conn)
+    recent_events = require_limit(args.recent_events, field="recent-events")
+    payload = collect_baton_detail(conn, run, args.baton_id, recent_events=recent_events)
+    if args.json:
+        print_json(payload)
+        return 0
+    baton_payload = payload["baton"] or {}
+    print(f"Baton: {baton_payload.get('id')}")
+    print(f"Status: {baton_payload.get('status')}")
+    print(f"Title: {baton_payload.get('title')}")
+    print(f"Owner: {baton_payload.get('owner')}")
+    print(f"Scope: {baton_payload.get('scope')}")
+    print(f"Acceptance tier: {baton_payload.get('acceptance_tier')}")
+    print(f"Verification level: {baton_payload.get('verification_level')}")
+    if baton_payload.get("commit_sha"):
+        print(f"Commit: {baton_payload.get('commit_sha')}")
+    print("")
+    print_table(
+        [row for row in payload["verification"] if row is not None],
+        [("created_at", "Time"), ("result", "Result"), ("command", "Command"), ("summary", "Summary")],
+        empty="No verification records.",
+    )
+    print("")
+    print_table(
+        [row for row in payload["reviews"] if row is not None],
+        [("created_at", "Time"), ("status", "Status"), ("reviewer", "Reviewer"), ("summary", "Summary")],
+        empty="No review records.",
+    )
+    print("")
+    print_table(
+        [row for row in payload["events"] if row is not None],
+        [("occurred_at", "Time"), ("event_type", "Type"), ("actor", "Actor"), ("summary", "Summary")],
+        empty="No events.",
+    )
+    return 0
+
+
+def cmd_events_list(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    conn = connect(root, args.db)
+    run = require_run(conn)
+    recent = require_limit(args.recent, field="recent")
+    where = ["run_id = ?"]
+    params: list[Any] = [run["id"]]
+    if args.baton:
+        require_baton(conn, args.baton)
+        where.append("baton_id = ?")
+        params.append(args.baton)
+    if args.type:
+        where.append("event_type = ?")
+        params.append(args.type)
+    params.append(recent)
+    rows = list(
+        conn.execute(
+            f"""
+            SELECT * FROM events
+            WHERE {' AND '.join(where)}
+            ORDER BY occurred_at DESC, id DESC
+            LIMIT ?
+            """,
+            params,
+        )
+    )
+    events = [row_to_public_dict(row) for row in rows]
+    if args.json:
+        print_json({"count": len(events), "events": events})
+        return 0
+    print_table(
+        [event for event in events if event is not None],
+        [
+            ("id", "ID"),
+            ("occurred_at", "Time"),
+            ("event_type", "Type"),
+            ("baton_id", "Baton"),
+            ("actor", "Actor"),
+            ("summary", "Summary"),
+        ],
+        empty="No events found.",
+    )
+    return 0
+
+
+def cmd_verification_list(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    conn = connect(root, args.db)
+    run = require_run(conn)
+    recent = require_limit(args.recent, field="recent")
+    params: list[Any]
+    if args.baton:
+        require_baton(conn, args.baton)
+        where = "v.baton_id = ?"
+        params = [args.baton, recent]
+    else:
+        where = "(v.baton_id IS NULL OR b.run_id = ?)"
+        params = [run["id"], recent]
+    rows = list(
+        conn.execute(
+            f"""
+            SELECT v.*
+            FROM verification_runs v
+            LEFT JOIN batons b ON b.id = v.baton_id
+            WHERE {where}
+            ORDER BY v.created_at DESC, v.id DESC
+            LIMIT ?
+            """,
+            params,
+        )
+    )
+    verification = [row_to_public_dict(row) for row in rows]
+    if args.json:
+        print_json({"count": len(verification), "verification": verification})
+        return 0
+    print_table(
+        [row for row in verification if row is not None],
+        [
+            ("id", "ID"),
+            ("created_at", "Time"),
+            ("baton_id", "Baton"),
+            ("result", "Result"),
+            ("command", "Command"),
+            ("summary", "Summary"),
+        ],
+        empty="No verification records found.",
+    )
+    return 0
+
+
+def cmd_review_list(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    conn = connect(root, args.db)
+    run = require_run(conn)
+    recent = require_limit(args.recent, field="recent")
+    if args.baton:
+        require_baton(conn, args.baton)
+        where = "r.baton_id = ?"
+        params: list[Any] = [args.baton, recent]
+    else:
+        where = "b.run_id = ?"
+        params = [run["id"], recent]
+    rows = list(
+        conn.execute(
+            f"""
+            SELECT r.*
+            FROM reviews r
+            JOIN batons b ON b.id = r.baton_id
+            WHERE {where}
+            ORDER BY r.created_at DESC, r.id DESC
+            LIMIT ?
+            """,
+            params,
+        )
+    )
+    reviews = [review_with_findings(conn, row) for row in rows]
+    if args.json:
+        print_json({"count": len(reviews), "reviews": reviews})
+        return 0
+    print_table(
+        reviews,
+        [
+            ("id", "ID"),
+            ("created_at", "Time"),
+            ("baton_id", "Baton"),
+            ("status", "Status"),
+            ("reviewer", "Reviewer"),
+            ("summary", "Summary"),
+        ],
+        empty="No reviews found.",
+    )
+    for review in reviews:
+        findings = review.get("findings") or []
+        if findings:
+            print("")
+            print(f"Findings for review {review['id']}:")
+            print_table(
+                findings,
+                [
+                    ("severity", "Severity"),
+                    ("file", "File"),
+                    ("line", "Line"),
+                    ("status", "Status"),
+                    ("summary", "Summary"),
+                ],
+                empty="No findings.",
+            )
+    return 0
+
+
+def verification_check_defaults(level: str) -> list[str]:
+    checks = {
+        "smoke": ["Run the smallest check that proves the primary path still starts or loads."],
+        "focused": ["Run focused checks that cover the baton scope."],
+        "focused_plus_build": [
+            "Run focused checks that cover the baton scope.",
+            "Run the relevant build, type, or lint gate for changed areas.",
+        ],
+        "full_gate": ["Run the repository's full test, lint, type, and build gate."],
+        "release_gate": [
+            "Run the repository's full test, lint, type, and build gate.",
+            "Run release-specific smoke or deployment-readiness checks.",
+        ],
+    }
+    return checks.get(level, [f"Run checks appropriate for verification level `{level}`."])
+
+
+def worker_policy_for(role: str, write_policy: str) -> dict[str, Any]:
+    if write_policy == "write":
+        may_edit = True
+    elif write_policy == "read-only":
+        may_edit = False
+    else:
+        may_edit = role == "builder"
+    return {
+        "write_policy": "write" if may_edit else "read-only",
+        "may_edit_files": may_edit,
+        "may_run_commands": role in {"builder", "reviewer", "executive"},
+        "may_record_cli_evidence": True,
+        "must_return_evidence_if_cli_unavailable": True,
+        "reviewer_read_only_by_default": role == "reviewer",
+    }
+
+
+def handoff_schema_for(role: str) -> dict[str, Any]:
+    if role == "builder":
+        return {
+            "baton_id": "string",
+            "owner": "string",
+            "base_commit": "string",
+            "files_changed": ["path"],
+            "behavior_changed": "string",
+            "commands_run": ["command"],
+            "passing": ["check"],
+            "failing": ["check"],
+            "not_run_and_why": ["check: reason"],
+            "risks": "string",
+            "residual_gaps": "string",
+            "next_recommended_step": "string",
+        }
+    if role == "reviewer":
+        return {
+            "baton_id": "string",
+            "reviewer": "string",
+            "status": "accepted | patch_required | rejected | escalated",
+            "summary": "string",
+            "findings": ["severity|file|line|status|summary"],
+            "verification_observed": ["check"],
+            "recommendation": "accept | patch | reject | escalate",
+            "residual_risks": "string",
+        }
+    return {
+        "baton_id": "string",
+        "decision": "accepted | patch_required | rejected | escalated",
+        "acceptance_tier": "prototype | integration | release",
+        "evidence": ["verification or review record"],
+        "skipped_checks": ["check: reason"],
+        "residual_risk": "string",
+        "commit": "sha",
+        "push_status": "unknown | local_only | pushed",
+        "next_baton": "string",
+    }
+
+
+def recording_commands_for(
+    *,
+    prefix: list[str],
+    role: str,
+    baton_id: str | None,
+    recent: int,
+) -> list[dict[str, str]]:
+    commands: list[dict[str, str]] = []
+    if role == "builder" and baton_id:
+        commands.extend(
+            [
+                {
+                    "name": "record_verification",
+                    "when": "after running a required check",
+                    "command": shell_join(
+                        [
+                            *prefix,
+                            "verify",
+                            "record",
+                            "--baton",
+                            baton_id,
+                            "--command",
+                            "<command run>",
+                            "--result",
+                            "pass",
+                            "--summary",
+                            "<verification summary>",
+                        ]
+                    ),
+                },
+                {
+                    "name": "record_handoff",
+                    "when": "after scoped implementation and verification evidence are ready",
+                    "command": shell_join(
+                        [
+                            *prefix,
+                            "baton",
+                            "handoff",
+                            baton_id,
+                            "--summary",
+                            "<handoff summary>",
+                            "--files",
+                            "<file1,file2>",
+                            "--commands",
+                            "<command run>",
+                            "--verification",
+                            "<check: pass>",
+                            "--risks",
+                            "<risks or none>",
+                            "--next",
+                            "<next recommended step>",
+                        ]
+                    ),
+                },
+            ]
+        )
+    elif role == "reviewer" and baton_id:
+        commands.extend(
+            [
+                {
+                    "name": "record_accepted_review",
+                    "when": "after read-only review finds no blocking issues",
+                    "command": shell_join(
+                        [
+                            *prefix,
+                            "review",
+                            "record",
+                            "--baton",
+                            baton_id,
+                            "--reviewer",
+                            "Reviewer",
+                            "--status",
+                            "accepted",
+                            "--summary",
+                            "<review summary>",
+                        ]
+                    ),
+                },
+                {
+                    "name": "record_review_with_finding",
+                    "when": "after read-only review finds a required patch",
+                    "command": shell_join(
+                        [
+                            *prefix,
+                            "review",
+                            "record",
+                            "--baton",
+                            baton_id,
+                            "--reviewer",
+                            "Reviewer",
+                            "--status",
+                            "patch_required",
+                            "--summary",
+                            "<review summary>",
+                            "--finding",
+                            "P2|path/to/file.py|123|open|Finding summary",
+                        ]
+                    ),
+                },
+            ]
+        )
+    else:
+        commands.extend(
+            [
+                {
+                    "name": "inspect_status",
+                    "when": "before assigning or accepting work",
+                    "command": shell_join([*prefix, "status", "--compact"]),
+                },
+                {
+                    "name": "run_doctor",
+                    "when": "before assigning or accepting work",
+                    "command": shell_join([*prefix, "doctor"]),
+                },
+                {
+                    "name": "list_batons",
+                    "when": "to choose the next baton or inspect active work",
+                    "command": shell_join([*prefix, "baton", "list", "--all"]),
+                },
+                {
+                    "name": "list_recent_events",
+                    "when": "to inspect recent state transitions",
+                    "command": shell_join([*prefix, "events", "list", "--recent", recent]),
+                },
+                {
+                    "name": "create_next_baton",
+                    "when": "after choosing the next scoped unit of work",
+                    "command": shell_join(
+                        [
+                            *prefix,
+                            "baton",
+                            "create",
+                            "<baton id>",
+                            "--title",
+                            "<baton title>",
+                            "--owner",
+                            "Builder",
+                            "--scope",
+                            "<baton scope>",
+                            "--acceptance-tier",
+                            "integration",
+                            "--verification-level",
+                            "<verification level>",
+                        ]
+                    ),
+                },
+            ]
+        )
+        if baton_id:
+            commands.append(
+                {
+                    "name": "accept_baton",
+                    "when": "only after acceptance tier is satisfied",
+                    "command": shell_join(
+                        [
+                            *prefix,
+                            "baton",
+                            "accept",
+                            baton_id,
+                            "--commit",
+                            "<commit sha>",
+                            "--pushed-status",
+                            "local_only",
+                            "--summary",
+                            "<acceptance summary>",
+                        ]
+                    ),
+                }
+            )
+        commands.append(
+            {
+                "name": "render_ledger",
+                "when": "when a human-readable snapshot is useful",
+                "command": shell_join([*prefix, "render-ledger", "--recent", recent]),
+            }
+        )
+    return commands
+
+
+def role_instructions(role: str) -> str:
+    if role == "builder":
+        return (
+            "Implement only the scoped baton, run required checks, record verification and "
+            "handoff evidence when safe, and return a compact handoff bundle if CLI access is unavailable."
+        )
+    if role == "reviewer":
+        return (
+            "Review the baton evidence and changed scope without editing files unless explicitly authorized; "
+            "record or return findings and an acceptance recommendation."
+        )
+    return (
+        "Coordinate the factory, preserve role boundaries, inspect state, route review, accept only after "
+        "the selected tier is satisfied, and record durable decisions."
+    )
+
+
+def packet_scope(
+    *,
+    role: str,
+    baton: dict[str, Any] | None,
+    config: dict[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    allowed = csv_values(args.allowed)
+    restricted = csv_values(args.restricted)
+    non_goals = clean_values(args.non_goal)
+    invariants = [
+        "Preserve user changes; do not revert unknown work.",
+        "Do not broaden the baton scope silently.",
+        "Respect sandbox, credential, destructive-action, and external-effect boundaries.",
+    ]
+    protected_files = config["protected_generated_files"]
+    if protected_files:
+        invariants.append("Do not modify protected generated files unless the Executive explicitly authorizes it.")
+        restricted.extend(f"protected generated file: {path}" for path in protected_files)
+    invariants.extend(clean_values(args.invariant))
+
+    baton_scope = baton.get("scope", "") if baton else ""
+    if not allowed and baton_scope:
+        allowed.append(f"baton scope only: {baton_scope}")
+    if role == "builder":
+        restricted.append("unrelated files outside baton scope")
+    elif role == "reviewer":
+        restricted.append("file edits; reviewer is read-only by default")
+    else:
+        restricted.append("implementation edits unless explicitly taking a narrow executive patch")
+
+    verification_level = (
+        baton.get("verification_level")
+        if baton
+        else config["verification_policy"]["default_level"]
+    )
+    required_checks = clean_values(args.required_check) or verification_check_defaults(str(verification_level))
+
+    return {
+        "objective": baton.get("title", "") if baton else "Inspect and coordinate current factory state",
+        "scope": baton_scope,
+        "allowed_files_or_areas": unique_values(allowed),
+        "restricted_files_or_areas": unique_values(restricted),
+        "non_goals": unique_values(non_goals),
+        "hard_invariants": unique_values(invariants),
+        "required_checks": unique_values(required_checks),
+    }
+
+
+def recent_run_context(conn: sqlite3.Connection, run_id: str, recent: int) -> dict[str, Any]:
+    batons = list(
+        conn.execute(
+            "SELECT * FROM batons WHERE run_id = ? ORDER BY assigned_at DESC LIMIT ?",
+            (run_id, recent),
+        )
+    )
+    events = list(
+        conn.execute(
+            "SELECT * FROM events WHERE run_id = ? ORDER BY occurred_at DESC, id DESC LIMIT ?",
+            (run_id, recent),
+        )
+    )
+    return {
+        "batons": [row_to_public_dict(row) for row in batons],
+        "events": [row_to_public_dict(row) for row in events],
+    }
+
+
+def build_agent_packet(
+    *,
+    root: Path,
+    conn: sqlite3.Connection,
+    run: sqlite3.Row,
+    config: dict[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    role = args.role.lower()
+    if role not in AGENT_PACKET_ROLES:
+        raise FactoryError(f"--role must be one of {', '.join(sorted(AGENT_PACKET_ROLES))}")
+    if args.runtime_mode not in AGENT_PACKET_RUNTIME_MODES:
+        raise FactoryError(f"--runtime-mode must be one of {', '.join(sorted(AGENT_PACKET_RUNTIME_MODES))}")
+    if args.format not in AGENT_PACKET_FORMATS:
+        raise FactoryError(f"--format must be one of {', '.join(sorted(AGENT_PACKET_FORMATS))}")
+    if args.write_policy not in AGENT_PACKET_WRITE_POLICIES:
+        raise FactoryError(f"--write-policy must be one of {', '.join(sorted(AGENT_PACKET_WRITE_POLICIES))}")
+    if role in {"builder", "reviewer"} and not args.baton:
+        raise FactoryError("--baton is required for builder and reviewer packets.")
+
+    recent = require_limit(args.recent, field="recent")
+    baton_detail: dict[str, Any] | None = None
+    baton: dict[str, Any] | None = None
+    if args.baton:
+        baton_detail = collect_baton_detail(conn, run, args.baton, recent_events=recent)
+        baton = baton_detail["baton"]
+
+    status = collect_status(conn, root, args.db)
+    prefix = command_prefix(root, args)
+    acceptance_tier = baton.get("acceptance_tier") if baton else "integration"
+    verification_level = (
+        baton.get("verification_level")
+        if baton
+        else config["verification_policy"]["default_level"]
+    )
+    return {
+        "packet_version": 1,
+        "generated_at": utc_now(),
+        "runtime_mode": args.runtime_mode,
+        "role": role,
+        "instructions": role_instructions(role),
+        "project": {
+            "root": str(root),
+            "db": str(db_path_for(root, args.db)),
+            "config": str(config_path_for(root, args.config)),
+        },
+        "run": row_to_public_dict(run),
+        "current_status": {
+            "factory_status": status["run"]["status"],
+            "work_mode": status["run"]["work_mode"],
+            "topology": status["run"]["topology"],
+            "active_batons": status["active_batons"],
+            "held_locks": status["held_locks"],
+            "latest_event": status["latest_event"],
+            "git": status["git"],
+        },
+        "baton": baton,
+        "baton_evidence": baton_detail,
+        "scope": packet_scope(role=role, baton=baton, config=config, args=args),
+        "verification_policy": {
+            "acceptance_tier": acceptance_tier,
+            "verification_level": verification_level,
+            "config": config["verification_policy"],
+        },
+        "worker_policy": worker_policy_for(role, args.write_policy),
+        "handoff_schema": handoff_schema_for(role),
+        "recording_commands": recording_commands_for(
+            prefix=prefix,
+            role=role,
+            baton_id=args.baton,
+            recent=recent,
+        ),
+        "recent_context": recent_run_context(conn, run["id"], recent),
+        "completion_contract": [
+            "Stay inside the packet scope and hard invariants.",
+            "Run or honestly report required checks.",
+            "Record CLI evidence directly only when safe and available.",
+            "If CLI access is unavailable, return the handoff or review schema to the lead agent.",
+            "Do not accept, commit, push, or broaden scope unless this packet explicitly gives that authority.",
+        ],
+    }
+
+
+def markdown_bullets(values: Iterable[Any], *, empty: str) -> list[str]:
+    result = [f"- {value}" for value in values if str(value).strip()]
+    return result or [f"- {empty}"]
+
+
+def format_agent_packet_markdown(packet: dict[str, Any]) -> str:
+    role = str(packet["role"]).title()
+    baton = packet.get("baton") or {}
+    scope = packet["scope"]
+    worker_policy = packet["worker_policy"]
+    verification_policy = packet["verification_policy"]
+    status = packet["current_status"]
+    lines = [
+        f"# Agent Packet: {role}",
+        "",
+        f"Generated: {packet['generated_at']}",
+        f"Runtime mode: {packet['runtime_mode']}",
+        f"Factory: {packet['run']['id']}",
+        f"Project root: {packet['project']['root']}",
+        "",
+        "## Role Contract",
+        "",
+        f"- Role: {packet['role']}",
+        f"- Instructions: {packet['instructions']}",
+        f"- File write policy: {worker_policy['write_policy']}",
+        f"- May run commands: {worker_policy['may_run_commands']}",
+        f"- May record CLI evidence: {worker_policy['may_record_cli_evidence']}",
+        "- If CLI access is unavailable, return the required evidence to the lead agent.",
+        "",
+        "## Current State",
+        "",
+        f"- Factory status: {status['factory_status']}",
+        f"- Work mode: {status['work_mode']}",
+        f"- Topology: {status['topology']}",
+        f"- Active batons: {len(status['active_batons'])}",
+        f"- Held locks: {len(status['held_locks'])}",
+        f"- Git head: {status['git']['head'] or 'unavailable'}",
+        "",
+        "## Baton",
+        "",
+    ]
+    if baton:
+        lines.extend(
+            [
+                f"- ID: {baton['id']}",
+                f"- Title: {baton['title']}",
+                f"- Status: {baton['status']}",
+                f"- Owner: {baton['owner']}",
+                f"- Scope: {baton['scope'] or 'not specified'}",
+                f"- Acceptance tier: {baton['acceptance_tier']}",
+                f"- Verification level: {baton['verification_level']}",
+            ]
+        )
+    else:
+        lines.append("- No focused baton supplied; coordinate current factory state.")
+    lines.extend(
+        [
+            "",
+            "## Scope Controls",
+            "",
+            "Allowed files or areas:",
+            *markdown_bullets(scope["allowed_files_or_areas"], empty="baton scope only"),
+            "",
+            "Restricted files or areas:",
+            *markdown_bullets(scope["restricted_files_or_areas"], empty="none specified"),
+            "",
+            "Hard invariants:",
+            *markdown_bullets(scope["hard_invariants"], empty="none specified"),
+            "",
+            "Non-goals:",
+            *markdown_bullets(scope["non_goals"], empty="none specified"),
+            "",
+            "Required checks:",
+            *markdown_bullets(scope["required_checks"], empty="none specified"),
+            "",
+            "## Verification Policy",
+            "",
+            f"- Acceptance tier: {verification_policy['acceptance_tier']}",
+            f"- Verification level: {verification_policy['verification_level']}",
+            f"- Config requires baton for verification: {verification_policy['config']['require_baton']}",
+            (
+                "- Config requires summary for not_run: "
+                f"{verification_policy['config']['require_summary_for_not_run']}"
+            ),
+            "",
+            "## Handoff Schema",
+            "",
+            "```json",
+            json.dumps(packet["handoff_schema"], indent=2, sort_keys=True),
+            "```",
+            "",
+            "## Recording Commands",
+            "",
+        ]
+    )
+    for command in packet["recording_commands"]:
+        lines.extend(
+            [
+                f"### {command['name']}",
+                "",
+                f"When: {command['when']}",
+                "",
+                "```bash",
+                command["command"],
+                "```",
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            "## Completion Contract",
+            "",
+            *markdown_bullets(packet["completion_contract"], empty="none specified"),
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def cmd_agent_packet(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    config = config_for_args(root, args)
+    conn = connect(root, args.db)
+    run = require_run(conn)
+    packet = build_agent_packet(root=root, conn=conn, run=run, config=config, args=args)
+    if args.format == "json":
+        print_json(packet)
+    else:
+        print(format_agent_packet_markdown(packet))
+    return 0
+
+
+def agent_packet_text(packet: dict[str, Any], packet_format: str) -> str:
+    if packet_format == "json":
+        return json.dumps(packet, indent=2, sort_keys=True) + "\n"
+    return format_agent_packet_markdown(packet)
+
+
+def packet_dir_for(root: Path, raw_dir: str) -> Path:
+    relative = safe_relative_path(raw_dir, field="packet_dir", label="Argument")
+    return root / relative
+
+
+def write_agent_packet_file(root: Path, packet: dict[str, Any], packet_format: str, packet_dir: str) -> Path:
+    out_dir = packet_dir_for(root, packet_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    extension = "json" if packet_format == "json" else "md"
+    stamp = utc_now().replace(":", "").replace("-", "").replace("Z", "")
+    baton = packet.get("baton") or {}
+    filename = "-".join(
+        [
+            "packet",
+            stamp,
+            safe_slug(str(packet.get("role", "")), fallback="role"),
+            safe_slug(str(baton.get("id") or "no-baton"), fallback="no-baton"),
+        ]
+    )
+    path = out_dir / f"{filename}.{extension}"
+    path.write_text(agent_packet_text(packet, packet_format), encoding="utf-8")
+    return path
+
+
+def has_held_baton_lock(conn: sqlite3.Connection, run_id: str, baton_id: str | None) -> bool:
+    if not baton_id:
+        return False
+    row = conn.execute(
+        """
+        SELECT 1 FROM locks
+        WHERE run_id = ? AND baton_id = ? AND status = 'held'
+        LIMIT 1
+        """,
+        (run_id, baton_id),
+    ).fetchone()
+    return row is not None
+
+
+def build_codex_spawn_command(root: Path, packet: dict[str, Any], args: argparse.Namespace) -> list[str]:
+    sandbox = args.codex_sandbox
+    if sandbox == "auto":
+        sandbox = "workspace-write" if packet["worker_policy"]["may_edit_files"] else "read-only"
+    command = [
+        args.codex_bin,
+        "exec",
+        "--cd",
+        str(root),
+        "--sandbox",
+        sandbox,
+        "--ask-for-approval",
+        args.codex_approval,
+        "--ephemeral",
+    ]
+    if args.codex_model:
+        command.extend(["--model", args.codex_model])
+    if args.codex_profile:
+        command.extend(["--profile", args.codex_profile])
+    if args.codex_skip_git_repo_check:
+        command.append("--skip-git-repo-check")
+    command.append("-")
+    return command
+
+
+CUSTOM_PLACEHOLDER_RE = re.compile(r"\{[A-Za-z_][A-Za-z0-9_]*\}")
+
+
+def build_custom_spawn_command(root: Path, packet_path: Path, args: argparse.Namespace) -> list[str]:
+    if not args.command.strip():
+        raise FactoryError("--command is required for --adapter custom.")
+    if "{packet}" not in args.command:
+        raise FactoryError("Custom adapter --command must include the {packet} placeholder.")
+    try:
+        tokens = shlex.split(args.command)
+    except ValueError as exc:
+        raise FactoryError(f"Invalid custom adapter command: {exc}") from exc
+    if not tokens:
+        raise FactoryError("Custom adapter command must not be empty.")
+    replacements = {
+        "{packet}": str(packet_path),
+        "{root}": str(root),
+        "{role}": args.role,
+        "{baton}": args.baton or "",
+    }
+    expanded: list[str] = []
+    for token in tokens:
+        for placeholder, value in replacements.items():
+            token = token.replace(placeholder, value)
+        unknown = CUSTOM_PLACEHOLDER_RE.search(token)
+        if unknown:
+            raise FactoryError(f"Unknown custom adapter placeholder: {unknown.group(0)}")
+        expanded.append(token)
+    return expanded
+
+
+def build_spawn_command(root: Path, packet: dict[str, Any], packet_path: Path, args: argparse.Namespace) -> tuple[list[str], str | None]:
+    if args.adapter == "codex-cli":
+        return build_codex_spawn_command(root, packet, args), agent_packet_text(packet, args.packet_format)
+    if args.adapter == "custom":
+        return build_custom_spawn_command(root, packet_path, args), None
+    raise FactoryError(f"--adapter must be one of {', '.join(sorted(AGENT_SPAWN_ADAPTERS))}")
+
+
+def run_spawn_command(
+    *,
+    command: list[str],
+    stdin: str | None,
+    root: Path,
+    timeout_seconds: int,
+    output_limit: int,
+) -> dict[str, Any]:
+    started = time.monotonic()
+    try:
+        proc = subprocess.run(
+            command,
+            cwd=root,
+            input=stdin,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout_seconds,
+            check=False,
+        )
+        stdout, stdout_truncated = truncate_text(proc.stdout, output_limit)
+        stderr, stderr_truncated = truncate_text(proc.stderr, output_limit)
+        return {
+            "status": "completed" if proc.returncode == 0 else "failed",
+            "returncode": proc.returncode,
+            "duration_ms": int((time.monotonic() - started) * 1000),
+            "stdout": stdout,
+            "stderr": stderr,
+            "stdout_truncated": stdout_truncated,
+            "stderr_truncated": stderr_truncated,
+        }
+    except subprocess.TimeoutExpired as exc:
+        stdout, stdout_truncated = truncate_text(exc.stdout if isinstance(exc.stdout, str) else "", output_limit)
+        stderr, stderr_truncated = truncate_text(exc.stderr if isinstance(exc.stderr, str) else "", output_limit)
+        return {
+            "status": "timed_out",
+            "returncode": 124,
+            "duration_ms": int((time.monotonic() - started) * 1000),
+            "stdout": stdout,
+            "stderr": stderr,
+            "stdout_truncated": stdout_truncated,
+            "stderr_truncated": stderr_truncated,
+        }
+    except OSError as exc:
+        return {
+            "status": "failed",
+            "returncode": 127,
+            "duration_ms": int((time.monotonic() - started) * 1000),
+            "stdout": "",
+            "stderr": str(exc),
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+        }
+
+
+def spawn_event_payload(
+    *,
+    adapter: str,
+    role: str,
+    baton_id: str | None,
+    packet_path: Path,
+    command: list[str],
+    timeout_seconds: int,
+    status: str | None = None,
+    returncode: int | None = None,
+    duration_ms: int | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "adapter": adapter,
+        "role": role,
+        "baton_id": baton_id or "",
+        "packet_path": str(packet_path),
+        "timeout_seconds": timeout_seconds,
+        "command_preview": shorten(shell_join(command), 500),
+    }
+    if status is not None:
+        payload["status"] = status
+    if returncode is not None:
+        payload["returncode"] = returncode
+    if duration_ms is not None:
+        payload["duration_ms"] = duration_ms
+    return payload
+
+
+def cmd_agent_spawn(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    if not args.experimental and not args.dry_run:
+        raise FactoryError("agent spawn is experimental; pass --experimental to execute or --dry-run to preview.")
+    timeout_seconds = require_timeout(args.timeout_seconds)
+    output_limit = require_output_limit(args.output_limit)
+    args.format = args.packet_format
+    args.runtime_mode = "adapter_spawn"
+
+    config = config_for_args(root, args)
+    conn = connect(root, args.db)
+    run = require_run(conn)
+    packet = build_agent_packet(root=root, conn=conn, run=run, config=config, args=args)
+    if packet["worker_policy"]["may_edit_files"] and args.baton and not args.allow_unlocked:
+        if not has_held_baton_lock(conn, run["id"], args.baton):
+            raise FactoryError("Write-capable spawn requires a held lock for --baton, or pass --allow-unlocked.")
+    packet_path = write_agent_packet_file(root, packet, args.packet_format, args.packet_dir)
+    command, stdin = build_spawn_command(root, packet, packet_path, args)
+    result: dict[str, Any] = {
+        "adapter": args.adapter,
+        "role": args.role,
+        "baton": args.baton,
+        "packet_path": str(packet_path),
+        "command": command,
+        "command_preview": shell_join(command),
+        "timeout_seconds": timeout_seconds,
+        "experimental": args.experimental,
+        "dry_run": args.dry_run,
+        "events_recorded": False,
+    }
+    if args.dry_run:
+        result.update({"status": "dry_run", "returncode": 0})
+        print_json(result)
+        return 0
+
+    if not args.no_event:
+        emit_event(
+            conn,
+            event_type="agent.spawn.started",
+            actor=args.actor,
+            run_id=run["id"],
+            baton_id=args.baton,
+            summary=f"{args.adapter} spawn started for {args.role}",
+            payload=spawn_event_payload(
+                adapter=args.adapter,
+                role=args.role,
+                baton_id=args.baton,
+                packet_path=packet_path,
+                command=command,
+                timeout_seconds=timeout_seconds,
+            ),
+        )
+        conn.commit()
+        result["events_recorded"] = True
+
+    execution = run_spawn_command(
+        command=command,
+        stdin=stdin,
+        root=root,
+        timeout_seconds=timeout_seconds,
+        output_limit=output_limit,
+    )
+    result.update(execution)
+
+    if not args.no_event:
+        emit_event(
+            conn,
+            event_type="agent.spawn.completed",
+            actor=args.actor,
+            run_id=run["id"],
+            baton_id=args.baton,
+            summary=f"{args.adapter} spawn {execution['status']} for {args.role}",
+            payload=spawn_event_payload(
+                adapter=args.adapter,
+                role=args.role,
+                baton_id=args.baton,
+                packet_path=packet_path,
+                command=command,
+                timeout_seconds=timeout_seconds,
+                status=execution["status"],
+                returncode=execution["returncode"],
+                duration_ms=execution["duration_ms"],
+            ),
+        )
+        conn.commit()
+
+    print_json(result)
+    return int(execution["returncode"])
+
+
 def cmd_event_append(args: argparse.Namespace) -> int:
     root = resolve_root(args.root)
     conn = connect(root, args.db)
@@ -394,8 +1841,11 @@ def release_lock(conn: sqlite3.Connection, *, name: str) -> None:
 
 def cmd_baton_create(args: argparse.Namespace) -> int:
     root = resolve_root(args.root)
+    config = config_for_args(root, args)
     conn = connect(root, args.db)
     run = require_run(conn)
+    lock_name = args.lock_name or config["default_lock_name"]
+    verification_level = args.verification_level or config["verification_policy"]["default_level"]
     active = active_batons(conn, run["id"])
     if active and not args.allow_active:
         active_ids = ", ".join(row["id"] for row in active)
@@ -416,7 +1866,7 @@ def cmd_baton_create(args: argparse.Namespace) -> int:
             args.owner_thread or "",
             args.scope or "",
             args.acceptance_tier,
-            args.verification_level,
+            verification_level,
             args.model or "",
             args.reasoning or "",
             now,
@@ -428,7 +1878,7 @@ def cmd_baton_create(args: argparse.Namespace) -> int:
         acquire_lock(
             conn,
             run_id=run["id"],
-            name=args.lock_name,
+            name=lock_name,
             holder=args.owner or args.actor,
             baton_id=args.baton_id,
             force=args.force_lock,
@@ -444,20 +1894,22 @@ def cmd_baton_create(args: argparse.Namespace) -> int:
             "owner": args.owner,
             "scope": args.scope,
             "acceptance_tier": args.acceptance_tier,
-            "verification_level": args.verification_level,
+            "verification_level": verification_level,
             "lock_acquired": not args.no_lock,
         },
     )
     conn.commit()
-    print_json({"status": "assigned", "baton": args.baton_id, "lock": None if args.no_lock else args.lock_name})
+    print_json({"status": "assigned", "baton": args.baton_id, "lock": None if args.no_lock else lock_name})
     return 0
 
 
 def cmd_baton_handoff(args: argparse.Namespace) -> int:
     root = resolve_root(args.root)
+    config = config_for_args(root, args)
     conn = connect(root, args.db)
     run = require_run(conn)
     baton = require_baton(conn, args.baton_id)
+    lock_name = args.lock_name or config["default_lock_name"]
     files = csv_values(args.files)
     commands = csv_values(args.commands)
     verification = csv_values(args.verification)
@@ -496,7 +1948,7 @@ def cmd_baton_handoff(args: argparse.Namespace) -> int:
         ),
     )
     if args.release_lock:
-        release_lock(conn, name=args.lock_name)
+        release_lock(conn, name=lock_name)
     emit_event(
         conn,
         event_type="baton.handed_off",
@@ -513,9 +1965,11 @@ def cmd_baton_handoff(args: argparse.Namespace) -> int:
 
 def cmd_baton_accept(args: argparse.Namespace) -> int:
     root = resolve_root(args.root)
+    config = config_for_args(root, args)
     conn = connect(root, args.db)
     run = require_run(conn)
     baton = require_baton(conn, args.baton_id)
+    lock_name = args.lock_name or config["default_lock_name"]
     now = utc_now()
     conn.execute(
         """
@@ -534,7 +1988,7 @@ def cmd_baton_accept(args: argparse.Namespace) -> int:
             (args.baton_id, args.commit, args.message or "", args.pushed_status, now),
         )
     if args.release_lock:
-        release_lock(conn, name=args.lock_name)
+        release_lock(conn, name=lock_name)
     emit_event(
         conn,
         event_type="baton.accepted",
@@ -551,14 +2005,24 @@ def cmd_baton_accept(args: argparse.Namespace) -> int:
 
 def cmd_verify_record(args: argparse.Namespace) -> int:
     root = resolve_root(args.root)
+    config = config_for_args(root, args)
     conn = connect(root, args.db)
     run = require_run(conn)
+    verification_policy = config["verification_policy"]
+    if verification_policy["require_baton"] and not args.baton:
+        raise FactoryError("Project config requires --baton for verification records.")
     if args.baton:
         require_baton(conn, args.baton)
-    if args.result not in {"pass", "fail", "not_run", "blocked"}:
+    if args.result not in VERIFICATION_RESULTS:
         raise FactoryError("--result must be one of pass, fail, not_run, blocked")
     if args.duration_ms is not None and args.duration_ms < 0:
         raise FactoryError("--duration-ms must be greater than or equal to 0")
+    if (
+        args.result == "not_run"
+        and verification_policy["require_summary_for_not_run"]
+        and not args.summary.strip()
+    ):
+        raise FactoryError("Project config requires --summary when --result is not_run.")
     conn.execute(
         """
         INSERT INTO verification_runs
@@ -722,12 +2186,14 @@ def cmd_resume(args: argparse.Namespace) -> int:
 
 def cmd_lock_acquire(args: argparse.Namespace) -> int:
     root = resolve_root(args.root)
+    config = config_for_args(root, args)
     conn = connect(root, args.db)
     run = require_run(conn)
+    lock_name = args.name or config["default_lock_name"]
     acquire_lock(
         conn,
         run_id=run["id"],
-        name=args.name,
+        name=lock_name,
         holder=args.holder,
         baton_id=args.baton,
         force=args.force,
@@ -738,29 +2204,31 @@ def cmd_lock_acquire(args: argparse.Namespace) -> int:
         actor=args.holder,
         run_id=run["id"],
         baton_id=args.baton,
-        summary=f"{args.name} acquired by {args.holder}",
-        payload={"lock": args.name},
+        summary=f"{lock_name} acquired by {args.holder}",
+        payload={"lock": lock_name},
     )
     conn.commit()
-    print_json({"status": "held", "lock": args.name, "holder": args.holder})
+    print_json({"status": "held", "lock": lock_name, "holder": args.holder})
     return 0
 
 
 def cmd_lock_release(args: argparse.Namespace) -> int:
     root = resolve_root(args.root)
+    config = config_for_args(root, args)
     conn = connect(root, args.db)
     run = require_run(conn)
-    release_lock(conn, name=args.name)
+    lock_name = args.name or config["default_lock_name"]
+    release_lock(conn, name=lock_name)
     emit_event(
         conn,
         event_type="lock.released",
         actor=args.actor,
         run_id=run["id"],
-        summary=f"{args.name} released",
-        payload={"lock": args.name},
+        summary=f"{lock_name} released",
+        payload={"lock": lock_name},
     )
     conn.commit()
-    print_json({"status": "released", "lock": args.name})
+    print_json({"status": "released", "lock": lock_name})
     return 0
 
 
@@ -859,12 +2327,14 @@ def render_ledger(conn: sqlite3.Connection, root: Path, recent: int, db: str | N
 
 def cmd_render_ledger(args: argparse.Namespace) -> int:
     root = resolve_root(args.root)
+    config = config_for_args(root, args)
     conn = connect(root, args.db)
     if args.recent < 1:
         raise FactoryError("--recent must be greater than 0")
     markdown = render_ledger(conn, root, args.recent, args.db)
-    if args.out:
-        out = Path(args.out)
+    output_path = args.out or config["ledger_output_path"]
+    if output_path:
+        out = Path(output_path)
         if not out.is_absolute():
             out = root / out
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -875,7 +2345,7 @@ def cmd_render_ledger(args: argparse.Namespace) -> int:
     return 0
 
 
-def doctor_check(root: Path, conn: sqlite3.Connection) -> tuple[list[dict[str, str]], int]:
+def doctor_check(root: Path, conn: sqlite3.Connection, config: dict[str, Any]) -> tuple[list[dict[str, str]], int]:
     findings: list[dict[str, str]] = []
     exit_code = 0
 
@@ -907,14 +2377,19 @@ def doctor_check(root: Path, conn: sqlite3.Connection) -> tuple[list[dict[str, s
     else:
         add("warn", "git", "Git status unavailable")
 
-    protected = root / "apps/web/next-env.d.ts"
-    if protected.exists():
-        diff_code, _ = git_command(root, ["diff", "--exit-code", "--", "apps/web/next-env.d.ts"])
-        staged_code, staged = git_command(root, ["diff", "--cached", "--name-only", "--", "apps/web/next-env.d.ts"])
+    protected_files = config["protected_generated_files"]
+    for protected_file in protected_files:
+        protected = root / protected_file
+        check_name = f"protected_generated:{protected_file}"
+        if not protected.exists():
+            add("warn", check_name, "Configured protected file is missing")
+            continue
+        diff_code, _ = git_command(root, ["diff", "--exit-code", "--", protected_file])
+        staged_code, staged = git_command(root, ["diff", "--cached", "--name-only", "--", protected_file])
         if diff_code != 0 or (staged_code == 0 and staged.strip()):
-            add("fail", "protected_next_env", "apps/web/next-env.d.ts has diff or is staged")
+            add("fail", check_name, f"{protected_file} has diff or is staged")
         else:
-            add("ok", "protected_next_env", "apps/web/next-env.d.ts is unchanged")
+            add("ok", check_name, f"{protected_file} is unchanged")
 
     ahead_code, ahead = git_command(root, ["status", "-sb"])
     if ahead_code == 0:
@@ -924,8 +2399,9 @@ def doctor_check(root: Path, conn: sqlite3.Connection) -> tuple[list[dict[str, s
 
 def cmd_doctor(args: argparse.Namespace) -> int:
     root = resolve_root(args.root)
+    config = config_for_args(root, args)
     conn = connect(root, args.db)
-    findings, exit_code = doctor_check(root, conn)
+    findings, exit_code = doctor_check(root, conn, config)
     if args.json:
         print_json({"status": "fail" if exit_code else "ok", "findings": findings})
     else:
@@ -937,6 +2413,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--root", default=None, help="Project root; defaults to current directory.")
     parser.add_argument("--db", default=None, help="Factory DB path; defaults to .agentic-factory/factory.db.")
+    parser.add_argument("--config", default=None, help="Project config path; defaults to .agentic-factory/config.json.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -944,10 +2421,18 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_args(parser)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    config = subparsers.add_parser("config", help="Create or show project config.")
+    config_sub = config.add_subparsers(dest="config_command", required=True)
+    config_init = config_sub.add_parser("init", help="Create .agentic-factory/config.json.")
+    config_init.add_argument("--force", action="store_true")
+    config_init.set_defaults(func=cmd_config_init)
+    config_show = config_sub.add_parser("show", help="Show effective project config.")
+    config_show.set_defaults(func=cmd_config_show)
+
     init = subparsers.add_parser("init", help="Initialize a factory DB.")
-    init.add_argument("--mode", default="balanced")
+    init.add_argument("--mode", default=None)
     init.add_argument("--objective", default="")
-    init.add_argument("--topology", default="executive_as_ledger")
+    init.add_argument("--topology", default=None)
     init.add_argument("--actor", default="Agent")
     init.add_argument("--run-id", default="")
     init.add_argument("--force", action="store_true")
@@ -957,6 +2442,71 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--json", action="store_true")
     status.add_argument("--compact", action="store_true")
     status.set_defaults(func=cmd_status)
+
+    agent = subparsers.add_parser("agent", help="Generate portable agent packets.")
+    agent_sub = agent.add_subparsers(dest="agent_command", required=True)
+    agent_packet = agent_sub.add_parser("packet", help="Generate a role packet for delegation.")
+    agent_packet.add_argument("--role", required=True, choices=sorted(AGENT_PACKET_ROLES))
+    agent_packet.add_argument("--baton", default=None)
+    agent_packet.add_argument("--recent", type=int, default=DEFAULT_LIST_LIMIT)
+    agent_packet.add_argument("--format", choices=sorted(AGENT_PACKET_FORMATS), default="markdown")
+    agent_packet.add_argument(
+        "--runtime-mode",
+        choices=sorted(AGENT_PACKET_RUNTIME_MODES),
+        default="agent_cli_subagents",
+    )
+    agent_packet.add_argument("--write-policy", choices=sorted(AGENT_PACKET_WRITE_POLICIES), default="auto")
+    agent_packet.add_argument("--allowed", action="append", default=[], help="Allowed file or area; repeat or comma-separate.")
+    agent_packet.add_argument(
+        "--restricted",
+        action="append",
+        default=[],
+        help="Restricted file or area; repeat or comma-separate.",
+    )
+    agent_packet.add_argument("--invariant", action="append", default=[], help="Hard invariant to include.")
+    agent_packet.add_argument("--required-check", action="append", default=[], help="Required check to include.")
+    agent_packet.add_argument("--non-goal", action="append", default=[], help="Non-goal to include.")
+    agent_packet.set_defaults(func=cmd_agent_packet)
+
+    agent_spawn = agent_sub.add_parser("spawn", help="Experimentally spawn a packet through an adapter.")
+    agent_spawn.add_argument("--adapter", required=True, choices=sorted(AGENT_SPAWN_ADAPTERS))
+    agent_spawn.add_argument("--experimental", action="store_true", help="Required to execute the adapter.")
+    agent_spawn.add_argument("--dry-run", action="store_true", help="Write packet and print argv without execution.")
+    agent_spawn.add_argument("--role", required=True, choices=sorted(AGENT_PACKET_ROLES))
+    agent_spawn.add_argument("--baton", default=None)
+    agent_spawn.add_argument("--recent", type=int, default=DEFAULT_LIST_LIMIT)
+    agent_spawn.add_argument("--packet-format", choices=sorted(AGENT_PACKET_FORMATS), default="markdown")
+    agent_spawn.add_argument("--packet-dir", default=DEFAULT_PACKET_DIR)
+    agent_spawn.add_argument(
+        "--runtime-mode",
+        choices=sorted(AGENT_PACKET_RUNTIME_MODES),
+        default="adapter_spawn",
+        help=argparse.SUPPRESS,
+    )
+    agent_spawn.add_argument("--write-policy", choices=sorted(AGENT_PACKET_WRITE_POLICIES), default="auto")
+    agent_spawn.add_argument("--allowed", action="append", default=[], help="Allowed file or area; repeat or comma-separate.")
+    agent_spawn.add_argument(
+        "--restricted",
+        action="append",
+        default=[],
+        help="Restricted file or area; repeat or comma-separate.",
+    )
+    agent_spawn.add_argument("--invariant", action="append", default=[], help="Hard invariant to include.")
+    agent_spawn.add_argument("--required-check", action="append", default=[], help="Required check to include.")
+    agent_spawn.add_argument("--non-goal", action="append", default=[], help="Non-goal to include.")
+    agent_spawn.add_argument("--command", default="", help="Custom adapter command template; must include {packet}.")
+    agent_spawn.add_argument("--timeout-seconds", type=int, default=DEFAULT_SPAWN_TIMEOUT_SECONDS)
+    agent_spawn.add_argument("--output-limit", type=int, default=DEFAULT_SPAWN_OUTPUT_LIMIT)
+    agent_spawn.add_argument("--allow-unlocked", action="store_true", help="Allow write-capable spawn without a held baton lock.")
+    agent_spawn.add_argument("--no-event", action="store_true", help="Do not record agent.spawn events.")
+    agent_spawn.add_argument("--actor", default="Executive")
+    agent_spawn.add_argument("--codex-bin", default="codex")
+    agent_spawn.add_argument("--codex-model", default="")
+    agent_spawn.add_argument("--codex-profile", default="")
+    agent_spawn.add_argument("--codex-sandbox", choices=sorted(CODEX_SPAWN_SANDBOXES), default="auto")
+    agent_spawn.add_argument("--codex-approval", choices=sorted(CODEX_APPROVAL_POLICIES), default="never")
+    agent_spawn.add_argument("--codex-skip-git-repo-check", action="store_true")
+    agent_spawn.set_defaults(func=cmd_agent_spawn)
 
     event = subparsers.add_parser("event", help="Record a raw event.")
     event_sub = event.add_subparsers(dest="event_command", required=True)
@@ -971,6 +2521,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     baton = subparsers.add_parser("baton", help="Create, hand off, or accept batons.")
     baton_sub = baton.add_subparsers(dest="baton_command", required=True)
+    baton_list = baton_sub.add_parser("list", help="List batons for the current run.")
+    baton_list.add_argument("--all", action="store_true", help="Include non-active batons.")
+    baton_list.add_argument("--status", action="append", default=[], help="Filter by status; repeat or comma-separate.")
+    baton_list.add_argument("--limit", type=int, default=DEFAULT_LIST_LIMIT)
+    baton_list.add_argument("--json", action="store_true")
+    baton_list.set_defaults(func=cmd_baton_list)
+    baton_show = baton_sub.add_parser("show", help="Show detailed baton evidence.")
+    baton_show.add_argument("baton_id")
+    baton_show.add_argument("--recent-events", type=int, default=DEFAULT_LIST_LIMIT)
+    baton_show.add_argument("--json", action="store_true")
+    baton_show.set_defaults(func=cmd_baton_show)
     baton_create = baton_sub.add_parser("create", help="Assign a baton and acquire the writer lock.")
     baton_create.add_argument("baton_id")
     baton_create.add_argument("--title", required=True)
@@ -979,13 +2540,13 @@ def build_parser() -> argparse.ArgumentParser:
     baton_create.add_argument("--scope", default="")
     baton_create.add_argument("--summary", default="")
     baton_create.add_argument("--acceptance-tier", default="integration")
-    baton_create.add_argument("--verification-level", default="focused")
+    baton_create.add_argument("--verification-level", default=None)
     baton_create.add_argument("--model", default="")
     baton_create.add_argument("--reasoning", default="")
     baton_create.add_argument("--actor", default="Executive")
     baton_create.add_argument("--allow-active", action="store_true")
     baton_create.add_argument("--no-lock", action="store_true")
-    baton_create.add_argument("--lock-name", default="main-worktree")
+    baton_create.add_argument("--lock-name", default=None)
     baton_create.add_argument("--force-lock", action="store_true")
     baton_create.set_defaults(func=cmd_baton_create)
 
@@ -1002,7 +2563,7 @@ def build_parser() -> argparse.ArgumentParser:
     baton_handoff.add_argument("--actor", default="Builder")
     baton_handoff.add_argument("--release-lock", action="store_true", default=True)
     baton_handoff.add_argument("--keep-lock", dest="release_lock", action="store_false")
-    baton_handoff.add_argument("--lock-name", default="main-worktree")
+    baton_handoff.add_argument("--lock-name", default=None)
     baton_handoff.set_defaults(func=cmd_baton_handoff)
 
     baton_accept = baton_sub.add_parser("accept", help="Accept a baton.")
@@ -1014,11 +2575,16 @@ def build_parser() -> argparse.ArgumentParser:
     baton_accept.add_argument("--actor", default="Executive")
     baton_accept.add_argument("--release-lock", action="store_true", default=True)
     baton_accept.add_argument("--keep-lock", dest="release_lock", action="store_false")
-    baton_accept.add_argument("--lock-name", default="main-worktree")
+    baton_accept.add_argument("--lock-name", default=None)
     baton_accept.set_defaults(func=cmd_baton_accept)
 
     verify = subparsers.add_parser("verify", help="Record verification commands.")
     verify_sub = verify.add_subparsers(dest="verify_command", required=True)
+    verify_list = verify_sub.add_parser("list", help="List verification records.")
+    verify_list.add_argument("--baton", default=None)
+    verify_list.add_argument("--recent", type=int, default=DEFAULT_LIST_LIMIT)
+    verify_list.add_argument("--json", action="store_true")
+    verify_list.set_defaults(func=cmd_verification_list)
     verify_record = verify_sub.add_parser("record")
     verify_record.add_argument("--baton", default=None)
     verify_record.add_argument("--command", required=True)
@@ -1033,6 +2599,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     review = subparsers.add_parser("review", help="Record review packets.")
     review_sub = review.add_subparsers(dest="review_command", required=True)
+    review_list = review_sub.add_parser("list", help="List review records.")
+    review_list.add_argument("--baton", default=None)
+    review_list.add_argument("--recent", type=int, default=DEFAULT_LIST_LIMIT)
+    review_list.add_argument("--json", action="store_true")
+    review_list.set_defaults(func=cmd_review_list)
     review_record = review_sub.add_parser("record")
     review_record.add_argument("--baton", required=True)
     review_record.add_argument("--reviewer", default="Reviewer")
@@ -1059,15 +2630,32 @@ def build_parser() -> argparse.ArgumentParser:
     lock = subparsers.add_parser("lock", help="Manage explicit locks.")
     lock_sub = lock.add_subparsers(dest="lock_command", required=True)
     lock_acquire = lock_sub.add_parser("acquire")
-    lock_acquire.add_argument("--name", default="main-worktree")
+    lock_acquire.add_argument("--name", default=None)
     lock_acquire.add_argument("--holder", required=True)
     lock_acquire.add_argument("--baton", default=None)
     lock_acquire.add_argument("--force", action="store_true")
     lock_acquire.set_defaults(func=cmd_lock_acquire)
     lock_release = lock_sub.add_parser("release")
-    lock_release.add_argument("--name", default="main-worktree")
+    lock_release.add_argument("--name", default=None)
     lock_release.add_argument("--actor", default="Agent")
     lock_release.set_defaults(func=cmd_lock_release)
+
+    events = subparsers.add_parser("events", help="Inspect recorded events.")
+    events_sub = events.add_subparsers(dest="events_command", required=True)
+    events_list = events_sub.add_parser("list", help="List recent events.")
+    events_list.add_argument("--recent", type=int, default=DEFAULT_LIST_LIMIT)
+    events_list.add_argument("--baton", default=None)
+    events_list.add_argument("--type", default="")
+    events_list.add_argument("--json", action="store_true")
+    events_list.set_defaults(func=cmd_events_list)
+
+    verification = subparsers.add_parser("verification", help="Inspect verification records.")
+    verification_sub = verification.add_subparsers(dest="verification_command", required=True)
+    verification_list = verification_sub.add_parser("list", help="List verification records.")
+    verification_list.add_argument("--baton", default=None)
+    verification_list.add_argument("--recent", type=int, default=DEFAULT_LIST_LIMIT)
+    verification_list.add_argument("--json", action="store_true")
+    verification_list.set_defaults(func=cmd_verification_list)
 
     render = subparsers.add_parser("render-ledger", help="Render markdown ledger from DB.")
     render.add_argument("--out", default="")

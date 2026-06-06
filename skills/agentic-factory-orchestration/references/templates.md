@@ -7,7 +7,8 @@ DB records.
 ## Effective Config Summary
 
 ```text
-mode/topology:
+runtime_mode:
+work_mode/topology:
 target/tier:
 principal/user involvement:
 feedback handling:
@@ -28,10 +29,20 @@ known blockers:
 ## Capability Preflight
 
 ```text
+runtime_mode:
+delegation_mechanism:
 thread_tools_available:
+subagent_tools_available:
 known_thread_tool_limits:
 automation_tools_available:
 goal_tools_available:
+worker_workspace_model:
+worker_write_capability:
+worker_shell_capability:
+worker_skill_or_plugin_inheritance:
+credential_or_secret_inheritance:
+lead_visibility_into_worker_output:
+cancellation_or_timeout_controls:
 git_write_allowed:
 git_push_auth_available:
 network_available:
@@ -65,6 +76,38 @@ external_effect_policy:
 destructive_action_policy:
 handoff_required:
 escalation_triggers:
+```
+
+## Agent Packet Request
+
+```text
+role: builder | reviewer | executive
+baton_id:
+runtime_mode:
+write_policy: auto | read-only | write
+allowed_files_or_areas:
+restricted_files_or_areas:
+hard_invariants:
+required_checks:
+non_goals:
+packet_format: markdown | json
+```
+
+## Adapter Spawn Request
+
+```text
+adapter: codex-cli | custom
+role:
+baton_id:
+dry_run_required: true
+experimental_authorized:
+command_template:
+timeout_seconds:
+packet_path:
+workspace_lock_status:
+sandbox_or_permission_profile:
+expected_output_contract:
+recovery_plan:
 ```
 
 ## Handoff Bundle

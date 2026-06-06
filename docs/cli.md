@@ -11,21 +11,24 @@ Global options apply before the command name:
 
 - `--root <path>`: target project root; defaults to the current working directory.
 - `--db <path>`: SQLite DB path; relative paths resolve under `--root`.
+- `--config <path>`: project config path; relative paths resolve under `--root`.
 
-The CLI is local-first and stdlib-only. It does not execute shell input from command arguments.
+The CLI is local-first and stdlib-only. It does not execute shell input from command arguments or spawn agent processes.
 
 ## `factory.py`
 
 ```text
-usage: factory.py [-h] [--root ROOT] [--db DB]
-                  {init,status,event,baton,verify,review,pause,resume,lock,render-ledger,doctor} ...
+usage: factory.py [-h] [--root ROOT] [--db DB] [--config CONFIG]
+                  {config,init,status,agent,event,baton,verify,review,pause,resume,lock,events,verification,render-ledger,doctor} ...
 
 SQLite-backed software factory CLI.
 
 positional arguments:
-  {init,status,event,baton,verify,review,pause,resume,lock,render-ledger,doctor}
+  {config,init,status,agent,event,baton,verify,review,pause,resume,lock,events,verification,render-ledger,doctor}
+    config              Create or show project config.
     init                Initialize a factory DB.
     status              Show current factory state.
+    agent               Generate portable agent packets.
     event               Record a raw event.
     baton               Create, hand off, or accept batons.
     verify              Record verification commands.
@@ -33,6 +36,8 @@ positional arguments:
     pause               Pause the factory.
     resume              Resume the factory.
     lock                Manage explicit locks.
+    events              Inspect recorded events.
+    verification        Inspect verification records.
     render-ledger       Render markdown ledger from DB.
     doctor              Run factory health checks.
 
@@ -40,6 +45,7 @@ options:
   -h, --help            show this help message and exit
   --root ROOT           Project root; defaults to current directory.
   --db DB               Factory DB path; defaults to .agentic-factory/factory.db.
+  --config CONFIG       Project config path; defaults to .agentic-factory/config.json.
 ```
 
 Use global options before the command name.
@@ -54,6 +60,77 @@ Common failures:
 
 - No command: argparse prints usage and exits non-zero.
 - Relative `--db`: resolved under `--root`, not the shell's original directory.
+
+## `factory.py config`
+
+```text
+usage: factory.py config [-h] {init,show} ...
+
+positional arguments:
+  {init,show}
+    init       Create .agentic-factory/config.json.
+    show       Show effective project config.
+
+options:
+  -h, --help   show this help message and exit
+```
+
+## `factory.py config init`
+
+```text
+usage: factory.py config init [-h] [--force]
+
+options:
+  -h, --help  show this help message and exit
+  --force
+```
+
+Required arguments: none.
+
+Example:
+
+```bash
+python3 scripts/factory.py config init
+```
+
+Example output shape:
+
+```json
+{"status": "created", "path": ".../.agentic-factory/config.json", "config": {...}}
+```
+
+Common failures:
+
+- Config already exists and `--force` was not supplied.
+- The target config path cannot be written.
+
+## `factory.py config show`
+
+```text
+usage: factory.py config show [-h]
+
+options:
+  -h, --help  show this help message and exit
+```
+
+Required arguments: none.
+
+Example:
+
+```bash
+python3 scripts/factory.py config show
+```
+
+Example output shape:
+
+```json
+{"path": ".../.agentic-factory/config.json", "exists": true, "config": {...}}
+```
+
+Common failures:
+
+- Config JSON is invalid.
+- Config contains unknown fields or unsafe relative paths.
 
 ## `factory.py init`
 
@@ -122,6 +199,161 @@ Common failures:
 
 - No run exists: initialize first with `factory.py init`.
 
+## `factory.py agent`
+
+```text
+usage: factory.py agent [-h] {packet,spawn} ...
+
+positional arguments:
+  {packet,spawn}
+    packet        Generate a role packet for delegation.
+    spawn         Experimentally spawn a packet through an adapter.
+
+options:
+  -h, --help      show this help message and exit
+```
+
+## `factory.py agent packet`
+
+```text
+usage: factory.py agent packet [-h] --role {builder,executive,reviewer} [--baton BATON]
+                               [--recent RECENT] [--format {json,markdown}]
+                               [--runtime-mode {adapter_spawn,agent_cli_subagents,codex_native,manual_protocol,serial_single_agent}]
+                               [--write-policy {auto,read-only,write}] [--allowed ALLOWED]
+                               [--restricted RESTRICTED] [--invariant INVARIANT]
+                               [--required-check REQUIRED_CHECK] [--non-goal NON_GOAL]
+
+options:
+  -h, --help            show this help message and exit
+  --role {builder,executive,reviewer}
+  --baton BATON
+  --recent RECENT
+  --format {json,markdown}
+  --runtime-mode {adapter_spawn,agent_cli_subagents,codex_native,manual_protocol,serial_single_agent}
+  --write-policy {auto,read-only,write}
+  --allowed ALLOWED     Allowed file or area; repeat or comma-separate.
+  --restricted RESTRICTED
+                        Restricted file or area; repeat or comma-separate.
+  --invariant INVARIANT
+                        Hard invariant to include.
+  --required-check REQUIRED_CHECK
+                        Required check to include.
+  --non-goal NON_GOAL   Non-goal to include.
+```
+
+Required arguments: `--role`.
+
+Builder and Reviewer packets also require `--baton`.
+
+Example:
+
+```bash
+python3 scripts/factory.py agent packet --role builder --baton B-001
+```
+
+Structured output:
+
+```bash
+python3 scripts/factory.py agent packet --role reviewer --baton B-001 --format json
+```
+
+Example output shape:
+
+```json
+{"packet_version": 1, "role": "builder", "baton": {"id": "B-001"}, "recording_commands": []}
+```
+
+Common failures:
+
+- No run exists.
+- Unknown baton when `--baton` is supplied.
+- `--baton` is missing for Builder or Reviewer packets.
+- `--recent` is outside the allowed range.
+
+## `factory.py agent spawn`
+
+```text
+usage: factory.py agent spawn [-h] --adapter {codex-cli,custom} [--experimental] [--dry-run]
+                              --role {builder,executive,reviewer} [--baton BATON]
+                              [--recent RECENT] [--packet-format {json,markdown}]
+                              [--packet-dir PACKET_DIR] [--write-policy {auto,read-only,write}]
+                              [--allowed ALLOWED] [--restricted RESTRICTED]
+                              [--invariant INVARIANT] [--required-check REQUIRED_CHECK]
+                              [--non-goal NON_GOAL] [--command COMMAND]
+                              [--timeout-seconds TIMEOUT_SECONDS] [--output-limit OUTPUT_LIMIT]
+                              [--allow-unlocked] [--no-event] [--actor ACTOR]
+                              [--codex-bin CODEX_BIN] [--codex-model CODEX_MODEL]
+                              [--codex-profile CODEX_PROFILE]
+                              [--codex-sandbox {auto,read-only,workspace-write}]
+                              [--codex-approval {never,on-failure,on-request,untrusted}]
+                              [--codex-skip-git-repo-check]
+
+options:
+  -h, --help            show this help message and exit
+  --adapter {codex-cli,custom}
+  --experimental        Required to execute the adapter.
+  --dry-run             Write packet and print argv without execution.
+  --role {builder,executive,reviewer}
+  --baton BATON
+  --recent RECENT
+  --packet-format {json,markdown}
+  --packet-dir PACKET_DIR
+  --write-policy {auto,read-only,write}
+  --allowed ALLOWED     Allowed file or area; repeat or comma-separate.
+  --restricted RESTRICTED
+                        Restricted file or area; repeat or comma-separate.
+  --invariant INVARIANT
+                        Hard invariant to include.
+  --required-check REQUIRED_CHECK
+                        Required check to include.
+  --non-goal NON_GOAL   Non-goal to include.
+  --command COMMAND     Custom adapter command template; must include {packet}.
+  --timeout-seconds TIMEOUT_SECONDS
+  --output-limit OUTPUT_LIMIT
+  --allow-unlocked      Allow write-capable spawn without a held baton lock.
+  --no-event            Do not record agent.spawn events.
+  --actor ACTOR
+  --codex-bin CODEX_BIN
+  --codex-model CODEX_MODEL
+  --codex-profile CODEX_PROFILE
+  --codex-sandbox {auto,read-only,workspace-write}
+  --codex-approval {never,on-failure,on-request,untrusted}
+  --codex-skip-git-repo-check
+```
+
+Required arguments: `--adapter`, `--role`.
+
+Builder and Reviewer spawns also require `--baton`. Custom spawns require
+`--command` with a `{packet}` placeholder. Real execution requires
+`--experimental`; use `--dry-run` to preview without execution.
+
+Example dry run:
+
+```bash
+python3 scripts/factory.py agent spawn --adapter custom --role builder --baton B-001 --command "my-agent run --prompt-file {packet}" --dry-run
+```
+
+Example Codex CLI execution:
+
+```bash
+python3 scripts/factory.py agent spawn --adapter codex-cli --role builder --baton B-001 --experimental
+```
+
+Example output shape:
+
+```json
+{"status": "completed", "adapter": "custom", "packet_path": "...", "returncode": 0}
+```
+
+Common failures:
+
+- Missing `--experimental` for real execution.
+- Missing `{packet}` in a custom command.
+- Unknown baton or missing baton for Builder/Reviewer.
+- Write-capable spawn has no held baton lock and `--allow-unlocked` was not supplied.
+- Timeout returns status `timed_out` and exit code `124`.
+- Missing executable returns exit code `127`.
+
 ## `factory.py event`
 
 ```text
@@ -175,10 +407,12 @@ Common failures:
 ## `factory.py baton`
 
 ```text
-usage: factory.py baton [-h] {create,handoff,accept} ...
+usage: factory.py baton [-h] {list,show,create,handoff,accept} ...
 
 positional arguments:
-  {create,handoff,accept}
+  {list,show,create,handoff,accept}
+    list                List batons for the current run.
+    show                Show detailed baton evidence.
     create              Assign a baton and acquire the writer lock.
     handoff             Record a baton handoff.
     accept              Accept a baton.
@@ -186,6 +420,72 @@ positional arguments:
 options:
   -h, --help            show this help message and exit
 ```
+
+## `factory.py baton list`
+
+```text
+usage: factory.py baton list [-h] [--all] [--status STATUS] [--limit LIMIT] [--json]
+
+options:
+  -h, --help       show this help message and exit
+  --all            Include non-active batons.
+  --status STATUS  Filter by status; repeat or comma-separate.
+  --limit LIMIT
+  --json
+```
+
+Required arguments: none.
+
+Example:
+
+```bash
+python3 scripts/factory.py baton list --all --json
+```
+
+Example output shape:
+
+```json
+{"count": 1, "batons": [{"id": "B-001", "status": "accepted"}]}
+```
+
+Common failures:
+
+- No run exists.
+- `--limit` is less than 1 or greater than the maximum list limit.
+
+## `factory.py baton show`
+
+```text
+usage: factory.py baton show [-h] [--recent-events RECENT_EVENTS] [--json] baton_id
+
+positional arguments:
+  baton_id
+
+options:
+  -h, --help            show this help message and exit
+  --recent-events RECENT_EVENTS
+  --json
+```
+
+Required arguments: `baton_id`.
+
+Example:
+
+```bash
+python3 scripts/factory.py baton show B-001 --json
+```
+
+Example output shape:
+
+```json
+{"baton": {...}, "handoffs": [], "verification": [], "reviews": [], "commits": [], "events": []}
+```
+
+Common failures:
+
+- Unknown baton.
+- Baton does not belong to the current run.
+- `--recent-events` is outside the allowed range.
 
 ## `factory.py baton create`
 
@@ -238,6 +538,7 @@ Common failures:
 - No run exists.
 - Another active baton exists and `--allow-active` was not supplied.
 - Writer lock is already held and `--force-lock` was not supplied.
+- Project config is invalid.
 
 ## `factory.py baton handoff`
 
@@ -286,6 +587,7 @@ Common failures:
 
 - Unknown baton.
 - No run exists.
+- Project config is invalid.
 
 ## `factory.py baton accept`
 
@@ -328,18 +630,52 @@ Common failures:
 
 - Unknown baton.
 - Accepting before the configured tier is satisfied is an orchestration error; the CLI records the decision you give it.
+- Project config is invalid.
 
 ## `factory.py verify`
 
 ```text
-usage: factory.py verify [-h] {record} ...
+usage: factory.py verify [-h] {list,record} ...
 
 positional arguments:
-  {record}
+  {list,record}
+    list         List verification records.
 
 options:
-  -h, --help  show this help message and exit
+  -h, --help     show this help message and exit
 ```
+
+## `factory.py verify list`
+
+```text
+usage: factory.py verify list [-h] [--baton BATON] [--recent RECENT] [--json]
+
+options:
+  -h, --help       show this help message and exit
+  --baton BATON
+  --recent RECENT
+  --json
+```
+
+Required arguments: none.
+
+Example:
+
+```bash
+python3 scripts/factory.py verify list --baton B-001 --json
+```
+
+Example output shape:
+
+```json
+{"count": 1, "verification": [{"result": "pass", "command": "pytest"}]}
+```
+
+Common failures:
+
+- No run exists.
+- Unknown baton when `--baton` is supplied.
+- `--recent` is outside the allowed range.
 
 ## `factory.py verify record`
 
@@ -381,18 +717,53 @@ Common failures:
 - `--result` is not one of `pass`, `fail`, `not_run`, or `blocked`.
 - `--duration-ms` is negative.
 - Unknown baton when `--baton` is supplied.
+- Project config requires `--baton`.
+- Project config requires `--summary` for `not_run`.
 
 ## `factory.py review`
 
 ```text
-usage: factory.py review [-h] {record} ...
+usage: factory.py review [-h] {list,record} ...
 
 positional arguments:
-  {record}
+  {list,record}
+    list         List review records.
 
 options:
-  -h, --help  show this help message and exit
+  -h, --help     show this help message and exit
 ```
+
+## `factory.py review list`
+
+```text
+usage: factory.py review list [-h] [--baton BATON] [--recent RECENT] [--json]
+
+options:
+  -h, --help       show this help message and exit
+  --baton BATON
+  --recent RECENT
+  --json
+```
+
+Required arguments: none.
+
+Example:
+
+```bash
+python3 scripts/factory.py review list --baton B-001 --json
+```
+
+Example output shape:
+
+```json
+{"count": 1, "reviews": [{"status": "accepted", "findings": []}]}
+```
+
+Common failures:
+
+- No run exists.
+- Unknown baton when `--baton` is supplied.
+- `--recent` is outside the allowed range.
 
 ## `factory.py review record`
 
@@ -568,6 +939,98 @@ Common failures:
 
 - No run exists.
 - Releasing a missing lock is idempotent at the table-update level.
+- Project config is invalid.
+
+## `factory.py events`
+
+```text
+usage: factory.py events [-h] {list} ...
+
+positional arguments:
+  {list}
+    list      List recent events.
+
+options:
+  -h, --help  show this help message and exit
+```
+
+## `factory.py events list`
+
+```text
+usage: factory.py events list [-h] [--recent RECENT] [--baton BATON] [--type TYPE] [--json]
+
+options:
+  -h, --help       show this help message and exit
+  --recent RECENT
+  --baton BATON
+  --type TYPE
+  --json
+```
+
+Required arguments: none.
+
+Example:
+
+```bash
+python3 scripts/factory.py events list --recent 20 --json
+```
+
+Example output shape:
+
+```json
+{"count": 1, "events": [{"event_type": "factory.started"}]}
+```
+
+Common failures:
+
+- No run exists.
+- Unknown baton when `--baton` is supplied.
+- `--recent` is outside the allowed range.
+
+## `factory.py verification`
+
+```text
+usage: factory.py verification [-h] {list} ...
+
+positional arguments:
+  {list}
+    list      List verification records.
+
+options:
+  -h, --help  show this help message and exit
+```
+
+## `factory.py verification list`
+
+```text
+usage: factory.py verification list [-h] [--baton BATON] [--recent RECENT] [--json]
+
+options:
+  -h, --help       show this help message and exit
+  --baton BATON
+  --recent RECENT
+  --json
+```
+
+Required arguments: none.
+
+Example:
+
+```bash
+python3 scripts/factory.py verification list --baton B-001 --json
+```
+
+Example output shape:
+
+```json
+{"count": 1, "verification": [{"result": "pass", "command": "pytest"}]}
+```
+
+Common failures:
+
+- No run exists.
+- Unknown baton when `--baton` is supplied.
+- `--recent` is outside the allowed range.
 
 ## `factory.py render-ledger`
 
@@ -598,6 +1061,7 @@ Common failures:
 
 - No run exists.
 - `--recent` is less than 1.
+- Project config has an unsafe `ledger_output_path`.
 
 ## `factory.py doctor`
 
