@@ -21,5 +21,4 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: python3 scripts/validate_plugin.py .
-      - run: python3 -m unittest discover -s tests -v
+      - run: bash scripts/check.sh

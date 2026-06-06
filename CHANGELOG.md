@@ -3,5 +3,6 @@
 ## 0.1.0
 
 - Initial open-source preparation.
-- Added self-contained bundled skill guidance.
+- Added split skills for CLI/state operations and public factory orchestration.
+- Added installation, usage, and generated CLI reference docs.
 - Added SQLite-backed factory CLI, schema migration, templates, and tests.

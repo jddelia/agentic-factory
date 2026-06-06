@@ -5,10 +5,10 @@ workflows. It gives agents a stdlib-only Python CLI, a SQLite event store,
 structured baton state, review and verification records, pause/resume
 checkpoints, doctor checks, and markdown ledger rendering.
 
-The plugin is self-contained. Earlier local versions referenced a private
-`software-factory-v2` skill, but this repository now bundles the minimum
-operating model inside `skills/agentic-factory/SKILL.md` so users do not need
-any personal skill installed.
+The plugin is self-contained. It ships one skill for durable CLI/state
+operations and one skill for full software-factory orchestration. Earlier local
+versions referenced a private `software-factory-v2` skill; this repository does
+not require that skill and does not ship a conflicting copy of it.
 
 ## What It Provides
 
@@ -19,7 +19,8 @@ any personal skill installed.
 - Pause/resume checkpoints
 - Markdown build-ledger rendering
 - Doctor checks for common factory drift
-- A bundled Codex skill that tells agents when and how to use the tool
+- A bundled CLI/state skill that tells agents how to use the tool
+- A bundled orchestration skill for full factory operation
 
 ## Requirements
 
@@ -36,6 +37,12 @@ and validation checks needed for distribution.
 
 For general Codex plugin and skill concepts, see OpenAI's
 [Plugins and skills overview](https://openai.com/academy/codex-plugins-and-skills/).
+
+Detailed docs:
+
+- [Installation](docs/installation.md)
+- [Usage](docs/usage.md)
+- [CLI reference](docs/cli.md)
 
 ## Quick Start
 
@@ -71,14 +78,16 @@ python3 /path/to/agentic-factory/scripts/factory.py render-ledger \
 
 ## Recommended Workflow
 
-1. Run `init` once per target project.
-2. Run `doctor` before assigning or accepting work.
-3. Use `baton create` for the active writer.
-4. Use `baton handoff` to capture files, commands, verification, risks, and next
+1. Use `agentic-factory-orchestration` to choose mode, topology, acceptance tier,
+   and verification policy.
+2. Use `agentic-factory` to run `init` once per target project.
+3. Run `doctor` before assigning or accepting work.
+4. Use `baton create` for the active writer.
+5. Use `baton handoff` to capture files, commands, verification, risks, and next
    step.
-5. Use `verify record` and `review record` for evidence.
-6. Use `baton accept` only after the work meets the selected acceptance tier.
-7. Use `render-ledger` when humans need a markdown snapshot.
+6. Use `verify record` and `review record` for evidence.
+7. Use `baton accept` only after the work meets the selected acceptance tier.
+8. Use `render-ledger` when humans need a markdown snapshot.
 
 The database is the source of truth. The markdown ledger is a rendered view.
 
@@ -106,9 +115,13 @@ bash scripts/check.sh
 
 ```text
 .codex-plugin/plugin.json     Codex plugin manifest
-skills/agentic-factory/       Bundled self-contained Codex skill
+skills/agentic-factory/       CLI/state skill
+skills/agentic-factory-orchestration/
+                              Full software-factory orchestration skill
 scripts/factory.py            Stdlib-only SQLite CLI
+scripts/generate_cli_docs.py  CLI reference generator
 scripts/validate_plugin.py    Repo-local plugin hygiene validator
+docs/                         Installation, usage, and CLI reference
 migrations/                   SQLite schema migrations
 templates/                    Handoff and review packet templates
 tests/                        CLI regression tests
@@ -128,9 +141,9 @@ large historical ledger.
 
 The plugin intentionally does not ship a duplicate skill named
 `software-factory-v2`. Reusing that name would create avoidable conflicts for
-users who already have a personal or marketplace skill installed. The bundled
-`agentic-factory` skill contains the portable minimum doctrine and treats other
-factory policy skills as optional companions.
+users who already have a personal or marketplace skill installed. The public
+orchestration skill is named `agentic-factory-orchestration`; it references
+`agentic-factory` one-way for durable state.
 
 ## License
 
