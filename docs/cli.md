@@ -11,22 +11,24 @@ Global options apply before the command name:
 
 - `--root <path>`: target project root; defaults to the current working directory.
 - `--db <path>`: SQLite DB path; relative paths resolve under `--root`.
+- `--config <path>`: project config path; relative paths resolve under `--root`.
 
-The CLI is local-first and stdlib-only. It does not execute shell input from command arguments.
+The CLI is local-first and stdlib-only. It does not execute shell input from command arguments or spawn agent processes.
 
 ## `factory.py`
 
 ```text
 usage: factory.py [-h] [--root ROOT] [--db DB] [--config CONFIG]
-                  {config,init,status,event,baton,verify,review,pause,resume,lock,events,verification,render-ledger,doctor} ...
+                  {config,init,status,agent,event,baton,verify,review,pause,resume,lock,events,verification,render-ledger,doctor} ...
 
 SQLite-backed software factory CLI.
 
 positional arguments:
-  {config,init,status,event,baton,verify,review,pause,resume,lock,events,verification,render-ledger,doctor}
+  {config,init,status,agent,event,baton,verify,review,pause,resume,lock,events,verification,render-ledger,doctor}
     config              Create or show project config.
     init                Initialize a factory DB.
     status              Show current factory state.
+    agent               Generate portable agent packets.
     event               Record a raw event.
     baton               Create, hand off, or accept batons.
     verify              Record verification commands.
@@ -196,6 +198,76 @@ git=<head or unavailable>
 Common failures:
 
 - No run exists: initialize first with `factory.py init`.
+
+## `factory.py agent`
+
+```text
+usage: factory.py agent [-h] {packet} ...
+
+positional arguments:
+  {packet}
+    packet    Generate a role packet for delegation.
+
+options:
+  -h, --help  show this help message and exit
+```
+
+## `factory.py agent packet`
+
+```text
+usage: factory.py agent packet [-h] --role {builder,executive,reviewer} [--baton BATON]
+                               [--recent RECENT] [--format {json,markdown}]
+                               [--runtime-mode {adapter_spawn,agent_cli_subagents,codex_native,manual_protocol,serial_single_agent}]
+                               [--write-policy {auto,read-only,write}] [--allowed ALLOWED]
+                               [--restricted RESTRICTED] [--invariant INVARIANT]
+                               [--required-check REQUIRED_CHECK] [--non-goal NON_GOAL]
+
+options:
+  -h, --help            show this help message and exit
+  --role {builder,executive,reviewer}
+  --baton BATON
+  --recent RECENT
+  --format {json,markdown}
+  --runtime-mode {adapter_spawn,agent_cli_subagents,codex_native,manual_protocol,serial_single_agent}
+  --write-policy {auto,read-only,write}
+  --allowed ALLOWED     Allowed file or area; repeat or comma-separate.
+  --restricted RESTRICTED
+                        Restricted file or area; repeat or comma-separate.
+  --invariant INVARIANT
+                        Hard invariant to include.
+  --required-check REQUIRED_CHECK
+                        Required check to include.
+  --non-goal NON_GOAL   Non-goal to include.
+```
+
+Required arguments: `--role`.
+
+Builder and Reviewer packets also require `--baton`.
+
+Example:
+
+```bash
+python3 scripts/factory.py agent packet --role builder --baton B-001
+```
+
+Structured output:
+
+```bash
+python3 scripts/factory.py agent packet --role reviewer --baton B-001 --format json
+```
+
+Example output shape:
+
+```json
+{"packet_version": 1, "role": "builder", "baton": {"id": "B-001"}, "recording_commands": []}
+```
+
+Common failures:
+
+- No run exists.
+- Unknown baton when `--baton` is supplied.
+- `--baton` is missing for Builder or Reviewer packets.
+- `--recent` is outside the allowed range.
 
 ## `factory.py event`
 

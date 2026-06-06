@@ -61,6 +61,8 @@ remains the durable state layer in every mode.
 Other agent CLIs can still use the plugin by following the same baton,
 handoff, review, and verification protocol with their own delegation features.
 When delegation is unavailable or unsafe, one agent can run the roles serially.
+Use [Agent Packets](agent-packets.md) when a non-Codex runtime needs a concrete
+role prompt for Builder, Reviewer, or Executive work.
 
 See [Runtime Modes](runtime-modes.md) for the full mode contract.
 

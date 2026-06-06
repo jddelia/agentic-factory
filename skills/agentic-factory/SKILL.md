@@ -1,6 +1,6 @@
 ---
 name: agentic-factory
-description: "Use when directly recording, querying, validating, or rendering Agentic Factory SQLite state with scripts/factory.py: init, status, doctor, baton, verification, review, pause/resume, lock, event, and render-ledger commands."
+description: "Use when directly recording, querying, validating, rendering, or generating portable packets from Agentic Factory SQLite state with scripts/factory.py: init, status, doctor, baton, agent packet, verification, review, pause/resume, lock, event, and render-ledger commands."
 ---
 
 # Agentic Factory
@@ -15,8 +15,8 @@ may call into this one whenever it needs durable state.
 This skill does not spawn agents or choose worker topology. In Codex-native
 factory runs, the orchestration skill uses host delegation capabilities and this
 skill records the resulting state transitions. In other runtimes, the lead
-agent may use an agent CLI's own sub-agent mechanism or run roles serially while
-using the same records.
+agent may use an agent CLI's own sub-agent mechanism, generated agent packets,
+or serial role simulation while using the same records.
 
 ## Contract
 
@@ -152,6 +152,28 @@ python3 <plugin-root>/scripts/factory.py review list --baton B-001
 ```
 
 Add `--json` when another tool needs structured output.
+
+## Agent Packets
+
+Generate portable role packets when a non-Codex runtime, a serial role pass, or
+a handoff to another lead needs a concrete prompt derived from current state:
+
+```bash
+python3 <plugin-root>/scripts/factory.py agent packet \
+  --role builder \
+  --baton B-001
+
+python3 <plugin-root>/scripts/factory.py agent packet \
+  --role reviewer \
+  --baton B-001
+
+python3 <plugin-root>/scripts/factory.py agent packet \
+  --role executive \
+  --recent 20
+```
+
+Use `--format json` when another tool needs structured packet data. Packets are
+rendered instructions and command templates; they do not spawn workers.
 
 ## Pause, Resume, And Ledger
 

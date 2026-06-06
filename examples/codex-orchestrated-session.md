@@ -192,9 +192,21 @@ unclear, the Executive switches to recovery mode before assigning more work.
 ## Non-Codex Approximation
 
 In an agent CLI with sub-agent support, the lead agent follows the same flow but
-uses that CLI's delegation mechanism instead of Codex-native threads. In a CLI
-without sub-agents, the lead agent performs the Builder and Reviewer roles
-serially and records the same durable evidence.
+uses that CLI's delegation mechanism instead of Codex-native threads. The lead
+can generate portable packets for those workers:
+
+```bash
+python3 "$PLUGIN_ROOT/scripts/factory.py" agent packet \
+  --role builder \
+  --baton B-001
+
+python3 "$PLUGIN_ROOT/scripts/factory.py" agent packet \
+  --role reviewer \
+  --baton B-001
+```
+
+In a CLI without sub-agents, the lead agent performs the Builder and Reviewer
+roles serially and records the same durable evidence.
 
 For a command-by-command protocol exercise, see
 [`basic-factory/session.md`](basic-factory/session.md).

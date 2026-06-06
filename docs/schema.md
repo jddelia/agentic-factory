@@ -32,6 +32,10 @@ The database has three layers:
 The `events` table is the chronological audit trail. Current-state tables are
 optimized for quick inspection and rendering.
 
+Agent packets do not add tables. `factory.py agent packet` renders bounded
+views over existing run, baton, event, verification, review, lock, and config
+state.
+
 ## Tables
 
 ### `schema_migrations`

@@ -78,6 +78,21 @@ handoff_required:
 escalation_triggers:
 ```
 
+## Agent Packet Request
+
+```text
+role: builder | reviewer | executive
+baton_id:
+runtime_mode:
+write_policy: auto | read-only | write
+allowed_files_or_areas:
+restricted_files_or_areas:
+hard_invariants:
+required_checks:
+non_goals:
+packet_format: markdown | json
+```
+
 ## Handoff Bundle
 
 ```text

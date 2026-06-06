@@ -17,8 +17,9 @@ ledgers.
 The primary runtime is the Codex app. Prefer Codex-native thread or sub-agent
 capabilities when they are available and safe for the selected work. Other
 agent CLIs may approximate the same factory model through their own delegation
-features or by running roles serially. The `factory.py` CLI records state; it
-does not directly spawn arbitrary workers.
+features, generated agent packets, or serial role simulation. The `factory.py`
+CLI records state and renders packets; it does not directly spawn arbitrary
+workers.
 
 ## Outcome
 
@@ -82,7 +83,8 @@ enough signal, infer and proceed.
   when the host exposes those tools. Record baton state before delegation.
 - `agent_cli_subagents`: use when another agent CLI has a clear, safe
   sub-agent mechanism. Let that CLI own spawning; pass scoped baton or review
-  instructions and record returned evidence through `agentic-factory`.
+  packets from `factory.py agent packet` and record returned evidence through
+  `agentic-factory`.
 - `serial_single_agent`: one agent runs Executive, Builder, Reviewer, and Ledger
   duties sequentially. Keep role boundaries explicit and record the same DB
   evidence.
@@ -120,7 +122,9 @@ For every delegated worker:
 
 1. Record or confirm the baton before sending work.
 2. Give the worker role, baton id, objective, scope, non-goals, allowed areas,
-   restricted areas, hard invariants, required checks, and handoff schema.
+   restricted areas, hard invariants, required checks, and handoff schema. Use
+   `factory.py agent packet` when the runtime needs a portable delegation
+   prompt.
 3. State whether the worker may edit files, run commands, and record CLI
    evidence directly.
 4. Require compact handoff output: files, behavior, contracts, commands,
@@ -273,3 +277,5 @@ acceptance.
   decision, stop, resume, and recovery packet templates.
 - `../../docs/runtime-modes.md`: public runtime mode contract and delegation
   boundaries.
+- `../../docs/agent-packets.md`: portable packet generation and generic CLI
+  delegation flow.

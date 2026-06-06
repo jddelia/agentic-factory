@@ -24,6 +24,7 @@ protocol execution for testing and debugging.
 - Append-first factory events
 - Baton assignment, handoff, acceptance, and lock commands
 - Direct inspection commands for batons, events, verification, and reviews
+- Agent packet generation for portable Builder, Reviewer, and Executive handoffs
 - Project-local config through `.agentic-factory/config.json`
 - Review findings and verification records
 - Pause/resume checkpoints
@@ -53,6 +54,7 @@ Detailed docs:
 - [Installation](docs/installation.md)
 - [Usage](docs/usage.md)
 - [Runtime modes](docs/runtime-modes.md)
+- [Agent packets](docs/agent-packets.md)
 - [Project configuration](docs/configuration.md)
 - [CLI reference](docs/cli.md)
 - [Schema and event contract](docs/schema.md)
@@ -106,7 +108,8 @@ python3 /path/to/agentic-factory/scripts/factory.py render-ledger \
 1. Use `agentic-factory-orchestration` to choose runtime mode, work mode,
    topology, acceptance tier, and verification policy.
 2. Use Codex-native worker delegation when available. In other agent CLIs, use
-   their native sub-agent mechanism or simulate roles serially.
+   their native sub-agent mechanism with generated agent packets, or simulate
+   roles serially.
 3. Use `agentic-factory` to run `init` once per target project.
 4. Run `doctor` before assigning or accepting work.
 5. Use `baton create` for the active writer.

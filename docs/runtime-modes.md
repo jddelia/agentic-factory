@@ -15,6 +15,8 @@ factory operating model from worker creation:
   handoffs, verification, reviews, locks, pauses, resumes, and rendered ledgers.
 - The host runtime owns worker creation. The core CLI does not directly spawn
   arbitrary agent processes.
+- Agent packets provide portable delegation prompts for runtimes that need a
+  concrete sub-agent handoff contract.
 
 ## Supported Modes
 
@@ -38,8 +40,7 @@ Expected behavior:
 
 Use this mode when another agent CLI provides its own sub-agent or delegation
 mechanism. The lead agent should use that CLI's native mechanism and pass a
-compact baton or review packet derived from the orchestration skill and current
-factory state.
+compact baton or review packet generated from current factory state.
 
 This mode is a compatibility approximation, not a guarantee that every agent
 CLI behaves like Codex. Before delegation, the lead agent must determine:
@@ -53,6 +54,16 @@ CLI behaves like Codex. Before delegation, the lead agent must determine:
 
 If any of those answers are unclear and the work is risky, use
 `serial_single_agent` or ask the user before launching external processes.
+
+Packet bridge:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py agent packet \
+  --role builder \
+  --baton B-001
+```
+
+See [Agent Packets](agent-packets.md) for the full portable delegation flow.
 
 ### `serial_single_agent`
 
@@ -111,7 +122,8 @@ All modes follow the same durable state discipline:
 1. Inspect status and run `doctor`.
 2. Create or confirm the baton before assigning work.
 3. Give each worker explicit scope, non-goals, allowed areas, restricted areas,
-   required checks, and handoff requirements.
+   required checks, and handoff requirements. Use `agent packet` when the host
+   runtime needs a portable sub-agent prompt.
 4. Preserve one active writer per worktree unless separate worktrees and merge
    policy are configured.
 5. Record verification and handoff evidence before review.

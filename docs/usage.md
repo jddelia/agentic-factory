@@ -18,7 +18,7 @@ Before assigning a baton, choose the safest available runtime mode:
 - `codex_native`: preferred. Use Codex app native thread or sub-agent
   capabilities for role-specific workers.
 - `agent_cli_subagents`: use another agent CLI's delegation mechanism after
-  capability preflight.
+  capability preflight, usually with generated agent packets.
 - `serial_single_agent`: perform roles sequentially when delegation is not
   available or not safe.
 - `manual_protocol`: run commands directly for tests, examples, and debugging.
@@ -71,6 +71,38 @@ delegating the scoped prompt to a Builder worker. In `agent_cli_subagents`, the
 lead agent should pass the same baton scope through that CLI's delegation
 mechanism. In `serial_single_agent`, keep the Builder role boundary explicit
 before editing.
+
+## Generate Agent Packets
+
+Use packets when a runtime needs a concrete prompt for a role-specific worker.
+Packets are rendered instructions; they do not spawn agents.
+
+Builder packet:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py agent packet \
+  --role builder \
+  --baton B-001
+```
+
+Reviewer packet:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py agent packet \
+  --role reviewer \
+  --baton B-001
+```
+
+Executive packet:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py agent packet \
+  --role executive \
+  --recent 20
+```
+
+Use `--format json` when another tool needs structured packet data. See
+[Agent Packets](agent-packets.md) for packet fields and runtime guidance.
 
 ## Record Verification
 

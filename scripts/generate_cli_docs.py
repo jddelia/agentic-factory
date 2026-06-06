@@ -21,6 +21,8 @@ COMMANDS: tuple[tuple[str, ...], ...] = (
     ("config", "show"),
     ("init",),
     ("status",),
+    ("agent",),
+    ("agent", "packet"),
     ("event",),
     ("event", "append"),
     ("baton",),
@@ -143,6 +145,36 @@ NOTES: dict[tuple[str, ...], str] = {
         Common failures:
 
         - No run exists: initialize first with `factory.py init`.
+    """,
+    ("agent", "packet"): """
+        Required arguments: `--role`.
+
+        Builder and Reviewer packets also require `--baton`.
+
+        Example:
+
+        ```bash
+        python3 scripts/factory.py agent packet --role builder --baton B-001
+        ```
+
+        Structured output:
+
+        ```bash
+        python3 scripts/factory.py agent packet --role reviewer --baton B-001 --format json
+        ```
+
+        Example output shape:
+
+        ```json
+        {"packet_version": 1, "role": "builder", "baton": {"id": "B-001"}, "recording_commands": []}
+        ```
+
+        Common failures:
+
+        - No run exists.
+        - Unknown baton when `--baton` is supplied.
+        - `--baton` is missing for Builder or Reviewer packets.
+        - `--recent` is outside the allowed range.
     """,
     ("event", "append"): """
         Required arguments: `--type`.
@@ -565,8 +597,9 @@ def render_doc() -> str:
         "",
         "- `--root <path>`: target project root; defaults to the current working directory.",
         "- `--db <path>`: SQLite DB path; relative paths resolve under `--root`.",
+        "- `--config <path>`: project config path; relative paths resolve under `--root`.",
         "",
-        "The CLI is local-first and stdlib-only. It does not execute shell input from command arguments.",
+        "The CLI is local-first and stdlib-only. It does not execute shell input from command arguments or spawn agent processes.",
         "",
     ]
     for command in COMMANDS:

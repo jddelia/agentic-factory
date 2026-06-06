@@ -286,6 +286,84 @@ class FactoryCliTest(unittest.TestCase):
             self.assertEqual(reviews["count"], 1)
             self.assertEqual(reviews["reviews"][0]["findings"][0]["summary"], "Document edge case")
 
+    def test_agent_packet_outputs_delegation_contracts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual(
+                self.run_cli(root, "init", "--run-id", "packet", "--objective", "Packet test").returncode,
+                0,
+            )
+            self.assertEqual(
+                self.run_cli(
+                    root,
+                    "baton",
+                    "create",
+                    "B-001",
+                    "--title",
+                    "Packet baton",
+                    "--scope",
+                    "Update docs and tests only",
+                    "--verification-level",
+                    "focused_plus_build",
+                ).returncode,
+                0,
+            )
+
+            builder = self.run_cli(
+                root,
+                "agent",
+                "packet",
+                "--role",
+                "builder",
+                "--baton",
+                "B-001",
+                "--format",
+                "json",
+                "--allowed",
+                "docs,tests",
+                "--restricted",
+                "secrets",
+                "--invariant",
+                "No network calls",
+                "--required-check",
+                "python3 -m unittest discover -s tests -v",
+            )
+            self.assertEqual(builder.returncode, 0, builder.stderr)
+            packet = json.loads(builder.stdout)
+            self.assertEqual(packet["packet_version"], 1)
+            self.assertEqual(packet["role"], "builder")
+            self.assertEqual(packet["baton"]["id"], "B-001")
+            self.assertEqual(packet["baton"]["status"], "assigned")
+            self.assertTrue(packet["worker_policy"]["may_edit_files"])
+            self.assertEqual(packet["scope"]["allowed_files_or_areas"], ["docs", "tests"])
+            self.assertIn("secrets", packet["scope"]["restricted_files_or_areas"])
+            self.assertIn("No network calls", packet["scope"]["hard_invariants"])
+            self.assertEqual(
+                packet["scope"]["required_checks"],
+                ["python3 -m unittest discover -s tests -v"],
+            )
+            command_text = "\n".join(command["command"] for command in packet["recording_commands"])
+            self.assertIn("verify record --baton B-001", command_text)
+            self.assertIn("baton handoff B-001", command_text)
+
+            reviewer = self.run_cli(root, "agent", "packet", "--role", "reviewer", "--baton", "B-001")
+            self.assertEqual(reviewer.returncode, 0, reviewer.stderr)
+            self.assertIn("# Agent Packet: Reviewer", reviewer.stdout)
+            self.assertIn("File write policy: read-only", reviewer.stdout)
+            self.assertIn("review record --baton B-001", reviewer.stdout)
+
+            executive = self.run_cli(root, "agent", "packet", "--role", "executive", "--recent", "2", "--format", "json")
+            self.assertEqual(executive.returncode, 0, executive.stderr)
+            executive_packet = json.loads(executive.stdout)
+            self.assertEqual(executive_packet["role"], "executive")
+            self.assertIsNone(executive_packet["baton"])
+            self.assertLessEqual(len(executive_packet["recent_context"]["events"]), 2)
+            self.assertIn("inspect_status", [command["name"] for command in executive_packet["recording_commands"]])
+
+            missing_baton = self.run_cli(root, "agent", "packet", "--role", "builder")
+            self.assertEqual(missing_baton.returncode, 2)
+            self.assertIn("--baton is required", missing_baton.stderr)
+
     def test_project_config_controls_defaults_and_doctor(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
