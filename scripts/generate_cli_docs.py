@@ -419,7 +419,17 @@ def help_text(command: tuple[str, ...]) -> str:
     output = proc.stdout if proc.returncode == 0 else proc.stderr
     if proc.returncode != 0:
         raise RuntimeError(f"failed to get help for {command or ('root',)}: {output}")
-    return output.strip()
+    return normalize_help_text(output)
+
+
+def normalize_help_text(output: str) -> str:
+    lines: list[str] = []
+    for line in output.strip().splitlines():
+        if line.strip() == "..." and lines:
+            lines[-1] = f"{lines[-1].rstrip()} ..."
+            continue
+        lines.append(line.rstrip())
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":
