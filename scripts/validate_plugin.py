@@ -47,7 +47,15 @@ def validate(plugin_root: Path) -> list[str]:
         reject_todos(manifest, "$", errors)
         validate_manifest(plugin_root, manifest, errors)
 
-    for required_file in ("README.md", "LICENSE", "CONTRIBUTING.md", "SECURITY.md"):
+    for required_file in (
+        "README.md",
+        "LICENSE",
+        "CONTRIBUTING.md",
+        "SECURITY.md",
+        "docs/installation.md",
+        "docs/usage.md",
+        "docs/cli.md",
+    ):
         if not (plugin_root / required_file).is_file():
             errors.append(f"missing open-source hygiene file `{required_file}`")
 
