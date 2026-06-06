@@ -12,6 +12,12 @@ not how to design the whole operating model.
 For full factory orchestration, use `agentic-factory-orchestration`. That skill
 may call into this one whenever it needs durable state.
 
+This skill does not spawn agents or choose worker topology. In Codex-native
+factory runs, the orchestration skill uses host delegation capabilities and this
+skill records the resulting state transitions. In other runtimes, the lead
+agent may use an agent CLI's own sub-agent mechanism or run roles serially while
+using the same records.
+
 ## Contract
 
 - Run the CLI from the target project root unless `--root` is supplied.
@@ -21,6 +27,8 @@ may call into this one whenever it needs durable state.
 - Preserve sandbox, approval, credential, and destructive-action boundaries.
 - Keep one active writer lock per worktree unless the orchestrator explicitly
   configures separate worktrees.
+- Treat worker creation as host-runtime behavior, not a `factory.py`
+  responsibility.
 
 Resolve the installed plugin root, then run commands as:
 

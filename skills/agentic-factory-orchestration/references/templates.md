@@ -7,7 +7,8 @@ DB records.
 ## Effective Config Summary
 
 ```text
-mode/topology:
+runtime_mode:
+work_mode/topology:
 target/tier:
 principal/user involvement:
 feedback handling:
@@ -28,10 +29,20 @@ known blockers:
 ## Capability Preflight
 
 ```text
+runtime_mode:
+delegation_mechanism:
 thread_tools_available:
+subagent_tools_available:
 known_thread_tool_limits:
 automation_tools_available:
 goal_tools_available:
+worker_workspace_model:
+worker_write_capability:
+worker_shell_capability:
+worker_skill_or_plugin_inheritance:
+credential_or_secret_inheritance:
+lead_visibility_into_worker_output:
+cancellation_or_timeout_controls:
 git_write_allowed:
 git_push_auth_available:
 network_available:

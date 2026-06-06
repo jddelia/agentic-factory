@@ -1,8 +1,30 @@
 # Usage
 
-This guide shows the normal Agentic Factory lifecycle. Use
-`agentic-factory-orchestration` when deciding how to run the factory. Use
-`agentic-factory` when recording or querying durable state with the CLI.
+This guide shows the durable Agentic Factory lifecycle. In the primary Codex
+app mode, the Executive, Builder, Reviewer, and Ledger roles emit these CLI
+commands as part of an orchestrated run. In other runtimes, a lead agent can use
+the same commands with that runtime's sub-agent mechanism or simulate the roles
+serially.
+
+Use `agentic-factory-orchestration` when deciding runtime mode, work mode,
+roles, review depth, and verification policy. Use `agentic-factory` when
+recording or querying durable state with the CLI. See
+[Runtime Modes](runtime-modes.md) for the architecture boundary.
+
+## Runtime Selection
+
+Before assigning a baton, choose the safest available runtime mode:
+
+- `codex_native`: preferred. Use Codex app native thread or sub-agent
+  capabilities for role-specific workers.
+- `agent_cli_subagents`: use another agent CLI's delegation mechanism after
+  capability preflight.
+- `serial_single_agent`: perform roles sequentially when delegation is not
+  available or not safe.
+- `manual_protocol`: run commands directly for tests, examples, and debugging.
+
+The CLI records state transitions. It does not directly spawn arbitrary worker
+processes.
 
 ## Initialize
 
@@ -44,6 +66,12 @@ python3 /path/to/agentic-factory/scripts/factory.py baton create B-001 \
 By default, baton creation acquires the `main-worktree` lock. Use
 `--allow-active` only for non-writer records or explicitly managed concurrency.
 
+In `codex_native` mode, the Executive normally records this baton before
+delegating the scoped prompt to a Builder worker. In `agent_cli_subagents`, the
+lead agent should pass the same baton scope through that CLI's delegation
+mechanism. In `serial_single_agent`, keep the Builder role boundary explicit
+before editing.
+
 ## Record Verification
 
 ```bash
@@ -71,6 +99,10 @@ python3 /path/to/agentic-factory/scripts/factory.py baton handoff B-001 \
 Use repeated `--files`, `--commands`, or `--verification` flags, or
 comma-separated values, when recording multiple entries.
 
+Workers with safe CLI access can record their own verification and handoff
+evidence. Otherwise, they should return a structured handoff bundle and the
+Executive or Ledger records it.
+
 ## Record Review
 
 ```bash
@@ -87,6 +119,10 @@ Finding format:
 ```text
 severity|file|line|status|summary
 ```
+
+Reviewers are read-only by default. If the runtime cannot provide an
+independent Reviewer worker, the lead agent may perform a serial review pass
+and record the same review evidence.
 
 ## Accept
 

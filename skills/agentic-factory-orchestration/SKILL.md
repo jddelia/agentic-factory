@@ -14,6 +14,12 @@ skill as the CLI/state layer for `init`, `status`, `doctor`, baton records,
 verification records, review records, pause/resume checkpoints, and rendered
 ledgers.
 
+The primary runtime is the Codex app. Prefer Codex-native thread or sub-agent
+capabilities when they are available and safe for the selected work. Other
+agent CLIs may approximate the same factory model through their own delegation
+features or by running roles serially. The `factory.py` CLI records state; it
+does not directly spawn arbitrary workers.
+
 ## Outcome
 
 Create a factory that matches the project's risk, maturity, and delivery target:
@@ -27,6 +33,7 @@ Create a factory that matches the project's risk, maturity, and delivery target:
 - optional read-only Reviewers and feedback Manager/User Liaison;
 - explicit baton lifecycle, handoff evidence, review policy, and acceptance tier;
 - explicit stop/resume controls with recoverable state;
+- explicit runtime mode and delegation capability preflight;
 - explicit permission, model, approval, destructive-action, credential, and
   external-effect policy;
 - commits only for accepted work unless the user explicitly delegates otherwise.
@@ -38,8 +45,18 @@ user request, project docs, tests, risk surface, and local tool constraints.
 
 1. Inspect before assigning work: stack, scripts, docs, dirty git state, branch,
    remote, generated-file hazards, test commands, env/secrets expectations,
-   permission constraints, browser/tool availability, and active factory state.
-2. Choose or confirm a compact configuration:
+   permission constraints, browser/tool availability, active factory state, and
+   runtime delegation capabilities.
+2. Choose the runtime mode:
+   - `codex_native`: preferred when Codex-native worker delegation is available.
+   - `agent_cli_subagents`: use another CLI's sub-agent mechanism after
+     capability preflight.
+   - `serial_single_agent`: use when delegation is unavailable, ambiguous, or
+     unsafe.
+   - `manual_protocol`: use for tests, demos, and human debugging.
+   - `adapter_spawn`: future/experimental only; do not use unless explicitly
+     configured.
+3. Choose or confirm a compact configuration:
    - `work_mode`: default `balanced` unless the request clearly implies another
      mode.
    - `factory_topology`: default `executive_as_ledger`.
@@ -49,14 +66,70 @@ user request, project docs, tests, risk surface, and local tool constraints.
      readiness.
    - `verification_level`: default `focused_plus_build` for normal feature work.
    - `concurrency_policy`: default `single_writer`.
-3. For DB-backed factories, initialize or inspect state with `agentic-factory`:
+4. For DB-backed factories, initialize or inspect state with `agentic-factory`:
    `init`, `status --compact`, then `doctor`.
-4. Define the next baton with objective, scope, non-goals, risk, acceptance tier,
+5. Define the next baton with objective, scope, non-goals, risk, acceptance tier,
    verification level, escalation triggers, owner, and handoff requirements.
-5. Assign only the roles needed for the chosen topology.
+6. Assign only the roles needed for the chosen topology and runtime mode.
 
 Ask at most three short questions when required. If the user's request gives
 enough signal, infer and proceed.
+
+## Runtime Modes
+
+- `codex_native`: primary and preferred. Use Codex-native threads or sub-agents
+  to delegate Builder, Reviewer, Manager/User Liaison, Watcher, or Ledger work
+  when the host exposes those tools. Record baton state before delegation.
+- `agent_cli_subagents`: use when another agent CLI has a clear, safe
+  sub-agent mechanism. Let that CLI own spawning; pass scoped baton or review
+  instructions and record returned evidence through `agentic-factory`.
+- `serial_single_agent`: one agent runs Executive, Builder, Reviewer, and Ledger
+  duties sequentially. Keep role boundaries explicit and record the same DB
+  evidence.
+- `manual_protocol`: human or test harness runs CLI commands directly to
+  exercise the factory protocol.
+- `adapter_spawn`: reserved for future explicit adapters that launch external
+  agent CLI processes. Do not run process-level adapters unless the user or
+  project configuration explicitly authorizes them.
+
+Read `docs/runtime-modes.md` when explaining or changing runtime behavior.
+
+## Capability Preflight
+
+Before delegating to workers, establish the runtime capability profile without
+running arbitrary external agent processes:
+
+- native thread/sub-agent tools available;
+- delegation mechanism and limits;
+- worker workspace model: shared worktree, isolated worktree, forked workspace,
+  or unknown;
+- worker write permissions and shell-command permissions;
+- worker skill/plugin/context inheritance;
+- credential, secret, and environment inheritance;
+- lead visibility into worker output, diffs, logs, and final packets;
+- cancellation, timeout, pause, resume, and stale-worker recovery behavior;
+- prompt, file, context, tool-call, and long-command limits.
+
+If worker capability or ownership is ambiguous, use `serial_single_agent` until
+the ambiguity is resolved. Do not spawn external agent CLI processes directly
+unless operating in an explicitly configured adapter mode.
+
+## Delegation Protocol
+
+For every delegated worker:
+
+1. Record or confirm the baton before sending work.
+2. Give the worker role, baton id, objective, scope, non-goals, allowed areas,
+   restricted areas, hard invariants, required checks, and handoff schema.
+3. State whether the worker may edit files, run commands, and record CLI
+   evidence directly.
+4. Require compact handoff output: files, behavior, contracts, commands,
+   passing checks, failing checks, skipped checks, risks, and recommendation.
+5. If the worker cannot use the CLI safely, the Executive/Ledger records its
+   returned evidence.
+6. Do not assign a Reviewer to edit files unless explicitly authorized.
+7. Do not accept a baton until verification and review evidence meet the
+   selected acceptance tier.
 
 ## Work Modes
 
@@ -173,6 +246,11 @@ owners, scopes, merge order, conflict policy, and reconciliation gate.
 
 Watchers and monitors never edit files.
 
+When agent CLI sub-agents share a worktree, treat them as one-writer-at-a-time
+participants under the same lock discipline. When workers run in forked or
+isolated workspaces, require an explicit merge and reconciliation plan before
+acceptance.
+
 ## Operating Rules
 
 - Preserve user changes; never revert unknown work unless explicitly asked.
@@ -181,6 +259,8 @@ Watchers and monitors never edit files.
 - Keep ledgers useful and evidence-based.
 - Prefer product-visible vertical slices when the selected mode favors velocity.
 - Keep hard invariants explicit in every baton.
+- Keep Codex-native orchestration first when available; use other runtimes as
+  compatibility modes.
 - If push/auth fails, keep local commits and record remote status.
 - If a design, browser, document, spreadsheet, GitHub, or other domain skill is
   explicitly named, use that skill for the relevant work.
@@ -191,3 +271,5 @@ Watchers and monitors never edit files.
   stop/resume, cleanup, permission, and escalation knobs.
 - `references/templates.md`: concise factory config, baton, handoff, review,
   decision, stop, resume, and recovery packet templates.
+- `../../docs/runtime-modes.md`: public runtime mode contract and delegation
+  boundaries.

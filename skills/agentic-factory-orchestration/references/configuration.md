@@ -43,6 +43,7 @@ interview; infer the rest and record it as editable config.
 Common fields:
 
 ```text
+runtime_mode: codex_native | agent_cli_subagents | serial_single_agent | manual_protocol | adapter_spawn
 work_mode:
 factory_topology: executive_as_ledger | separate_ledger | passive_fallback
 role_topology: lean_solo | standard | reviewed | managed | enterprise
@@ -74,6 +75,12 @@ capability_preflight: minimal | standard | full
 it. If the environment still prompts, record the mismatch and use blocker policy
 instead of stalling silently.
 
+`codex_native` is the preferred runtime mode when Codex-native thread or
+sub-agent capabilities are available. Use `agent_cli_subagents` only after
+confirming the host CLI's delegation, workspace, permission, and recovery
+semantics. Use `serial_single_agent` when delegation is unavailable or unclear.
+Treat `adapter_spawn` as future/experimental unless explicitly configured.
+
 ## User Involvement
 
 Use `principal_partner` for substantial or long-running factories unless the
@@ -97,6 +104,7 @@ interrupt the Executive or Builder.
 Default substantial-build settings:
 
 ```text
+runtime_mode: codex_native
 tool_call_budget_policy: bounded_reads
 thread_read_policy: latest_only
 active_actor_polling_policy: adaptive_backoff

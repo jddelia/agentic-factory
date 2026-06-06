@@ -1,14 +1,22 @@
 # Agentic Factory
 
 Agentic Factory is a Codex plugin for durable agentic software-factory
-workflows. It gives agents a stdlib-only Python CLI, a SQLite event store,
-structured baton state, review and verification records, pause/resume
-checkpoints, doctor checks, and markdown ledger rendering.
+workflows. Its primary mode is Codex app orchestration, where a lead agent can
+coordinate role-specific workers while recording durable state through a
+stdlib-only Python CLI, a SQLite event store, structured baton state, review and
+verification records, pause/resume checkpoints, doctor checks, and markdown
+ledger rendering.
 
 The plugin is self-contained. It ships one skill for durable CLI/state
 operations and one skill for full software-factory orchestration. Earlier local
 versions referenced a private `software-factory-v2` skill; this repository does
 not require that skill and does not ship a conflicting copy of it.
+
+The CLI is the factory control plane and ledger. It does not need to know how
+every host runtime spawns workers. The orchestration skill chooses the best
+runtime mode: Codex-native delegation when available, another agent CLI's
+sub-agent mechanism when safe, serial role simulation when necessary, or manual
+protocol execution for testing and debugging.
 
 ## What It Provides
 
@@ -44,14 +52,26 @@ Detailed docs:
 
 - [Installation](docs/installation.md)
 - [Usage](docs/usage.md)
+- [Runtime modes](docs/runtime-modes.md)
 - [Project configuration](docs/configuration.md)
 - [CLI reference](docs/cli.md)
 - [Schema and event contract](docs/schema.md)
-- [Basic factory example](examples/basic-factory/session.md)
+- [Codex-orchestrated example](examples/codex-orchestrated-session.md)
+- [Manual CLI protocol transcript](examples/basic-factory/session.md)
 
 ## Quick Start
 
-From a project root, run the CLI from the installed plugin directory:
+In the Codex app, start with the orchestration prompt:
+
+```text
+Run a Codex-native DB-backed software factory for this project
+```
+
+The lead agent should select runtime mode, initialize durable state, assign
+batons, coordinate workers, and record evidence through the CLI.
+
+For manual protocol testing or a direct CLI smoke check, run commands from the
+target project root with the installed plugin directory:
 
 ```bash
 python3 /path/to/agentic-factory/scripts/factory.py init \
@@ -83,16 +103,18 @@ python3 /path/to/agentic-factory/scripts/factory.py render-ledger \
 
 ## Recommended Workflow
 
-1. Use `agentic-factory-orchestration` to choose mode, topology, acceptance tier,
-   and verification policy.
-2. Use `agentic-factory` to run `init` once per target project.
-3. Run `doctor` before assigning or accepting work.
-4. Use `baton create` for the active writer.
-5. Use `baton handoff` to capture files, commands, verification, risks, and next
+1. Use `agentic-factory-orchestration` to choose runtime mode, work mode,
+   topology, acceptance tier, and verification policy.
+2. Use Codex-native worker delegation when available. In other agent CLIs, use
+   their native sub-agent mechanism or simulate roles serially.
+3. Use `agentic-factory` to run `init` once per target project.
+4. Run `doctor` before assigning or accepting work.
+5. Use `baton create` for the active writer.
+6. Use `baton handoff` to capture files, commands, verification, risks, and next
    step.
-6. Use `verify record` and `review record` for evidence.
-7. Use `baton accept` only after the work meets the selected acceptance tier.
-8. Use `render-ledger` when humans need a markdown snapshot.
+7. Use `verify record` and `review record` for evidence.
+8. Use `baton accept` only after the work meets the selected acceptance tier.
+9. Use `render-ledger` when humans need a markdown snapshot.
 
 The database is the source of truth. The markdown ledger is a rendered view.
 
@@ -150,6 +172,11 @@ The plugin intentionally does not ship a duplicate skill named
 users who already have a personal or marketplace skill installed. The public
 orchestration skill is named `agentic-factory-orchestration`; it references
 `agentic-factory` one-way for durable state.
+
+The plugin also intentionally keeps direct process spawning out of the core
+CLI. Host runtimes own worker creation. The orchestration skill tells the lead
+agent how to preflight runtime capabilities and select the safest available
+delegation mode, while `factory.py` records the resulting state transitions.
 
 ## License
 

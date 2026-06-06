@@ -6,4 +6,6 @@
 - Added split skills for CLI/state operations and public factory orchestration.
 - Added installation, usage, schema, example session, and generated CLI reference docs.
 - Added direct inspection commands and project-local config support.
+- Clarified Codex-native runtime mode, portable agent CLI approximations, and
+  manual protocol examples.
 - Added SQLite-backed factory CLI, schema migration, templates, and tests.

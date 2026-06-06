@@ -1,7 +1,15 @@
-# Basic Factory Session
+# Manual CLI Protocol Transcript
 
-This example walks through a realistic Agentic Factory run in a separate target
-project. It demonstrates the normal lifecycle:
+This example walks through the underlying Agentic Factory state transitions in
+a separate target project. It is a manual protocol transcript: a maintainer runs
+each CLI command directly to show what the database records.
+
+In the primary Codex app flow, users should not need to type each transition by
+hand. The Executive, Builder, Reviewer, and Ledger roles normally emit these
+commands while running the factory. Other agent CLIs can approximate the same
+flow with their own sub-agent mechanism, or by simulating roles serially.
+
+The transcript demonstrates the lifecycle:
 
 1. initialize
 2. create baton
@@ -13,6 +21,9 @@ project. It demonstrates the normal lifecycle:
 
 The commands use `PLUGIN_ROOT` so the target project does not need to live
 inside this plugin repository.
+
+For the intended Codex-native orchestration shape, see
+[`../codex-orchestrated-session.md`](../codex-orchestrated-session.md).
 
 ## Setup
 
@@ -74,6 +85,9 @@ git=unavailable
 
 ## 2. Create Baton
 
+In an orchestrated run, the Executive records this baton before assigning the
+Builder role. Here, the command is typed directly.
+
 ```bash
 python3 "$PLUGIN_ROOT/scripts/factory.py" baton create B-001 \
   --title "Add greeting helper coverage" \
@@ -94,6 +108,10 @@ Example output:
 ```
 
 ## 3. Record Verification
+
+In an orchestrated run, the Builder normally performs this scoped work and
+records the verification evidence, or returns a structured handoff bundle for
+the Executive/Ledger to record.
 
 Create a focused test:
 
@@ -139,6 +157,8 @@ Example output:
 
 ## 4. Handoff
 
+This command represents the Builder handoff bundle.
+
 ```bash
 python3 "$PLUGIN_ROOT/scripts/factory.py" baton handoff B-001 \
   --summary "Added focused greeting helper coverage" \
@@ -160,6 +180,10 @@ Example output:
 ```
 
 ## 5. Review
+
+In an orchestrated run, this evidence comes from a read-only Reviewer worker
+when the selected runtime can provide one. In serial mode, the lead agent
+performs a separate review pass and records the same evidence.
 
 ```bash
 python3 "$PLUGIN_ROOT/scripts/factory.py" review record \
@@ -191,6 +215,9 @@ python3 "$PLUGIN_ROOT/scripts/factory.py" review record \
 ```
 
 ## 6. Accept
+
+Acceptance remains an Executive decision. The CLI records the decision; it does
+not independently prove that the acceptance tier was satisfied.
 
 Commit the accepted files in the target project:
 
