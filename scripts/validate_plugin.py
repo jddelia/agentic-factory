@@ -55,6 +55,8 @@ def validate(plugin_root: Path) -> list[str]:
         "docs/installation.md",
         "docs/usage.md",
         "docs/cli.md",
+        "docs/schema.md",
+        "examples/basic-factory/session.md",
     ):
         if not (plugin_root / required_file).is_file():
             errors.append(f"missing open-source hygiene file `{required_file}`")

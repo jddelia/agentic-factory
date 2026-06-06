@@ -43,6 +43,8 @@ Detailed docs:
 - [Installation](docs/installation.md)
 - [Usage](docs/usage.md)
 - [CLI reference](docs/cli.md)
+- [Schema and event contract](docs/schema.md)
+- [Basic factory example](examples/basic-factory/session.md)
 
 ## Quick Start
 
@@ -121,7 +123,8 @@ skills/agentic-factory-orchestration/
 scripts/factory.py            Stdlib-only SQLite CLI
 scripts/generate_cli_docs.py  CLI reference generator
 scripts/validate_plugin.py    Repo-local plugin hygiene validator
-docs/                         Installation, usage, and CLI reference
+docs/                         Installation, usage, CLI, and schema docs
+examples/                     End-to-end example sessions
 migrations/                   SQLite schema migrations
 templates/                    Handoff and review packet templates
 tests/                        CLI regression tests
