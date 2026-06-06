@@ -1,0 +1,42 @@
+{
+  "name": "agentic-factory",
+  "version": "0.1.0",
+  "description": "Database-backed agentic software factory operations with structured events, baton state, reviews, verification history, pause/resume controls, and markdown ledger rendering.",
+  "author": {
+    "name": "Agentic Factory contributors"
+  },
+  "license": "MIT",
+  "keywords": [
+    "software-factory",
+    "agentic",
+    "agents",
+    "sqlite",
+    "ledger",
+    "batons",
+    "reviews",
+    "automation"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Agentic Factory",
+    "shortDescription": "Run durable agentic factories with SQLite-backed ledgers.",
+    "longDescription": "Agentic Factory adds executable infrastructure for long-running agent-driven software builds: a structured SQLite event store, current-state queries, baton assignment and handoff commands, review and verification records, pause/resume checkpoints, doctor checks, and markdown ledger rendering. The bundled skill includes the minimum operating model, so the plugin works without private skill dependencies.",
+    "developerName": "Agentic Factory contributors",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Initialize a DB-backed factory ledger",
+      "Record this baton handoff in the factory DB",
+      "Render the current build ledger"
+    ],
+    "brandColor": "#2563EB",
+    "composerIcon": "./assets/composer-icon.png",
+    "logo": "./assets/logo.png",
+    "screenshots": [
+      "./assets/selected-light-d-preview.png"
+    ]
+  }
+}

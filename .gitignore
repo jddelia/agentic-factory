@@ -1,0 +1,15 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+.agentic-factory/
+docs/build_ledger.md
+*.sqlite
+*.sqlite3
+*.db
