@@ -21,6 +21,15 @@ python3 /path/to/agentic-factory/scripts/factory.py status --compact
 python3 /path/to/agentic-factory/scripts/factory.py doctor
 ```
 
+Optional: create project defaults first:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py config init
+python3 /path/to/agentic-factory/scripts/factory.py config show
+```
+
+See [Project Configuration](configuration.md) for supported fields.
+
 ## Create A Baton
 
 ```bash
@@ -119,6 +128,41 @@ python3 /path/to/agentic-factory/scripts/factory.py render-ledger \
 ```
 
 The markdown ledger is a snapshot. Keep durable state in SQLite.
+
+## Inspect Existing State
+
+List batons:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py baton list --all
+```
+
+Show a baton with related handoffs, verification, reviews, commits, and events:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py baton show B-001
+```
+
+List recent events:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py events list --recent 20
+```
+
+List verification records:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py verification list --baton B-001
+```
+
+List review records:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py review list --baton B-001
+```
+
+Add `--json` to these commands when another tool or agent needs structured
+output.
 
 ## Custom DB Path
 

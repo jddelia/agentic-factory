@@ -16,23 +16,34 @@ CLI = REPO_ROOT / "scripts" / "factory.py"
 DOC = REPO_ROOT / "docs" / "cli.md"
 COMMANDS: tuple[tuple[str, ...], ...] = (
     (),
+    ("config",),
+    ("config", "init"),
+    ("config", "show"),
     ("init",),
     ("status",),
     ("event",),
     ("event", "append"),
     ("baton",),
+    ("baton", "list"),
+    ("baton", "show"),
     ("baton", "create"),
     ("baton", "handoff"),
     ("baton", "accept"),
     ("verify",),
+    ("verify", "list"),
     ("verify", "record"),
     ("review",),
+    ("review", "list"),
     ("review", "record"),
     ("pause",),
     ("resume",),
     ("lock",),
     ("lock", "acquire"),
     ("lock", "release"),
+    ("events",),
+    ("events", "list"),
+    ("verification",),
+    ("verification", "list"),
     ("render-ledger",),
     ("doctor",),
 )
@@ -50,6 +61,46 @@ NOTES: dict[tuple[str, ...], str] = {
 
         - No command: argparse prints usage and exits non-zero.
         - Relative `--db`: resolved under `--root`, not the shell's original directory.
+    """,
+    ("config", "init"): """
+        Required arguments: none.
+
+        Example:
+
+        ```bash
+        python3 scripts/factory.py config init
+        ```
+
+        Example output shape:
+
+        ```json
+        {"status": "created", "path": ".../.agentic-factory/config.json", "config": {...}}
+        ```
+
+        Common failures:
+
+        - Config already exists and `--force` was not supplied.
+        - The target config path cannot be written.
+    """,
+    ("config", "show"): """
+        Required arguments: none.
+
+        Example:
+
+        ```bash
+        python3 scripts/factory.py config show
+        ```
+
+        Example output shape:
+
+        ```json
+        {"path": ".../.agentic-factory/config.json", "exists": true, "config": {...}}
+        ```
+
+        Common failures:
+
+        - Config JSON is invalid.
+        - Config contains unknown fields or unsafe relative paths.
     """,
     ("init",): """
         Required arguments: none.
@@ -114,6 +165,47 @@ NOTES: dict[tuple[str, ...], str] = {
         - `--payload` and `--payload-file` used together.
         - Payload is not a JSON object.
     """,
+    ("baton", "list"): """
+        Required arguments: none.
+
+        Example:
+
+        ```bash
+        python3 scripts/factory.py baton list --all --json
+        ```
+
+        Example output shape:
+
+        ```json
+        {"count": 1, "batons": [{"id": "B-001", "status": "accepted"}]}
+        ```
+
+        Common failures:
+
+        - No run exists.
+        - `--limit` is less than 1 or greater than the maximum list limit.
+    """,
+    ("baton", "show"): """
+        Required arguments: `baton_id`.
+
+        Example:
+
+        ```bash
+        python3 scripts/factory.py baton show B-001 --json
+        ```
+
+        Example output shape:
+
+        ```json
+        {"baton": {...}, "handoffs": [], "verification": [], "reviews": [], "commits": [], "events": []}
+        ```
+
+        Common failures:
+
+        - Unknown baton.
+        - Baton does not belong to the current run.
+        - `--recent-events` is outside the allowed range.
+    """,
     ("baton", "create"): """
         Required arguments: `baton_id`, `--title`.
 
@@ -134,6 +226,7 @@ NOTES: dict[tuple[str, ...], str] = {
         - No run exists.
         - Another active baton exists and `--allow-active` was not supplied.
         - Writer lock is already held and `--force-lock` was not supplied.
+        - Project config is invalid.
     """,
     ("baton", "handoff"): """
         Required arguments: `baton_id`, `--summary`.
@@ -154,6 +247,7 @@ NOTES: dict[tuple[str, ...], str] = {
 
         - Unknown baton.
         - No run exists.
+        - Project config is invalid.
     """,
     ("baton", "accept"): """
         Required arguments: `baton_id`.
@@ -174,6 +268,28 @@ NOTES: dict[tuple[str, ...], str] = {
 
         - Unknown baton.
         - Accepting before the configured tier is satisfied is an orchestration error; the CLI records the decision you give it.
+        - Project config is invalid.
+    """,
+    ("verify", "list"): """
+        Required arguments: none.
+
+        Example:
+
+        ```bash
+        python3 scripts/factory.py verify list --baton B-001 --json
+        ```
+
+        Example output shape:
+
+        ```json
+        {"count": 1, "verification": [{"result": "pass", "command": "pytest"}]}
+        ```
+
+        Common failures:
+
+        - No run exists.
+        - Unknown baton when `--baton` is supplied.
+        - `--recent` is outside the allowed range.
     """,
     ("verify", "record"): """
         Required arguments: `--command`, `--result`.
@@ -195,6 +311,29 @@ NOTES: dict[tuple[str, ...], str] = {
         - `--result` is not one of `pass`, `fail`, `not_run`, or `blocked`.
         - `--duration-ms` is negative.
         - Unknown baton when `--baton` is supplied.
+        - Project config requires `--baton`.
+        - Project config requires `--summary` for `not_run`.
+    """,
+    ("review", "list"): """
+        Required arguments: none.
+
+        Example:
+
+        ```bash
+        python3 scripts/factory.py review list --baton B-001 --json
+        ```
+
+        Example output shape:
+
+        ```json
+        {"count": 1, "reviews": [{"status": "accepted", "findings": []}]}
+        ```
+
+        Common failures:
+
+        - No run exists.
+        - Unknown baton when `--baton` is supplied.
+        - `--recent` is outside the allowed range.
     """,
     ("review", "record"): """
         Required arguments: `--baton`.
@@ -295,6 +434,49 @@ NOTES: dict[tuple[str, ...], str] = {
 
         - No run exists.
         - Releasing a missing lock is idempotent at the table-update level.
+        - Project config is invalid.
+    """,
+    ("events", "list"): """
+        Required arguments: none.
+
+        Example:
+
+        ```bash
+        python3 scripts/factory.py events list --recent 20 --json
+        ```
+
+        Example output shape:
+
+        ```json
+        {"count": 1, "events": [{"event_type": "factory.started"}]}
+        ```
+
+        Common failures:
+
+        - No run exists.
+        - Unknown baton when `--baton` is supplied.
+        - `--recent` is outside the allowed range.
+    """,
+    ("verification", "list"): """
+        Required arguments: none.
+
+        Example:
+
+        ```bash
+        python3 scripts/factory.py verification list --baton B-001 --json
+        ```
+
+        Example output shape:
+
+        ```json
+        {"count": 1, "verification": [{"result": "pass", "command": "pytest"}]}
+        ```
+
+        Common failures:
+
+        - No run exists.
+        - Unknown baton when `--baton` is supplied.
+        - `--recent` is outside the allowed range.
     """,
     ("render-ledger",): """
         Required arguments: none.
@@ -315,6 +497,7 @@ NOTES: dict[tuple[str, ...], str] = {
 
         - No run exists.
         - `--recent` is less than 1.
+        - Project config has an unsafe `ledger_output_path`.
     """,
     ("doctor",): """
         Required arguments: none.

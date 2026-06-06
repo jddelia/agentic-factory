@@ -274,6 +274,16 @@ Git head: abc1234 test: add greeting helper coverage
 The generated DB is local workflow state and should not be committed:
 
 ```bash
+python3 "$PLUGIN_ROOT/scripts/factory.py" baton list --all
+python3 "$PLUGIN_ROOT/scripts/factory.py" baton show B-001
+python3 "$PLUGIN_ROOT/scripts/factory.py" events list --recent 20
+python3 "$PLUGIN_ROOT/scripts/factory.py" verification list --baton B-001
+python3 "$PLUGIN_ROOT/scripts/factory.py" review list --baton B-001
+```
+
+You can also inspect the raw tables directly:
+
+```bash
 sqlite3 .agentic-factory/factory.db ".tables"
 sqlite3 .agentic-factory/factory.db "select event_type, baton_id, summary from events order by id;"
 ```

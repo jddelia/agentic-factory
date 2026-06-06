@@ -32,6 +32,20 @@ Global options:
 
 - `--root <path>`: target project root; defaults to current directory.
 - `--db <path>`: DB path; relative paths resolve under `--root`.
+- `--config <path>`: config path; defaults to `.agentic-factory/config.json`.
+
+## Project Config
+
+Use project config for durable defaults:
+
+```bash
+python3 <plugin-root>/scripts/factory.py config init
+python3 <plugin-root>/scripts/factory.py config show
+```
+
+Supported config fields include default mode, default topology, default lock
+name, preferred ledger output path, verification policy, and protected generated
+files. Invalid config fails fast before command behavior changes.
 
 ## First Touch
 
@@ -116,6 +130,21 @@ severity|file|line|status|summary
 
 Use blank or `0` for line when there is no file line.
 
+## Direct Inspection
+
+Use bounded read-only inspection commands instead of parsing the whole DB or a
+large rendered ledger:
+
+```bash
+python3 <plugin-root>/scripts/factory.py baton list --all
+python3 <plugin-root>/scripts/factory.py baton show B-001
+python3 <plugin-root>/scripts/factory.py events list --recent 20
+python3 <plugin-root>/scripts/factory.py verification list --baton B-001
+python3 <plugin-root>/scripts/factory.py review list --baton B-001
+```
+
+Add `--json` when another tool needs structured output.
+
 ## Pause, Resume, And Ledger
 
 Pause:
@@ -147,8 +176,9 @@ When state exists, inspect in this order:
 
 1. `factory.py status --compact`
 2. `factory.py doctor`
-3. current baton, handoff, verification, or review evidence
-4. `factory.py render-ledger` only when a markdown snapshot is needed
+3. `factory.py baton show <id>` or focused list commands
+4. current handoff, verification, or review evidence
+5. `factory.py render-ledger` only when a markdown snapshot is needed
 
 Avoid reading a whole historical markdown ledger when structured status is
 available.

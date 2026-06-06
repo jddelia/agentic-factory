@@ -15,6 +15,8 @@ not require that skill and does not ship a conflicting copy of it.
 - SQLite event store under `.agentic-factory/factory.db`
 - Append-first factory events
 - Baton assignment, handoff, acceptance, and lock commands
+- Direct inspection commands for batons, events, verification, and reviews
+- Project-local config through `.agentic-factory/config.json`
 - Review findings and verification records
 - Pause/resume checkpoints
 - Markdown build-ledger rendering
@@ -42,6 +44,7 @@ Detailed docs:
 
 - [Installation](docs/installation.md)
 - [Usage](docs/usage.md)
+- [Project configuration](docs/configuration.md)
 - [CLI reference](docs/cli.md)
 - [Schema and event contract](docs/schema.md)
 - [Basic factory example](examples/basic-factory/session.md)

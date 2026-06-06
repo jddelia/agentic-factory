@@ -8,8 +8,10 @@ without installing project dependencies.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
+from pathlib import PurePosixPath
 import sqlite3
 import subprocess
 import sys
@@ -21,7 +23,35 @@ from typing import Any, Iterable
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DB_DIR = ".agentic-factory"
 DEFAULT_DB_NAME = "factory.db"
+DEFAULT_CONFIG_NAME = "config.json"
 ACTIVE_BATON_STATUSES = {"assigned", "active", "in_progress", "handed_off", "review"}
+VERIFICATION_RESULTS = {"pass", "fail", "not_run", "blocked"}
+DEFAULT_LIST_LIMIT = 20
+MAX_LIST_LIMIT = 500
+DEFAULT_PROJECT_CONFIG: dict[str, Any] = {
+    "default_mode": "balanced",
+    "default_topology": "executive_as_ledger",
+    "default_lock_name": "main-worktree",
+    "ledger_output_path": "",
+    "verification_policy": {
+        "default_level": "focused",
+        "require_baton": False,
+        "require_summary_for_not_run": False,
+    },
+    "protected_generated_files": [],
+}
+CONFIG_FILE_TEMPLATE: dict[str, Any] = {
+    "default_mode": "balanced",
+    "default_topology": "executive_as_ledger",
+    "default_lock_name": "main-worktree",
+    "ledger_output_path": "docs/build_ledger.md",
+    "verification_policy": {
+        "default_level": "focused",
+        "require_baton": False,
+        "require_summary_for_not_run": True,
+    },
+    "protected_generated_files": [],
+}
 
 
 class FactoryError(RuntimeError):
@@ -56,6 +86,118 @@ def db_path_for(root: Path, db: str | None) -> Path:
             path = root / path
         return path.resolve()
     return root / DEFAULT_DB_DIR / DEFAULT_DB_NAME
+
+
+def config_path_for(root: Path, config: str | None) -> Path:
+    if config:
+        path = Path(config).expanduser()
+        if not path.is_absolute():
+            path = root / path
+        return path.resolve()
+    return root / DEFAULT_DB_DIR / DEFAULT_CONFIG_NAME
+
+
+def safe_relative_path(raw: Any, *, field: str, allow_empty: bool = False) -> str:
+    if not isinstance(raw, str):
+        raise FactoryError(f"Config field `{field}` must be a string.")
+    stripped = raw.strip()
+    if not stripped:
+        if allow_empty:
+            return ""
+        raise FactoryError(f"Config field `{field}` must not be empty.")
+    candidate = PurePosixPath(stripped.replace("\\", "/"))
+    if candidate.is_absolute() or candidate.as_posix() == "." or ".." in candidate.parts:
+        raise FactoryError(f"Config field `{field}` must be a relative path inside the project.")
+    return candidate.as_posix()
+
+
+def require_config_string(payload: dict[str, Any], key: str) -> str:
+    value = payload.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise FactoryError(f"Config field `{key}` must be a non-empty string.")
+    return value.strip()
+
+
+def require_config_bool(payload: dict[str, Any], key: str) -> bool:
+    value = payload.get(key)
+    if not isinstance(value, bool):
+        raise FactoryError(f"Config field `verification_policy.{key}` must be a boolean.")
+    return value
+
+
+def load_project_config(root: Path, config: str | None = None) -> tuple[dict[str, Any], Path, bool]:
+    path = config_path_for(root, config)
+    effective = copy.deepcopy(DEFAULT_PROJECT_CONFIG)
+    if not path.is_file():
+        return effective, path, False
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise FactoryError(f"Invalid config JSON at {path}: {exc}") from exc
+    except OSError as exc:
+        raise FactoryError(f"Unable to read config at {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise FactoryError("Project config must contain a JSON object.")
+
+    allowed = {
+        "default_mode",
+        "default_topology",
+        "default_lock_name",
+        "ledger_output_path",
+        "verification_policy",
+        "protected_generated_files",
+    }
+    unknown = sorted(set(payload) - allowed)
+    if unknown:
+        raise FactoryError(f"Unknown config field(s): {', '.join(unknown)}")
+
+    for key in ("default_mode", "default_topology", "default_lock_name"):
+        if key in payload:
+            effective[key] = require_config_string(payload, key)
+
+    if "ledger_output_path" in payload:
+        effective["ledger_output_path"] = safe_relative_path(
+            payload["ledger_output_path"],
+            field="ledger_output_path",
+            allow_empty=True,
+        )
+
+    if "protected_generated_files" in payload:
+        protected = payload["protected_generated_files"]
+        if not isinstance(protected, list):
+            raise FactoryError("Config field `protected_generated_files` must be an array.")
+        effective["protected_generated_files"] = [
+            safe_relative_path(value, field="protected_generated_files[]")
+            for value in protected
+        ]
+
+    if "verification_policy" in payload:
+        policy = payload["verification_policy"]
+        if not isinstance(policy, dict):
+            raise FactoryError("Config field `verification_policy` must be an object.")
+        allowed_policy = {"default_level", "require_baton", "require_summary_for_not_run"}
+        unknown_policy = sorted(set(policy) - allowed_policy)
+        if unknown_policy:
+            raise FactoryError(
+                f"Unknown config field(s) under `verification_policy`: {', '.join(unknown_policy)}"
+            )
+        if "default_level" in policy:
+            effective["verification_policy"]["default_level"] = require_config_string(policy, "default_level")
+        if "require_baton" in policy:
+            effective["verification_policy"]["require_baton"] = require_config_bool(policy, "require_baton")
+        if "require_summary_for_not_run" in policy:
+            effective["verification_policy"]["require_summary_for_not_run"] = require_config_bool(
+                policy,
+                "require_summary_for_not_run",
+            )
+
+    return effective, path, True
+
+
+def config_for_args(root: Path, args: argparse.Namespace) -> dict[str, Any]:
+    config, _, _ = load_project_config(root, getattr(args, "config", None))
+    return config
 
 
 def connect(root: Path, db: str | None = None) -> sqlite3.Connection:
@@ -105,6 +247,53 @@ def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
 
 def print_json(value: Any) -> None:
     print(json.dumps(value, indent=2, sort_keys=True))
+
+
+def parse_json_field(raw: str | None) -> Any:
+    fallback: Any = [] if raw and raw.strip().startswith("[") else {}
+    return json_loads_or_empty(raw, fallback)
+
+
+def row_to_public_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    payload = dict(row)
+    for key, value in list(payload.items()):
+        if key.endswith("_json"):
+            payload[key[:-5]] = parse_json_field(value)
+    return payload
+
+
+def require_limit(value: int, *, field: str) -> int:
+    if value < 1:
+        raise FactoryError(f"--{field} must be greater than 0")
+    if value > MAX_LIST_LIMIT:
+        raise FactoryError(f"--{field} must be less than or equal to {MAX_LIST_LIMIT}")
+    return value
+
+
+def shorten(value: Any, max_len: int = 80) -> str:
+    text = "" if value is None else str(value).replace("\n", " ")
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3] + "..."
+
+
+def print_table(rows: list[dict[str, Any]], columns: list[tuple[str, str]], *, empty: str) -> None:
+    if not rows:
+        print(empty)
+        return
+    widths = {
+        key: min(
+            max(len(label), *(len(shorten(row.get(key), 80)) for row in rows)),
+            80,
+        )
+        for key, label in columns
+    }
+    print("  ".join(label.ljust(widths[key]) for key, label in columns))
+    print("  ".join("-" * widths[key] for key, _label in columns))
+    for row in rows:
+        print("  ".join(shorten(row.get(key), widths[key]).ljust(widths[key]) for key, _label in columns))
 
 
 def emit_event(
@@ -219,6 +408,7 @@ def markdown_cell(value: Any) -> str:
 
 def cmd_init(args: argparse.Namespace) -> int:
     root = resolve_root(args.root)
+    config = config_for_args(root, args)
     conn = connect(root, args.db)
     existing = current_run(conn)
     if existing and not args.force:
@@ -234,6 +424,8 @@ def cmd_init(args: argparse.Namespace) -> int:
 
     now = utc_now()
     run_id = args.run_id or f"factory-{now.replace(':', '').replace('-', '').replace('Z', '')}"
+    work_mode = args.mode or config["default_mode"]
+    topology = args.topology or config["default_topology"]
     conn.execute(
         """
         INSERT INTO factory_runs
@@ -244,8 +436,8 @@ def cmd_init(args: argparse.Namespace) -> int:
             run_id,
             str(root),
             args.objective or "",
-            args.mode,
-            args.topology,
+            work_mode,
+            topology,
             now,
             now,
             json_dump({"created_by": "agentic-factory"}),
@@ -256,8 +448,8 @@ def cmd_init(args: argparse.Namespace) -> int:
         event_type="factory.started",
         actor=args.actor,
         run_id=run_id,
-        summary=args.objective or f"Factory started in {args.mode} mode",
-        payload={"work_mode": args.mode, "topology": args.topology, "project_root": str(root)},
+        summary=args.objective or f"Factory started in {work_mode} mode",
+        payload={"work_mode": work_mode, "topology": topology, "project_root": str(root)},
     )
     conn.commit()
     print_json({"status": "initialized", "db": str(db_path_for(root, args.db)), "run_id": run_id})
@@ -334,6 +526,325 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_config_init(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    path = config_path_for(root, args.config)
+    if path.exists() and not args.force:
+        print_json(
+            {
+                "status": "exists",
+                "path": str(path),
+                "message": "Project config already exists. Use --force to overwrite it.",
+            }
+        )
+        return 0
+    config = copy.deepcopy(CONFIG_FILE_TEMPLATE)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print_json({"status": "created", "path": str(path), "config": config})
+    return 0
+
+
+def cmd_config_show(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    config, path, exists = load_project_config(root, args.config)
+    print_json({"path": str(path), "exists": exists, "config": config})
+    return 0
+
+
+def cmd_baton_list(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    conn = connect(root, args.db)
+    run = require_run(conn)
+    limit = require_limit(args.limit, field="limit")
+    statuses = csv_values(args.status)
+    params: list[Any] = [run["id"]]
+    where = ["run_id = ?"]
+    if statuses:
+        where.append(f"status IN ({','.join('?' for _ in statuses)})")
+        params.extend(statuses)
+    elif not args.all:
+        active = sorted(ACTIVE_BATON_STATUSES)
+        where.append(f"status IN ({','.join('?' for _ in active)})")
+        params.extend(active)
+    params.append(limit)
+    rows = list(
+        conn.execute(
+            f"""
+            SELECT * FROM batons
+            WHERE {' AND '.join(where)}
+            ORDER BY assigned_at DESC
+            LIMIT ?
+            """,
+            params,
+        )
+    )
+    batons = [row_to_public_dict(row) for row in rows]
+    if args.json:
+        print_json({"count": len(batons), "batons": batons})
+        return 0
+    print_table(
+        [baton for baton in batons if baton is not None],
+        [
+            ("id", "Baton"),
+            ("status", "Status"),
+            ("title", "Title"),
+            ("owner", "Owner"),
+            ("assigned_at", "Assigned"),
+            ("commit_sha", "Commit"),
+        ],
+        empty="No batons found.",
+    )
+    return 0
+
+
+def review_with_findings(conn: sqlite3.Connection, review: sqlite3.Row) -> dict[str, Any]:
+    payload = row_to_public_dict(review) or {}
+    findings = list(
+        conn.execute(
+            "SELECT * FROM review_findings WHERE review_id = ? ORDER BY id",
+            (review["id"],),
+        )
+    )
+    payload["findings"] = [row_to_public_dict(row) for row in findings]
+    return payload
+
+
+def cmd_baton_show(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    conn = connect(root, args.db)
+    run = require_run(conn)
+    baton = require_baton(conn, args.baton_id)
+    if baton["run_id"] != run["id"]:
+        raise FactoryError(f"Baton {args.baton_id} does not belong to current run {run['id']}.")
+    recent_events = require_limit(args.recent_events, field="recent-events")
+    handoffs = list(
+        conn.execute(
+            "SELECT * FROM handoffs WHERE baton_id = ? ORDER BY created_at DESC",
+            (args.baton_id,),
+        )
+    )
+    verification = list(
+        conn.execute(
+            "SELECT * FROM verification_runs WHERE baton_id = ? ORDER BY created_at DESC",
+            (args.baton_id,),
+        )
+    )
+    reviews = list(
+        conn.execute(
+            "SELECT * FROM reviews WHERE baton_id = ? ORDER BY created_at DESC, id DESC",
+            (args.baton_id,),
+        )
+    )
+    commits = list(
+        conn.execute(
+            "SELECT * FROM commits WHERE baton_id = ? ORDER BY created_at DESC",
+            (args.baton_id,),
+        )
+    )
+    events = list(
+        conn.execute(
+            """
+            SELECT * FROM events
+            WHERE baton_id = ?
+            ORDER BY occurred_at DESC, id DESC
+            LIMIT ?
+            """,
+            (args.baton_id, recent_events),
+        )
+    )
+    payload = {
+        "baton": row_to_public_dict(baton),
+        "handoffs": [row_to_public_dict(row) for row in handoffs],
+        "verification": [row_to_public_dict(row) for row in verification],
+        "reviews": [review_with_findings(conn, row) for row in reviews],
+        "commits": [row_to_public_dict(row) for row in commits],
+        "events": [row_to_public_dict(row) for row in events],
+    }
+    if args.json:
+        print_json(payload)
+        return 0
+    baton_payload = payload["baton"] or {}
+    print(f"Baton: {baton_payload.get('id')}")
+    print(f"Status: {baton_payload.get('status')}")
+    print(f"Title: {baton_payload.get('title')}")
+    print(f"Owner: {baton_payload.get('owner')}")
+    print(f"Scope: {baton_payload.get('scope')}")
+    print(f"Acceptance tier: {baton_payload.get('acceptance_tier')}")
+    print(f"Verification level: {baton_payload.get('verification_level')}")
+    if baton_payload.get("commit_sha"):
+        print(f"Commit: {baton_payload.get('commit_sha')}")
+    print("")
+    print_table(
+        [row for row in payload["verification"] if row is not None],
+        [("created_at", "Time"), ("result", "Result"), ("command", "Command"), ("summary", "Summary")],
+        empty="No verification records.",
+    )
+    print("")
+    print_table(
+        [row for row in payload["reviews"] if row is not None],
+        [("created_at", "Time"), ("status", "Status"), ("reviewer", "Reviewer"), ("summary", "Summary")],
+        empty="No review records.",
+    )
+    print("")
+    print_table(
+        [row for row in payload["events"] if row is not None],
+        [("occurred_at", "Time"), ("event_type", "Type"), ("actor", "Actor"), ("summary", "Summary")],
+        empty="No events.",
+    )
+    return 0
+
+
+def cmd_events_list(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    conn = connect(root, args.db)
+    run = require_run(conn)
+    recent = require_limit(args.recent, field="recent")
+    where = ["run_id = ?"]
+    params: list[Any] = [run["id"]]
+    if args.baton:
+        require_baton(conn, args.baton)
+        where.append("baton_id = ?")
+        params.append(args.baton)
+    if args.type:
+        where.append("event_type = ?")
+        params.append(args.type)
+    params.append(recent)
+    rows = list(
+        conn.execute(
+            f"""
+            SELECT * FROM events
+            WHERE {' AND '.join(where)}
+            ORDER BY occurred_at DESC, id DESC
+            LIMIT ?
+            """,
+            params,
+        )
+    )
+    events = [row_to_public_dict(row) for row in rows]
+    if args.json:
+        print_json({"count": len(events), "events": events})
+        return 0
+    print_table(
+        [event for event in events if event is not None],
+        [
+            ("id", "ID"),
+            ("occurred_at", "Time"),
+            ("event_type", "Type"),
+            ("baton_id", "Baton"),
+            ("actor", "Actor"),
+            ("summary", "Summary"),
+        ],
+        empty="No events found.",
+    )
+    return 0
+
+
+def cmd_verification_list(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    conn = connect(root, args.db)
+    run = require_run(conn)
+    recent = require_limit(args.recent, field="recent")
+    params: list[Any]
+    if args.baton:
+        require_baton(conn, args.baton)
+        where = "v.baton_id = ?"
+        params = [args.baton, recent]
+    else:
+        where = "(v.baton_id IS NULL OR b.run_id = ?)"
+        params = [run["id"], recent]
+    rows = list(
+        conn.execute(
+            f"""
+            SELECT v.*
+            FROM verification_runs v
+            LEFT JOIN batons b ON b.id = v.baton_id
+            WHERE {where}
+            ORDER BY v.created_at DESC, v.id DESC
+            LIMIT ?
+            """,
+            params,
+        )
+    )
+    verification = [row_to_public_dict(row) for row in rows]
+    if args.json:
+        print_json({"count": len(verification), "verification": verification})
+        return 0
+    print_table(
+        [row for row in verification if row is not None],
+        [
+            ("id", "ID"),
+            ("created_at", "Time"),
+            ("baton_id", "Baton"),
+            ("result", "Result"),
+            ("command", "Command"),
+            ("summary", "Summary"),
+        ],
+        empty="No verification records found.",
+    )
+    return 0
+
+
+def cmd_review_list(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    conn = connect(root, args.db)
+    run = require_run(conn)
+    recent = require_limit(args.recent, field="recent")
+    if args.baton:
+        require_baton(conn, args.baton)
+        where = "r.baton_id = ?"
+        params: list[Any] = [args.baton, recent]
+    else:
+        where = "b.run_id = ?"
+        params = [run["id"], recent]
+    rows = list(
+        conn.execute(
+            f"""
+            SELECT r.*
+            FROM reviews r
+            JOIN batons b ON b.id = r.baton_id
+            WHERE {where}
+            ORDER BY r.created_at DESC, r.id DESC
+            LIMIT ?
+            """,
+            params,
+        )
+    )
+    reviews = [review_with_findings(conn, row) for row in rows]
+    if args.json:
+        print_json({"count": len(reviews), "reviews": reviews})
+        return 0
+    print_table(
+        reviews,
+        [
+            ("id", "ID"),
+            ("created_at", "Time"),
+            ("baton_id", "Baton"),
+            ("status", "Status"),
+            ("reviewer", "Reviewer"),
+            ("summary", "Summary"),
+        ],
+        empty="No reviews found.",
+    )
+    for review in reviews:
+        findings = review.get("findings") or []
+        if findings:
+            print("")
+            print(f"Findings for review {review['id']}:")
+            print_table(
+                findings,
+                [
+                    ("severity", "Severity"),
+                    ("file", "File"),
+                    ("line", "Line"),
+                    ("status", "Status"),
+                    ("summary", "Summary"),
+                ],
+                empty="No findings.",
+            )
+    return 0
+
+
 def cmd_event_append(args: argparse.Namespace) -> int:
     root = resolve_root(args.root)
     conn = connect(root, args.db)
@@ -394,8 +905,11 @@ def release_lock(conn: sqlite3.Connection, *, name: str) -> None:
 
 def cmd_baton_create(args: argparse.Namespace) -> int:
     root = resolve_root(args.root)
+    config = config_for_args(root, args)
     conn = connect(root, args.db)
     run = require_run(conn)
+    lock_name = args.lock_name or config["default_lock_name"]
+    verification_level = args.verification_level or config["verification_policy"]["default_level"]
     active = active_batons(conn, run["id"])
     if active and not args.allow_active:
         active_ids = ", ".join(row["id"] for row in active)
@@ -416,7 +930,7 @@ def cmd_baton_create(args: argparse.Namespace) -> int:
             args.owner_thread or "",
             args.scope or "",
             args.acceptance_tier,
-            args.verification_level,
+            verification_level,
             args.model or "",
             args.reasoning or "",
             now,
@@ -428,7 +942,7 @@ def cmd_baton_create(args: argparse.Namespace) -> int:
         acquire_lock(
             conn,
             run_id=run["id"],
-            name=args.lock_name,
+            name=lock_name,
             holder=args.owner or args.actor,
             baton_id=args.baton_id,
             force=args.force_lock,
@@ -444,20 +958,22 @@ def cmd_baton_create(args: argparse.Namespace) -> int:
             "owner": args.owner,
             "scope": args.scope,
             "acceptance_tier": args.acceptance_tier,
-            "verification_level": args.verification_level,
+            "verification_level": verification_level,
             "lock_acquired": not args.no_lock,
         },
     )
     conn.commit()
-    print_json({"status": "assigned", "baton": args.baton_id, "lock": None if args.no_lock else args.lock_name})
+    print_json({"status": "assigned", "baton": args.baton_id, "lock": None if args.no_lock else lock_name})
     return 0
 
 
 def cmd_baton_handoff(args: argparse.Namespace) -> int:
     root = resolve_root(args.root)
+    config = config_for_args(root, args)
     conn = connect(root, args.db)
     run = require_run(conn)
     baton = require_baton(conn, args.baton_id)
+    lock_name = args.lock_name or config["default_lock_name"]
     files = csv_values(args.files)
     commands = csv_values(args.commands)
     verification = csv_values(args.verification)
@@ -496,7 +1012,7 @@ def cmd_baton_handoff(args: argparse.Namespace) -> int:
         ),
     )
     if args.release_lock:
-        release_lock(conn, name=args.lock_name)
+        release_lock(conn, name=lock_name)
     emit_event(
         conn,
         event_type="baton.handed_off",
@@ -513,9 +1029,11 @@ def cmd_baton_handoff(args: argparse.Namespace) -> int:
 
 def cmd_baton_accept(args: argparse.Namespace) -> int:
     root = resolve_root(args.root)
+    config = config_for_args(root, args)
     conn = connect(root, args.db)
     run = require_run(conn)
     baton = require_baton(conn, args.baton_id)
+    lock_name = args.lock_name or config["default_lock_name"]
     now = utc_now()
     conn.execute(
         """
@@ -534,7 +1052,7 @@ def cmd_baton_accept(args: argparse.Namespace) -> int:
             (args.baton_id, args.commit, args.message or "", args.pushed_status, now),
         )
     if args.release_lock:
-        release_lock(conn, name=args.lock_name)
+        release_lock(conn, name=lock_name)
     emit_event(
         conn,
         event_type="baton.accepted",
@@ -551,14 +1069,24 @@ def cmd_baton_accept(args: argparse.Namespace) -> int:
 
 def cmd_verify_record(args: argparse.Namespace) -> int:
     root = resolve_root(args.root)
+    config = config_for_args(root, args)
     conn = connect(root, args.db)
     run = require_run(conn)
+    verification_policy = config["verification_policy"]
+    if verification_policy["require_baton"] and not args.baton:
+        raise FactoryError("Project config requires --baton for verification records.")
     if args.baton:
         require_baton(conn, args.baton)
-    if args.result not in {"pass", "fail", "not_run", "blocked"}:
+    if args.result not in VERIFICATION_RESULTS:
         raise FactoryError("--result must be one of pass, fail, not_run, blocked")
     if args.duration_ms is not None and args.duration_ms < 0:
         raise FactoryError("--duration-ms must be greater than or equal to 0")
+    if (
+        args.result == "not_run"
+        and verification_policy["require_summary_for_not_run"]
+        and not args.summary.strip()
+    ):
+        raise FactoryError("Project config requires --summary when --result is not_run.")
     conn.execute(
         """
         INSERT INTO verification_runs
@@ -722,12 +1250,14 @@ def cmd_resume(args: argparse.Namespace) -> int:
 
 def cmd_lock_acquire(args: argparse.Namespace) -> int:
     root = resolve_root(args.root)
+    config = config_for_args(root, args)
     conn = connect(root, args.db)
     run = require_run(conn)
+    lock_name = args.name or config["default_lock_name"]
     acquire_lock(
         conn,
         run_id=run["id"],
-        name=args.name,
+        name=lock_name,
         holder=args.holder,
         baton_id=args.baton,
         force=args.force,
@@ -738,29 +1268,31 @@ def cmd_lock_acquire(args: argparse.Namespace) -> int:
         actor=args.holder,
         run_id=run["id"],
         baton_id=args.baton,
-        summary=f"{args.name} acquired by {args.holder}",
-        payload={"lock": args.name},
+        summary=f"{lock_name} acquired by {args.holder}",
+        payload={"lock": lock_name},
     )
     conn.commit()
-    print_json({"status": "held", "lock": args.name, "holder": args.holder})
+    print_json({"status": "held", "lock": lock_name, "holder": args.holder})
     return 0
 
 
 def cmd_lock_release(args: argparse.Namespace) -> int:
     root = resolve_root(args.root)
+    config = config_for_args(root, args)
     conn = connect(root, args.db)
     run = require_run(conn)
-    release_lock(conn, name=args.name)
+    lock_name = args.name or config["default_lock_name"]
+    release_lock(conn, name=lock_name)
     emit_event(
         conn,
         event_type="lock.released",
         actor=args.actor,
         run_id=run["id"],
-        summary=f"{args.name} released",
-        payload={"lock": args.name},
+        summary=f"{lock_name} released",
+        payload={"lock": lock_name},
     )
     conn.commit()
-    print_json({"status": "released", "lock": args.name})
+    print_json({"status": "released", "lock": lock_name})
     return 0
 
 
@@ -859,12 +1391,14 @@ def render_ledger(conn: sqlite3.Connection, root: Path, recent: int, db: str | N
 
 def cmd_render_ledger(args: argparse.Namespace) -> int:
     root = resolve_root(args.root)
+    config = config_for_args(root, args)
     conn = connect(root, args.db)
     if args.recent < 1:
         raise FactoryError("--recent must be greater than 0")
     markdown = render_ledger(conn, root, args.recent, args.db)
-    if args.out:
-        out = Path(args.out)
+    output_path = args.out or config["ledger_output_path"]
+    if output_path:
+        out = Path(output_path)
         if not out.is_absolute():
             out = root / out
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -875,7 +1409,7 @@ def cmd_render_ledger(args: argparse.Namespace) -> int:
     return 0
 
 
-def doctor_check(root: Path, conn: sqlite3.Connection) -> tuple[list[dict[str, str]], int]:
+def doctor_check(root: Path, conn: sqlite3.Connection, config: dict[str, Any]) -> tuple[list[dict[str, str]], int]:
     findings: list[dict[str, str]] = []
     exit_code = 0
 
@@ -907,14 +1441,19 @@ def doctor_check(root: Path, conn: sqlite3.Connection) -> tuple[list[dict[str, s
     else:
         add("warn", "git", "Git status unavailable")
 
-    protected = root / "apps/web/next-env.d.ts"
-    if protected.exists():
-        diff_code, _ = git_command(root, ["diff", "--exit-code", "--", "apps/web/next-env.d.ts"])
-        staged_code, staged = git_command(root, ["diff", "--cached", "--name-only", "--", "apps/web/next-env.d.ts"])
+    protected_files = config["protected_generated_files"]
+    for protected_file in protected_files:
+        protected = root / protected_file
+        check_name = f"protected_generated:{protected_file}"
+        if not protected.exists():
+            add("warn", check_name, "Configured protected file is missing")
+            continue
+        diff_code, _ = git_command(root, ["diff", "--exit-code", "--", protected_file])
+        staged_code, staged = git_command(root, ["diff", "--cached", "--name-only", "--", protected_file])
         if diff_code != 0 or (staged_code == 0 and staged.strip()):
-            add("fail", "protected_next_env", "apps/web/next-env.d.ts has diff or is staged")
+            add("fail", check_name, f"{protected_file} has diff or is staged")
         else:
-            add("ok", "protected_next_env", "apps/web/next-env.d.ts is unchanged")
+            add("ok", check_name, f"{protected_file} is unchanged")
 
     ahead_code, ahead = git_command(root, ["status", "-sb"])
     if ahead_code == 0:
@@ -924,8 +1463,9 @@ def doctor_check(root: Path, conn: sqlite3.Connection) -> tuple[list[dict[str, s
 
 def cmd_doctor(args: argparse.Namespace) -> int:
     root = resolve_root(args.root)
+    config = config_for_args(root, args)
     conn = connect(root, args.db)
-    findings, exit_code = doctor_check(root, conn)
+    findings, exit_code = doctor_check(root, conn, config)
     if args.json:
         print_json({"status": "fail" if exit_code else "ok", "findings": findings})
     else:
@@ -937,6 +1477,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--root", default=None, help="Project root; defaults to current directory.")
     parser.add_argument("--db", default=None, help="Factory DB path; defaults to .agentic-factory/factory.db.")
+    parser.add_argument("--config", default=None, help="Project config path; defaults to .agentic-factory/config.json.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -944,10 +1485,18 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_args(parser)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    config = subparsers.add_parser("config", help="Create or show project config.")
+    config_sub = config.add_subparsers(dest="config_command", required=True)
+    config_init = config_sub.add_parser("init", help="Create .agentic-factory/config.json.")
+    config_init.add_argument("--force", action="store_true")
+    config_init.set_defaults(func=cmd_config_init)
+    config_show = config_sub.add_parser("show", help="Show effective project config.")
+    config_show.set_defaults(func=cmd_config_show)
+
     init = subparsers.add_parser("init", help="Initialize a factory DB.")
-    init.add_argument("--mode", default="balanced")
+    init.add_argument("--mode", default=None)
     init.add_argument("--objective", default="")
-    init.add_argument("--topology", default="executive_as_ledger")
+    init.add_argument("--topology", default=None)
     init.add_argument("--actor", default="Agent")
     init.add_argument("--run-id", default="")
     init.add_argument("--force", action="store_true")
@@ -971,6 +1520,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     baton = subparsers.add_parser("baton", help="Create, hand off, or accept batons.")
     baton_sub = baton.add_subparsers(dest="baton_command", required=True)
+    baton_list = baton_sub.add_parser("list", help="List batons for the current run.")
+    baton_list.add_argument("--all", action="store_true", help="Include non-active batons.")
+    baton_list.add_argument("--status", action="append", default=[], help="Filter by status; repeat or comma-separate.")
+    baton_list.add_argument("--limit", type=int, default=DEFAULT_LIST_LIMIT)
+    baton_list.add_argument("--json", action="store_true")
+    baton_list.set_defaults(func=cmd_baton_list)
+    baton_show = baton_sub.add_parser("show", help="Show detailed baton evidence.")
+    baton_show.add_argument("baton_id")
+    baton_show.add_argument("--recent-events", type=int, default=DEFAULT_LIST_LIMIT)
+    baton_show.add_argument("--json", action="store_true")
+    baton_show.set_defaults(func=cmd_baton_show)
     baton_create = baton_sub.add_parser("create", help="Assign a baton and acquire the writer lock.")
     baton_create.add_argument("baton_id")
     baton_create.add_argument("--title", required=True)
@@ -979,13 +1539,13 @@ def build_parser() -> argparse.ArgumentParser:
     baton_create.add_argument("--scope", default="")
     baton_create.add_argument("--summary", default="")
     baton_create.add_argument("--acceptance-tier", default="integration")
-    baton_create.add_argument("--verification-level", default="focused")
+    baton_create.add_argument("--verification-level", default=None)
     baton_create.add_argument("--model", default="")
     baton_create.add_argument("--reasoning", default="")
     baton_create.add_argument("--actor", default="Executive")
     baton_create.add_argument("--allow-active", action="store_true")
     baton_create.add_argument("--no-lock", action="store_true")
-    baton_create.add_argument("--lock-name", default="main-worktree")
+    baton_create.add_argument("--lock-name", default=None)
     baton_create.add_argument("--force-lock", action="store_true")
     baton_create.set_defaults(func=cmd_baton_create)
 
@@ -1002,7 +1562,7 @@ def build_parser() -> argparse.ArgumentParser:
     baton_handoff.add_argument("--actor", default="Builder")
     baton_handoff.add_argument("--release-lock", action="store_true", default=True)
     baton_handoff.add_argument("--keep-lock", dest="release_lock", action="store_false")
-    baton_handoff.add_argument("--lock-name", default="main-worktree")
+    baton_handoff.add_argument("--lock-name", default=None)
     baton_handoff.set_defaults(func=cmd_baton_handoff)
 
     baton_accept = baton_sub.add_parser("accept", help="Accept a baton.")
@@ -1014,11 +1574,16 @@ def build_parser() -> argparse.ArgumentParser:
     baton_accept.add_argument("--actor", default="Executive")
     baton_accept.add_argument("--release-lock", action="store_true", default=True)
     baton_accept.add_argument("--keep-lock", dest="release_lock", action="store_false")
-    baton_accept.add_argument("--lock-name", default="main-worktree")
+    baton_accept.add_argument("--lock-name", default=None)
     baton_accept.set_defaults(func=cmd_baton_accept)
 
     verify = subparsers.add_parser("verify", help="Record verification commands.")
     verify_sub = verify.add_subparsers(dest="verify_command", required=True)
+    verify_list = verify_sub.add_parser("list", help="List verification records.")
+    verify_list.add_argument("--baton", default=None)
+    verify_list.add_argument("--recent", type=int, default=DEFAULT_LIST_LIMIT)
+    verify_list.add_argument("--json", action="store_true")
+    verify_list.set_defaults(func=cmd_verification_list)
     verify_record = verify_sub.add_parser("record")
     verify_record.add_argument("--baton", default=None)
     verify_record.add_argument("--command", required=True)
@@ -1033,6 +1598,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     review = subparsers.add_parser("review", help="Record review packets.")
     review_sub = review.add_subparsers(dest="review_command", required=True)
+    review_list = review_sub.add_parser("list", help="List review records.")
+    review_list.add_argument("--baton", default=None)
+    review_list.add_argument("--recent", type=int, default=DEFAULT_LIST_LIMIT)
+    review_list.add_argument("--json", action="store_true")
+    review_list.set_defaults(func=cmd_review_list)
     review_record = review_sub.add_parser("record")
     review_record.add_argument("--baton", required=True)
     review_record.add_argument("--reviewer", default="Reviewer")
@@ -1059,15 +1629,32 @@ def build_parser() -> argparse.ArgumentParser:
     lock = subparsers.add_parser("lock", help="Manage explicit locks.")
     lock_sub = lock.add_subparsers(dest="lock_command", required=True)
     lock_acquire = lock_sub.add_parser("acquire")
-    lock_acquire.add_argument("--name", default="main-worktree")
+    lock_acquire.add_argument("--name", default=None)
     lock_acquire.add_argument("--holder", required=True)
     lock_acquire.add_argument("--baton", default=None)
     lock_acquire.add_argument("--force", action="store_true")
     lock_acquire.set_defaults(func=cmd_lock_acquire)
     lock_release = lock_sub.add_parser("release")
-    lock_release.add_argument("--name", default="main-worktree")
+    lock_release.add_argument("--name", default=None)
     lock_release.add_argument("--actor", default="Agent")
     lock_release.set_defaults(func=cmd_lock_release)
+
+    events = subparsers.add_parser("events", help="Inspect recorded events.")
+    events_sub = events.add_subparsers(dest="events_command", required=True)
+    events_list = events_sub.add_parser("list", help="List recent events.")
+    events_list.add_argument("--recent", type=int, default=DEFAULT_LIST_LIMIT)
+    events_list.add_argument("--baton", default=None)
+    events_list.add_argument("--type", default="")
+    events_list.add_argument("--json", action="store_true")
+    events_list.set_defaults(func=cmd_events_list)
+
+    verification = subparsers.add_parser("verification", help="Inspect verification records.")
+    verification_sub = verification.add_subparsers(dest="verification_command", required=True)
+    verification_list = verification_sub.add_parser("list", help="List verification records.")
+    verification_list.add_argument("--baton", default=None)
+    verification_list.add_argument("--recent", type=int, default=DEFAULT_LIST_LIMIT)
+    verification_list.add_argument("--json", action="store_true")
+    verification_list.set_defaults(func=cmd_verification_list)
 
     render = subparsers.add_parser("render-ledger", help="Render markdown ledger from DB.")
     render.add_argument("--out", default="")

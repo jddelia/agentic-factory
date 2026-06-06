@@ -199,6 +199,203 @@ class FactoryCliTest(unittest.TestCase):
             self.assertIn("One \\| Two", ledger)
             self.assertIn("A | B", ledger)
 
+    def test_inspection_commands_return_bounded_structured_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual(self.run_cli(root, "init", "--run-id", "inspect").returncode, 0)
+            self.assertEqual(
+                self.run_cli(root, "baton", "create", "B-001", "--title", "Inspect me").returncode,
+                0,
+            )
+            self.assertEqual(
+                self.run_cli(
+                    root,
+                    "verify",
+                    "record",
+                    "--baton",
+                    "B-001",
+                    "--command",
+                    "pytest",
+                    "--result",
+                    "pass",
+                    "--summary",
+                    "Focused pass",
+                ).returncode,
+                0,
+            )
+            self.assertEqual(
+                self.run_cli(
+                    root,
+                    "baton",
+                    "handoff",
+                    "B-001",
+                    "--summary",
+                    "Handed off",
+                    "--files",
+                    "app.py",
+                ).returncode,
+                0,
+            )
+            self.assertEqual(
+                self.run_cli(
+                    root,
+                    "review",
+                    "record",
+                    "--baton",
+                    "B-001",
+                    "--status",
+                    "accepted",
+                    "--summary",
+                    "Accepted",
+                    "--finding",
+                    "P2|app.py|10|resolved|Document edge case",
+                ).returncode,
+                0,
+            )
+            self.assertEqual(
+                self.run_cli(root, "baton", "accept", "B-001", "--commit", "abc1234").returncode,
+                0,
+            )
+
+            active = json.loads(self.run_cli(root, "baton", "list", "--json").stdout)
+            self.assertEqual(active["count"], 0)
+            all_batons = json.loads(self.run_cli(root, "baton", "list", "--all", "--json").stdout)
+            self.assertEqual(all_batons["count"], 1)
+            self.assertEqual(all_batons["batons"][0]["id"], "B-001")
+
+            shown = json.loads(self.run_cli(root, "baton", "show", "B-001", "--json").stdout)
+            self.assertEqual(shown["baton"]["status"], "accepted")
+            self.assertEqual(len(shown["verification"]), 1)
+            self.assertEqual(len(shown["reviews"]), 1)
+            self.assertEqual(shown["reviews"][0]["findings"][0]["severity"], "P2")
+
+            events = json.loads(self.run_cli(root, "events", "list", "--recent", "3", "--json").stdout)
+            self.assertEqual(events["count"], 3)
+            self.assertEqual(events["events"][0]["event_type"], "baton.accepted")
+
+            verification = json.loads(
+                self.run_cli(root, "verification", "list", "--baton", "B-001", "--json").stdout
+            )
+            self.assertEqual(verification["count"], 1)
+            self.assertEqual(verification["verification"][0]["result"], "pass")
+
+            verify_alias = json.loads(self.run_cli(root, "verify", "list", "--baton", "B-001", "--json").stdout)
+            self.assertEqual(verify_alias["count"], 1)
+
+            reviews = json.loads(self.run_cli(root, "review", "list", "--baton", "B-001", "--json").stdout)
+            self.assertEqual(reviews["count"], 1)
+            self.assertEqual(reviews["reviews"][0]["findings"][0]["summary"], "Document edge case")
+
+    def test_project_config_controls_defaults_and_doctor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init"], cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+            subprocess.run(
+                ["git", "config", "user.name", "Factory Test"],
+                cwd=root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "factory@example.invalid"],
+                cwd=root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            config_dir = root / ".agentic-factory"
+            config_dir.mkdir()
+            (config_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "default_mode": "strict",
+                        "default_topology": "separate_ledger",
+                        "default_lock_name": "custom-worktree",
+                        "ledger_output_path": "factory-ledger.md",
+                        "verification_policy": {
+                            "default_level": "full_gate",
+                            "require_baton": True,
+                            "require_summary_for_not_run": True,
+                        },
+                        "protected_generated_files": ["generated.txt"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (root / "generated.txt").write_text("stable\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "add", "generated.txt"],
+                cwd=root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "seed generated file"],
+                cwd=root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(self.run_cli(root, "init", "--objective", "Config test").returncode, 0)
+            status = json.loads(self.run_cli(root, "status", "--json").stdout)
+            self.assertEqual(status["run"]["work_mode"], "strict")
+            self.assertEqual(status["run"]["topology"], "separate_ledger")
+
+            create = json.loads(
+                self.run_cli(root, "baton", "create", "B-001", "--title", "Configured baton").stdout
+            )
+            self.assertEqual(create["lock"], "custom-worktree")
+            with sqlite3.connect(root / ".agentic-factory" / "factory.db") as conn:
+                verification_level = conn.execute(
+                    "SELECT verification_level FROM batons WHERE id = 'B-001'"
+                ).fetchone()[0]
+            self.assertEqual(verification_level, "full_gate")
+
+            missing_baton = self.run_cli(root, "verify", "record", "--command", "pytest", "--result", "pass")
+            self.assertEqual(missing_baton.returncode, 2)
+            self.assertIn("requires --baton", missing_baton.stderr)
+
+            missing_summary = self.run_cli(
+                root,
+                "verify",
+                "record",
+                "--baton",
+                "B-001",
+                "--command",
+                "manual check",
+                "--result",
+                "not_run",
+            )
+            self.assertEqual(missing_summary.returncode, 2)
+            self.assertIn("requires --summary", missing_summary.stderr)
+
+            rendered = self.run_cli(root, "render-ledger")
+            self.assertEqual(rendered.returncode, 0, rendered.stderr)
+            self.assertTrue((root / "factory-ledger.md").is_file())
+
+            (root / "generated.txt").write_text("changed\n", encoding="utf-8")
+            doctor = json.loads(self.run_cli(root, "doctor", "--json").stdout)
+            self.assertEqual(doctor["status"], "fail")
+            self.assertTrue(
+                any(finding["check"] == "protected_generated:generated.txt" for finding in doctor["findings"])
+            )
+
+    def test_invalid_project_config_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / ".agentic-factory"
+            config_dir.mkdir()
+            (config_dir / "config.json").write_text(
+                json.dumps({"ledger_output_path": "../outside.md"}),
+                encoding="utf-8",
+            )
+            result = self.run_cli(root, "config", "show")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("relative path inside the project", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

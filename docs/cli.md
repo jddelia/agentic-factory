@@ -17,13 +17,14 @@ The CLI is local-first and stdlib-only. It does not execute shell input from com
 ## `factory.py`
 
 ```text
-usage: factory.py [-h] [--root ROOT] [--db DB]
-                  {init,status,event,baton,verify,review,pause,resume,lock,render-ledger,doctor} ...
+usage: factory.py [-h] [--root ROOT] [--db DB] [--config CONFIG]
+                  {config,init,status,event,baton,verify,review,pause,resume,lock,events,verification,render-ledger,doctor} ...
 
 SQLite-backed software factory CLI.
 
 positional arguments:
-  {init,status,event,baton,verify,review,pause,resume,lock,render-ledger,doctor}
+  {config,init,status,event,baton,verify,review,pause,resume,lock,events,verification,render-ledger,doctor}
+    config              Create or show project config.
     init                Initialize a factory DB.
     status              Show current factory state.
     event               Record a raw event.
@@ -33,6 +34,8 @@ positional arguments:
     pause               Pause the factory.
     resume              Resume the factory.
     lock                Manage explicit locks.
+    events              Inspect recorded events.
+    verification        Inspect verification records.
     render-ledger       Render markdown ledger from DB.
     doctor              Run factory health checks.
 
@@ -40,6 +43,7 @@ options:
   -h, --help            show this help message and exit
   --root ROOT           Project root; defaults to current directory.
   --db DB               Factory DB path; defaults to .agentic-factory/factory.db.
+  --config CONFIG       Project config path; defaults to .agentic-factory/config.json.
 ```
 
 Use global options before the command name.
@@ -54,6 +58,77 @@ Common failures:
 
 - No command: argparse prints usage and exits non-zero.
 - Relative `--db`: resolved under `--root`, not the shell's original directory.
+
+## `factory.py config`
+
+```text
+usage: factory.py config [-h] {init,show} ...
+
+positional arguments:
+  {init,show}
+    init       Create .agentic-factory/config.json.
+    show       Show effective project config.
+
+options:
+  -h, --help   show this help message and exit
+```
+
+## `factory.py config init`
+
+```text
+usage: factory.py config init [-h] [--force]
+
+options:
+  -h, --help  show this help message and exit
+  --force
+```
+
+Required arguments: none.
+
+Example:
+
+```bash
+python3 scripts/factory.py config init
+```
+
+Example output shape:
+
+```json
+{"status": "created", "path": ".../.agentic-factory/config.json", "config": {...}}
+```
+
+Common failures:
+
+- Config already exists and `--force` was not supplied.
+- The target config path cannot be written.
+
+## `factory.py config show`
+
+```text
+usage: factory.py config show [-h]
+
+options:
+  -h, --help  show this help message and exit
+```
+
+Required arguments: none.
+
+Example:
+
+```bash
+python3 scripts/factory.py config show
+```
+
+Example output shape:
+
+```json
+{"path": ".../.agentic-factory/config.json", "exists": true, "config": {...}}
+```
+
+Common failures:
+
+- Config JSON is invalid.
+- Config contains unknown fields or unsafe relative paths.
 
 ## `factory.py init`
 
@@ -175,10 +250,12 @@ Common failures:
 ## `factory.py baton`
 
 ```text
-usage: factory.py baton [-h] {create,handoff,accept} ...
+usage: factory.py baton [-h] {list,show,create,handoff,accept} ...
 
 positional arguments:
-  {create,handoff,accept}
+  {list,show,create,handoff,accept}
+    list                List batons for the current run.
+    show                Show detailed baton evidence.
     create              Assign a baton and acquire the writer lock.
     handoff             Record a baton handoff.
     accept              Accept a baton.
@@ -186,6 +263,72 @@ positional arguments:
 options:
   -h, --help            show this help message and exit
 ```
+
+## `factory.py baton list`
+
+```text
+usage: factory.py baton list [-h] [--all] [--status STATUS] [--limit LIMIT] [--json]
+
+options:
+  -h, --help       show this help message and exit
+  --all            Include non-active batons.
+  --status STATUS  Filter by status; repeat or comma-separate.
+  --limit LIMIT
+  --json
+```
+
+Required arguments: none.
+
+Example:
+
+```bash
+python3 scripts/factory.py baton list --all --json
+```
+
+Example output shape:
+
+```json
+{"count": 1, "batons": [{"id": "B-001", "status": "accepted"}]}
+```
+
+Common failures:
+
+- No run exists.
+- `--limit` is less than 1 or greater than the maximum list limit.
+
+## `factory.py baton show`
+
+```text
+usage: factory.py baton show [-h] [--recent-events RECENT_EVENTS] [--json] baton_id
+
+positional arguments:
+  baton_id
+
+options:
+  -h, --help            show this help message and exit
+  --recent-events RECENT_EVENTS
+  --json
+```
+
+Required arguments: `baton_id`.
+
+Example:
+
+```bash
+python3 scripts/factory.py baton show B-001 --json
+```
+
+Example output shape:
+
+```json
+{"baton": {...}, "handoffs": [], "verification": [], "reviews": [], "commits": [], "events": []}
+```
+
+Common failures:
+
+- Unknown baton.
+- Baton does not belong to the current run.
+- `--recent-events` is outside the allowed range.
 
 ## `factory.py baton create`
 
@@ -238,6 +381,7 @@ Common failures:
 - No run exists.
 - Another active baton exists and `--allow-active` was not supplied.
 - Writer lock is already held and `--force-lock` was not supplied.
+- Project config is invalid.
 
 ## `factory.py baton handoff`
 
@@ -286,6 +430,7 @@ Common failures:
 
 - Unknown baton.
 - No run exists.
+- Project config is invalid.
 
 ## `factory.py baton accept`
 
@@ -328,18 +473,52 @@ Common failures:
 
 - Unknown baton.
 - Accepting before the configured tier is satisfied is an orchestration error; the CLI records the decision you give it.
+- Project config is invalid.
 
 ## `factory.py verify`
 
 ```text
-usage: factory.py verify [-h] {record} ...
+usage: factory.py verify [-h] {list,record} ...
 
 positional arguments:
-  {record}
+  {list,record}
+    list         List verification records.
 
 options:
-  -h, --help  show this help message and exit
+  -h, --help     show this help message and exit
 ```
+
+## `factory.py verify list`
+
+```text
+usage: factory.py verify list [-h] [--baton BATON] [--recent RECENT] [--json]
+
+options:
+  -h, --help       show this help message and exit
+  --baton BATON
+  --recent RECENT
+  --json
+```
+
+Required arguments: none.
+
+Example:
+
+```bash
+python3 scripts/factory.py verify list --baton B-001 --json
+```
+
+Example output shape:
+
+```json
+{"count": 1, "verification": [{"result": "pass", "command": "pytest"}]}
+```
+
+Common failures:
+
+- No run exists.
+- Unknown baton when `--baton` is supplied.
+- `--recent` is outside the allowed range.
 
 ## `factory.py verify record`
 
@@ -381,18 +560,53 @@ Common failures:
 - `--result` is not one of `pass`, `fail`, `not_run`, or `blocked`.
 - `--duration-ms` is negative.
 - Unknown baton when `--baton` is supplied.
+- Project config requires `--baton`.
+- Project config requires `--summary` for `not_run`.
 
 ## `factory.py review`
 
 ```text
-usage: factory.py review [-h] {record} ...
+usage: factory.py review [-h] {list,record} ...
 
 positional arguments:
-  {record}
+  {list,record}
+    list         List review records.
 
 options:
-  -h, --help  show this help message and exit
+  -h, --help     show this help message and exit
 ```
+
+## `factory.py review list`
+
+```text
+usage: factory.py review list [-h] [--baton BATON] [--recent RECENT] [--json]
+
+options:
+  -h, --help       show this help message and exit
+  --baton BATON
+  --recent RECENT
+  --json
+```
+
+Required arguments: none.
+
+Example:
+
+```bash
+python3 scripts/factory.py review list --baton B-001 --json
+```
+
+Example output shape:
+
+```json
+{"count": 1, "reviews": [{"status": "accepted", "findings": []}]}
+```
+
+Common failures:
+
+- No run exists.
+- Unknown baton when `--baton` is supplied.
+- `--recent` is outside the allowed range.
 
 ## `factory.py review record`
 
@@ -568,6 +782,98 @@ Common failures:
 
 - No run exists.
 - Releasing a missing lock is idempotent at the table-update level.
+- Project config is invalid.
+
+## `factory.py events`
+
+```text
+usage: factory.py events [-h] {list} ...
+
+positional arguments:
+  {list}
+    list      List recent events.
+
+options:
+  -h, --help  show this help message and exit
+```
+
+## `factory.py events list`
+
+```text
+usage: factory.py events list [-h] [--recent RECENT] [--baton BATON] [--type TYPE] [--json]
+
+options:
+  -h, --help       show this help message and exit
+  --recent RECENT
+  --baton BATON
+  --type TYPE
+  --json
+```
+
+Required arguments: none.
+
+Example:
+
+```bash
+python3 scripts/factory.py events list --recent 20 --json
+```
+
+Example output shape:
+
+```json
+{"count": 1, "events": [{"event_type": "factory.started"}]}
+```
+
+Common failures:
+
+- No run exists.
+- Unknown baton when `--baton` is supplied.
+- `--recent` is outside the allowed range.
+
+## `factory.py verification`
+
+```text
+usage: factory.py verification [-h] {list} ...
+
+positional arguments:
+  {list}
+    list      List verification records.
+
+options:
+  -h, --help  show this help message and exit
+```
+
+## `factory.py verification list`
+
+```text
+usage: factory.py verification list [-h] [--baton BATON] [--recent RECENT] [--json]
+
+options:
+  -h, --help       show this help message and exit
+  --baton BATON
+  --recent RECENT
+  --json
+```
+
+Required arguments: none.
+
+Example:
+
+```bash
+python3 scripts/factory.py verification list --baton B-001 --json
+```
+
+Example output shape:
+
+```json
+{"count": 1, "verification": [{"result": "pass", "command": "pytest"}]}
+```
+
+Common failures:
+
+- No run exists.
+- Unknown baton when `--baton` is supplied.
+- `--recent` is outside the allowed range.
 
 ## `factory.py render-ledger`
 
@@ -598,6 +904,7 @@ Common failures:
 
 - No run exists.
 - `--recent` is less than 1.
+- Project config has an unsafe `ledger_output_path`.
 
 ## `factory.py doctor`
 

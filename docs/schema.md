@@ -297,6 +297,22 @@ The current CLI reads:
 When adding new inspection commands, prefer indexed access paths and bounded
 queries. Avoid commands that require loading the entire event log by default.
 
+Read-only inspection commands use the same tables:
+
+- `baton list`: bounded query on `batons` by current `run_id` and optional
+  status filters.
+- `baton show`: one baton plus related handoffs, verification, reviews,
+  findings, commits, and recent events.
+- `events list`: bounded query on `events` by current `run_id`, optional baton,
+  and optional event type.
+- `verification list`: bounded query on `verification_runs`, scoped by baton or
+  current run.
+- `review list`: bounded query on `reviews` and `review_findings`, scoped by
+  baton or current run.
+
+Project config is file-based, not stored in SQLite. See
+`docs/configuration.md` for `.agentic-factory/config.json`.
+
 ## Migration Checklist
 
 Before adding a migration:
