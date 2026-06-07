@@ -176,7 +176,7 @@ usage: factory.py up [-h] [--mode MODE] [--objective OBJECTIVE] [--topology TOPO
                      [--runtime-mode {adapter_spawn,agent_cli_subagents,codex_native,manual_protocol,serial_single_agent}]
                      [--actor ACTOR] [--run-id RUN_ID] [--force] [--host HOST] [--port PORT]
                      [--recent RECENT] [--token TOKEN] [--read-only] [--allow-remote] [--open]
-                     [--no-open] [--no-serve]
+                     [--no-open] [--background] [--no-serve]
 
 options:
   -h, --help            show this help message and exit
@@ -196,7 +196,8 @@ options:
   --allow-remote        Allow binding to a non-loopback host.
   --open                Open the dashboard URL in the default browser. This is the default.
   --no-open             Do not open the dashboard URL.
-  --no-serve            Initialize and print JSON without starting the server.
+  --background          Start the dashboard server in the background and print JSON.
+  --no-serve            Test-only bootstrap without starting the dashboard server.
 ```
 
 Required arguments: none, but orchestration agents should pass a resolved
@@ -205,26 +206,30 @@ objective, mode, topology, and runtime mode after using
 
 `up` is the low-friction agent-facing bootstrap. It initializes the DB
 if needed, ensures operator records, starts the local dashboard with
-controls enabled by default, records readiness events, prints the URL,
-and then waits while the server runs. If the default port is occupied,
-it picks the next free port. It does not assign the first baton.
+controls enabled by default, records readiness events, and prints the
+URL. If the default port is occupied, it picks the next free port. It
+does not assign the first baton.
+
+For real agent CLI invocations, use `--background` so the dashboard
+server keeps running while the agent receives JSON and can pause for
+user readiness.
 
 Example:
 
 ```bash
-python3 scripts/factory.py up --objective "Build the todo app" --topology executive_as_ledger
+python3 scripts/factory.py up --objective "Build the todo app" --topology executive_as_ledger --background
 ```
 
-Nonblocking setup for automation:
+Test-only setup without a running dashboard:
 
 ```bash
 python3 scripts/factory.py up --objective "Build the todo app" --no-serve --no-open
 ```
 
-Example output shape with `--no-serve`:
+Example output shape with `--background`:
 
 ```json
-{"status": "ready_for_user", "dashboard_url": "http://127.0.0.1:8765/?token=...", "control_enabled": true}
+{"status": "ready_for_user", "dashboard_url": "http://127.0.0.1:8765/?token=...", "server_running": true, "dashboard_pid": 12345}
 ```
 
 Common failures:
@@ -233,6 +238,7 @@ Common failures:
 - Non-loopback host without `--allow-remote`.
 - `--port` is outside the allowed range.
 - Explicit `--port` is already in use.
+- `--background` and `--no-serve` are used together.
 - Existing run plus `--force` with a duplicate `--run-id`.
 
 ## `factory.py status`

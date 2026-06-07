@@ -73,8 +73,9 @@ Use [Dashboard](dashboard.md) when a non-Codex or generic agent-CLI workflow
 needs a visible local factory floor.
 
 For the lowest-friction agent CLI path, the lead agent should perform
-orchestration preflight and then run `factory.py up`, which initializes state,
-starts the dashboard, and pauses for user confirmation before operations begin.
+orchestration preflight and then run `factory.py up --background`, which
+initializes state, starts the dashboard, returns setup JSON, and pauses for
+user confirmation before operations begin.
 
 See [Runtime Modes](runtime-modes.md) for the full mode contract.
 

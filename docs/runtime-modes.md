@@ -44,8 +44,8 @@ compact baton or review packet generated from current factory state.
 
 This mode should still be agent-driven. The user invokes the plugin through the
 agent; the orchestration skill resolves the objective, mode, topology, and
-runtime policy; then the agent runs `factory.py up` to initialize the DB and
-local factory floor before the first baton.
+runtime policy; then the agent runs `factory.py up --background` to initialize
+the DB and start the local factory floor before the first baton.
 
 This mode is a compatibility approximation, not a guarantee that every agent
 CLI behaves like Codex. Before delegation, the lead agent must determine:
@@ -74,7 +74,7 @@ Optional factory-floor view:
 python3 /path/to/agentic-factory/scripts/factory.py up \
   --objective "Ship the requested project outcome" \
   --runtime-mode agent_cli_subagents \
-  --open
+  --background
 ```
 
 After `up`, the lead agent should present the dashboard URL, run ID, project

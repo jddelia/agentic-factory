@@ -3083,6 +3083,73 @@ def dashboard_url(host: str, port: int, token: str) -> str:
     return f"http://{display_host}:{port}/?token={token}"
 
 
+def wait_for_dashboard_port(host: str, port: int, proc: subprocess.Popen[Any], timeout_seconds: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        returncode = proc.poll()
+        if returncode is not None:
+            raise FactoryError(f"Dashboard server exited early with status {returncode}.")
+        try:
+            with socket.create_connection((host, port), timeout=0.2):
+                return
+        except OSError:
+            time.sleep(0.1)
+    raise FactoryError(f"Dashboard server did not become ready on {host}:{port}.")
+
+
+def start_dashboard_background(
+    *,
+    root: Path,
+    db: str | None,
+    config: str | None,
+    host: str,
+    port: int,
+    token: str,
+    recent: int,
+    actor: str,
+    control_enabled: bool,
+    allow_remote: bool,
+    open_browser: bool,
+) -> subprocess.Popen[Any]:
+    command = [sys.executable, str(Path(__file__).resolve()), "--root", str(root)]
+    if db:
+        command.extend(["--db", db])
+    if config:
+        command.extend(["--config", config])
+    command.extend(
+        [
+            "dashboard",
+            "serve",
+            "--host",
+            host,
+            "--port",
+            str(port),
+            "--token",
+            token,
+            "--recent",
+            str(recent),
+            "--actor",
+            actor,
+        ]
+    )
+    if not control_enabled:
+        command.append("--read-only")
+    if allow_remote:
+        command.append("--allow-remote")
+    if open_browser:
+        command.append("--open")
+    proc = subprocess.Popen(
+        command,
+        cwd=root,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    wait_for_dashboard_port(host, port, proc)
+    return proc
+
+
 def record_dashboard_started(
     conn: sqlite3.Connection,
     *,
@@ -3169,6 +3236,8 @@ def cmd_up(args: argparse.Namespace) -> int:
     require_limit(args.recent, field="recent")
     if getattr(args, "open", False) and args.no_open:
         raise FactoryError("Use either --open or --no-open, not both.")
+    if args.background and args.no_serve:
+        raise FactoryError("Use either --background or --no-serve, not both.")
     if not is_loopback_host(args.host) and not args.allow_remote:
         raise FactoryError("up binds the dashboard to loopback by default; pass --allow-remote for non-loopback hosts.")
     port = resolve_dashboard_port(args.host, args.port)
@@ -3225,6 +3294,96 @@ def cmd_up(args: argparse.Namespace) -> int:
     token = args.token or secrets.token_urlsafe(24)
     url = dashboard_url(args.host, port, token)
     control_enabled = not args.read_only
+
+    payload = {
+        "status": "ready_for_user",
+        "run_id": run["id"],
+        "created_run": created,
+        "root": str(root),
+        "db": str(db_path_for(root, args.db)),
+        "dashboard_url": url,
+        "control_enabled": control_enabled,
+        "mode": run["work_mode"],
+        "topology": run["topology"],
+        "runtime_mode": args.runtime_mode,
+        "primary_operator": primary_operator,
+        "operators": operators,
+        "server_running": True,
+        "message": "Factory floor is ready. Present this URL to the user and wait for readiness before assigning work.",
+    }
+    if args.no_serve:
+        payload["status"] = "initialized_no_server"
+        payload["server_running"] = False
+        payload["warning"] = (
+            "--no-serve was supplied, so the dashboard HTTP server is not running. "
+            "Use --background for non-blocking agent startup with a live dashboard."
+        )
+        emit_event(
+            conn,
+            event_type="factory.bootstrap.no_server",
+            actor=args.actor,
+            run_id=run["id"],
+            summary="Factory bootstrap initialized without starting the dashboard server.",
+            payload={
+                "dashboard_url": url,
+                "url": url,
+                "control_enabled": control_enabled,
+                "runtime_mode": args.runtime_mode,
+                "topology": run["topology"],
+                "primary_operator": primary_operator,
+                "created_run": created,
+                "server_running": False,
+            },
+        )
+        conn.commit()
+        print_json(payload)
+        return 0
+
+    if args.background:
+        conn.commit()
+        conn.close()
+        proc = start_dashboard_background(
+            root=root,
+            db=args.db,
+            config=args.config,
+            host=args.host,
+            port=port,
+            token=token,
+            recent=args.recent,
+            actor=args.actor,
+            control_enabled=control_enabled,
+            allow_remote=args.allow_remote,
+            open_browser=not args.no_open,
+        )
+        conn = connect(root, args.db)
+        emit_event(
+            conn,
+            event_type="factory.ready_for_operations",
+            actor=args.actor,
+            run_id=run["id"],
+            summary="Factory floor is initialized and waiting for user readiness.",
+            payload={
+                "dashboard_url": url,
+                "url": url,
+                "control_enabled": control_enabled,
+                "runtime_mode": args.runtime_mode,
+                "topology": run["topology"],
+                "primary_operator": primary_operator,
+                "created_run": created,
+                "server_running": True,
+                "dashboard_pid": proc.pid,
+            },
+        )
+        conn.commit()
+        conn.close()
+        payload["dashboard_pid"] = proc.pid
+        payload["message"] = (
+            "Factory floor is ready and the dashboard server is running in the background. "
+            "Present this URL to the user and wait for readiness before assigning work."
+        )
+        print_json(payload)
+        return 0
+
     record_dashboard_started(
         conn,
         run=run,
@@ -3247,28 +3406,10 @@ def cmd_up(args: argparse.Namespace) -> int:
             "topology": run["topology"],
             "primary_operator": primary_operator,
             "created_run": created,
+            "server_running": True,
         },
     )
     conn.commit()
-
-    payload = {
-        "status": "ready_for_user",
-        "run_id": run["id"],
-        "created_run": created,
-        "root": str(root),
-        "db": str(db_path_for(root, args.db)),
-        "dashboard_url": url,
-        "control_enabled": control_enabled,
-        "mode": run["work_mode"],
-        "topology": run["topology"],
-        "runtime_mode": args.runtime_mode,
-        "primary_operator": primary_operator,
-        "operators": operators,
-        "message": "Factory floor is ready. Present this URL to the user and wait for readiness before assigning work.",
-    }
-    if args.no_serve:
-        print_json(payload)
-        return 0
 
     print("Factory floor is ready.")
     print(f"Dashboard: {url}")
@@ -3348,7 +3489,8 @@ def build_parser() -> argparse.ArgumentParser:
     up.add_argument("--allow-remote", action="store_true", help="Allow binding to a non-loopback host.")
     up.add_argument("--open", action="store_true", help="Open the dashboard URL in the default browser. This is the default.")
     up.add_argument("--no-open", action="store_true", help="Do not open the dashboard URL.")
-    up.add_argument("--no-serve", action="store_true", help="Initialize and print JSON without starting the server.")
+    up.add_argument("--background", action="store_true", help="Start the dashboard server in the background and print JSON.")
+    up.add_argument("--no-serve", action="store_true", help="Test-only bootstrap without starting the dashboard server.")
     up.set_defaults(func=cmd_up)
 
     status = subparsers.add_parser("status", help="Show current factory state.")

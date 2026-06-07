@@ -30,7 +30,7 @@ For generic agent CLI runtimes, that means:
 
 1. the orchestration skill resolves and presents the startup configuration;
 2. the user confirms the setup;
-3. the agent runs `factory.py up`;
+3. the agent runs `factory.py up --background`;
 4. the agent presents the dashboard URL and top-level operator;
 5. the agent pauses until the user says factory operations may begin.
 
@@ -86,17 +86,18 @@ orchestration skill has resolved objective, mode, topology, and runtime policy:
 python3 <plugin-root>/scripts/factory.py up \
   --objective "Build the requested outcome" \
   --runtime-mode agent_cli_subagents \
-  --open
+  --background
 ```
 
-`up` initializes or refreshes the run, creates topology-derived operator
-records, starts the local dashboard with controls enabled by default, records
-a readiness checkpoint, prints the dashboard URL/run/topology/runtime values,
-and then waits for the lead agent to pause for user confirmation before
-factory operations begin.
+`up --background` initializes or refreshes the run, creates topology-derived
+operator records, starts the local dashboard with controls enabled by default,
+records a readiness checkpoint, prints the dashboard URL/run/topology/runtime
+values as JSON, and returns so the lead agent can pause for user confirmation
+before factory operations begin.
 
 Use `--read-only` when the dashboard should not record control requests. Use
-`--no-serve` for test or automation bootstrap JSON.
+`--no-serve` only for tests that intentionally do not need a running dashboard
+server.
 
 For Codex-native or manual state-only startup:
 

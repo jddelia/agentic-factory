@@ -10,8 +10,8 @@ The packet command does not spawn workers. It renders instructions and exact
 
 ## Basic Flow
 
-1. Lead agent runs orchestration preflight and `factory.py up` for generic
-   agent CLI dashboard workflows.
+1. Lead agent runs orchestration preflight and `factory.py up --background`
+   for generic agent CLI dashboard workflows.
 2. Lead agent waits for the user to confirm the ready factory floor.
 3. Lead agent creates or confirms a baton.
 4. Lead agent generates a packet for the next role.

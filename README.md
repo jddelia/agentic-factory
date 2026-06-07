@@ -91,13 +91,13 @@ policy, the agent can bootstrap the local factory floor:
 python3 /path/to/agentic-factory/scripts/factory.py up \
   --objective "Ship the requested project outcome" \
   --runtime-mode agent_cli_subagents \
-  --open
+  --background
 ```
 
-`up` initializes or refreshes the run, starts the local dashboard with controls
-enabled by default, records a ready checkpoint, prints the dashboard URL and
-top-level operator, then pauses for the user to review the setup before factory
-operations begin.
+`up --background` initializes or refreshes the run, starts the local dashboard
+with controls enabled by default, records a ready checkpoint, prints the
+dashboard URL and top-level operator, then returns so the agent can pause for
+the user to review setup before factory operations begin.
 
 For manual protocol testing or a direct CLI smoke check, run commands from the
 target project root with the installed plugin directory:
@@ -217,8 +217,8 @@ orchestration skill is named `agentic-factory-orchestration`; it references
 
 The plugin keeps factory setup low-friction without making the human drive the
 CLI. In agent-CLI modes, the orchestration skill performs the brief
-configuration/preflight work, calls `factory.py up`, presents the ready
-dashboard and topology, then waits for the user to begin operations.
+configuration/preflight work, calls `factory.py up --background`, presents the
+ready dashboard and topology, then waits for the user to begin operations.
 
 Experimental direct process spawning remains outside the core happy path. Host
 runtimes own worker creation whenever they provide a safe delegation mechanism.

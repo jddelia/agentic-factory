@@ -309,7 +309,8 @@ The CLI writes these event types directly:
 | --- | --- | --- | --- |
 | `factory.started` | `init` | Objective or mode summary. | `work_mode`, `topology`, `project_root`. |
 | `factory.dashboard.started` | `up`, `dashboard serve` | Dashboard startup details. | `url`, `host`, `port`, `control_enabled`, `opened`, `dashboard_policy`. |
-| `factory.ready_for_operations` | `up` | Factory floor is initialized and waiting for user readiness. | `dashboard_url`, `runtime_mode`, `topology`, `control_enabled`, `primary_operator`. |
+| `factory.ready_for_operations` | `up` | Factory floor is initialized with a running dashboard and waiting for user readiness. | `dashboard_url`, `runtime_mode`, `topology`, `control_enabled`, `primary_operator`, `server_running`, `dashboard_pid` when backgrounded. |
+| `factory.bootstrap.no_server` | `up --no-serve` | Factory state was initialized without starting the dashboard server. | `dashboard_url`, `runtime_mode`, `topology`, `control_enabled`, `primary_operator`, `server_running: false`. |
 | `baton.assigned` | `baton create` | Baton title. | `owner`, `scope`, `acceptance_tier`, `verification_level`, `lock_acquired`. |
 | `verification.completed` | `verify record` | `<result>: <command>`. | `result`, `command`, `package`. |
 | `baton.handed_off` | `baton handoff` | Handoff summary. | `owner`, `files_changed`, `commands_run`, `verification`. |

@@ -38,8 +38,10 @@ are not available, follow these hard stops in order:
 3. Present the resolved startup brief to the user and ask for confirmation or
    missing information in normal chat. Ask at most three questions. Do not use
    a special user-input tool unless the runtime explicitly provides one.
-4. After confirmation, run `factory.py up` from the target project root. In
-   agent-CLI dashboard workflows, `up` is the first mutating factory command.
+4. After confirmation, run `factory.py up --background` from the target
+   project root. In agent-CLI dashboard workflows, `up` is the first mutating
+   factory command, and `--background` is the non-blocking mode that still
+   starts the dashboard server.
 5. PAUSE. Present the dashboard URL, run ID, project root, topology, runtime
    mode, control state, and top-level operator. Wait for the user to say that
    factory operations may begin.
@@ -145,9 +147,11 @@ to manually run setup commands. Use this sequence:
 1. Briefly infer or ask for the build objective and hard constraints.
 2. Choose the work mode, topology, runtime mode, verification policy, and
    dashboard policy. Keep the prompt short; infer low-risk defaults.
-3. Run `factory.py up` from the target project root. Use
+3. Run `factory.py up --background` from the target project root. Use
    `--runtime-mode agent_cli_subagents` unless preflight selected a safer
-   specific mode. Use `--read-only` only if controls should be disabled.
+   specific mode. Use `--read-only` only if controls should be disabled. Do
+   not use `--no-serve` for real factory startup; it is for tests only and
+   leaves the dashboard URL without a running server.
 4. Present the dashboard URL, run ID, project root, topology, runtime mode,
    control state, and top-level operator.
 5. Pause and wait for the user to confirm readiness.
@@ -333,8 +337,8 @@ acceptance.
 - Treat `factory.py dashboard serve` as an optional visibility/control plane
   for non-Codex or adapter-heavy workflows, not a replacement for Codex app
   orchestration.
-- In agent-CLI dashboard workflows, prefer `factory.py up` over making the user
-  manually initialize state and start the dashboard.
+- In agent-CLI dashboard workflows, prefer `factory.py up --background` over
+  making the user manually initialize state and start the dashboard.
 - If push/auth fails, keep local commits and record remote status.
 - If a design, browser, document, spreadsheet, GitHub, or other domain skill is
   explicitly named, use that skill for the relevant work.

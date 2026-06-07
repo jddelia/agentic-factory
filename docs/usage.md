@@ -38,22 +38,23 @@ clear, the lead agent runs:
 python3 /path/to/agentic-factory/scripts/factory.py up \
   --objective "Ship the requested project outcome" \
   --runtime-mode agent_cli_subagents \
-  --open
+  --background
 ```
 
 `up` initializes the DB if needed, creates topology-derived operator records,
 starts the local dashboard with controls enabled by default, records
 `factory.ready_for_operations`, prints the dashboard URL and run metadata, then
-pauses. The lead agent should wait for the user to confirm readiness before
-creating the first work baton.
+returns so the lead agent can pause. The lead agent should wait for the user to
+confirm readiness before creating the first work baton.
 
-Use `--read-only` for observation-only dashboards. Use `--no-serve` when tests
-or automation only need bootstrap JSON.
+Use `--read-only` for observation-only dashboards. Use `--no-serve` only for
+tests that intentionally do not need a running dashboard server.
 
 This is a required gate for agent CLI dashboard workflows. Do not create a
 baton, generate packets, spawn workers, or edit project files before the agent
-has presented the resolved setup, run `factory.py up`, shown the dashboard URL
-and top-level operator, and received user confirmation to begin operations.
+has presented the resolved setup, run `factory.py up --background`, shown the
+dashboard URL and top-level operator, and received user confirmation to begin
+operations.
 
 ## Initialize
 

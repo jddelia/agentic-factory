@@ -1,4 +1,6 @@
 import json
+import os
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -552,9 +554,11 @@ class FactoryCliTest(unittest.TestCase):
             )
             self.assertEqual(up.returncode, 0, up.stderr)
             payload = json.loads(up.stdout)
-            self.assertEqual(payload["status"], "ready_for_user")
+            self.assertEqual(payload["status"], "initialized_no_server")
             self.assertTrue(payload["created_run"])
             self.assertTrue(payload["control_enabled"])
+            self.assertFalse(payload["server_running"])
+            self.assertIn("not running", payload["warning"])
             self.assertIn("?token=", payload["dashboard_url"])
             self.assertEqual(payload["primary_operator"]["role"], "Executive")
             self.assertEqual([operator["role"] for operator in payload["operators"]], ["Executive", "Ledger"])
@@ -562,10 +566,10 @@ class FactoryCliTest(unittest.TestCase):
             snapshot = json.loads(self.run_cli(root, "dashboard", "snapshot", "--recent", "20").stdout)
             self.assertEqual(snapshot["primary_operator"]["role"], "Executive")
             self.assertEqual([operator["role"] for operator in snapshot["operators"]], ["Executive", "Ledger"])
-            self.assertIn("factory.ready_for_operations", [event["event_type"] for event in snapshot["events"]])
-            ready_event = next(event for event in snapshot["events"] if event["event_type"] == "factory.ready_for_operations")
-            self.assertEqual(ready_event["payload"]["primary_operator"]["role"], "Executive")
-            self.assertEqual(ready_event["payload"]["dashboard_url"], payload["dashboard_url"])
+            self.assertIn("factory.bootstrap.no_server", [event["event_type"] for event in snapshot["events"]])
+            no_server_event = next(event for event in snapshot["events"] if event["event_type"] == "factory.bootstrap.no_server")
+            self.assertEqual(no_server_event["payload"]["primary_operator"]["role"], "Executive")
+            self.assertFalse(no_server_event["payload"]["server_running"])
 
             port = self.free_port()
             token = "test-token"
@@ -625,6 +629,53 @@ class FactoryCliTest(unittest.TestCase):
             events = json.loads(self.run_cli(root, "events", "list", "--type", "operator.message.requested", "--json").stdout)
             self.assertEqual(events["count"], 1)
             self.assertEqual(events["events"][0]["payload"]["message"], "pause until I say begin")
+
+    def test_up_background_starts_dashboard_server(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            port = self.free_port()
+            token = "background-token"
+            up = self.run_cli(
+                root,
+                "up",
+                "--objective",
+                "Build the app",
+                "--topology",
+                "separate_ledger",
+                "--runtime-mode",
+                "agent_cli_subagents",
+                "--port",
+                str(port),
+                "--token",
+                token,
+                "--background",
+                "--no-open",
+            )
+            self.assertEqual(up.returncode, 0, up.stderr)
+            payload = json.loads(up.stdout)
+            self.assertEqual(payload["status"], "ready_for_user")
+            self.assertTrue(payload["server_running"])
+            self.assertIsInstance(payload["dashboard_pid"], int)
+            try:
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/health",
+                    headers={"x-factory-token": token},
+                )
+                with urllib.request.urlopen(request, timeout=2) as response:
+                    health_payload = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(health_payload["status"], "ok")
+                self.assertTrue(health_payload["control_enabled"])
+
+                snapshot = json.loads(self.run_cli(root, "dashboard", "snapshot", "--recent", "20").stdout)
+                self.assertIn("factory.ready_for_operations", [event["event_type"] for event in snapshot["events"]])
+                ready_event = next(event for event in snapshot["events"] if event["event_type"] == "factory.ready_for_operations")
+                self.assertTrue(ready_event["payload"]["server_running"])
+                self.assertEqual(ready_event["payload"]["dashboard_pid"], payload["dashboard_pid"])
+            finally:
+                try:
+                    os.kill(int(payload["dashboard_pid"]), signal.SIGTERM)
+                except OSError:
+                    pass
 
     def test_project_config_controls_defaults_and_doctor(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

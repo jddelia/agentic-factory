@@ -84,7 +84,7 @@ def validate_factory_contracts(plugin_root: Path, errors: list[str]) -> None:
     required_orchestration_markers = (
         "## Required Sequence",
         "This sequence is a contract, not a recommendation.",
-        "run `factory.py up`",
+        "run `factory.py up --background`",
         "PAUSE.",
         "factory operations may begin",
         "Before step 5 is complete, do not run `baton create`",
@@ -93,7 +93,7 @@ def validate_factory_contracts(plugin_root: Path, errors: list[str]) -> None:
         "## Build Request Gate",
         "start with baton commands",
         "`agentic-factory-orchestration` and follow its Required Sequence",
-        "the agent runs `factory.py up`",
+        "the agent runs `factory.py up --background`",
     )
     validate_text_markers(orchestration, required_orchestration_markers, errors)
     validate_text_markers(operational, required_operational_markers, errors)

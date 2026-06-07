@@ -158,26 +158,30 @@ NOTES: dict[tuple[str, ...], str] = {
 
         `up` is the low-friction agent-facing bootstrap. It initializes the DB
         if needed, ensures operator records, starts the local dashboard with
-        controls enabled by default, records readiness events, prints the URL,
-        and then waits while the server runs. If the default port is occupied,
-        it picks the next free port. It does not assign the first baton.
+        controls enabled by default, records readiness events, and prints the
+        URL. If the default port is occupied, it picks the next free port. It
+        does not assign the first baton.
+
+        For real agent CLI invocations, use `--background` so the dashboard
+        server keeps running while the agent receives JSON and can pause for
+        user readiness.
 
         Example:
 
         ```bash
-        python3 scripts/factory.py up --objective "Build the todo app" --topology executive_as_ledger
+        python3 scripts/factory.py up --objective "Build the todo app" --topology executive_as_ledger --background
         ```
 
-        Nonblocking setup for automation:
+        Test-only setup without a running dashboard:
 
         ```bash
         python3 scripts/factory.py up --objective "Build the todo app" --no-serve --no-open
         ```
 
-        Example output shape with `--no-serve`:
+        Example output shape with `--background`:
 
         ```json
-        {"status": "ready_for_user", "dashboard_url": "http://127.0.0.1:8765/?token=...", "control_enabled": true}
+        {"status": "ready_for_user", "dashboard_url": "http://127.0.0.1:8765/?token=...", "server_running": true, "dashboard_pid": 12345}
         ```
 
         Common failures:
@@ -186,6 +190,7 @@ NOTES: dict[tuple[str, ...], str] = {
         - Non-loopback host without `--allow-remote`.
         - `--port` is outside the allowed range.
         - Explicit `--port` is already in use.
+        - `--background` and `--no-serve` are used together.
         - Existing run plus `--force` with a duplicate `--run-id`.
     """,
     ("dashboard", "snapshot"): """

@@ -48,12 +48,12 @@ or ask for the objective, mode, topology, and runtime policy, then run:
 python3 /path/to/agentic-factory/scripts/factory.py up \
   --objective "Ship the requested project outcome" \
   --runtime-mode agent_cli_subagents \
-  --open
+  --background
 ```
 
 `up` creates or refreshes the run, creates topology-derived operator records,
-records a readiness checkpoint, starts the dashboard, and prints the values the
-user needs before factory work begins:
+records a readiness checkpoint, starts the dashboard in the background, and
+prints the values the user needs before factory work begins:
 
 ```text
 Factory floor is ready.
@@ -69,8 +69,8 @@ The lead agent should pause at this point and ask the user to confirm that
 factory operations can begin.
 
 Use `--read-only` when the UI should observe without recording control
-requests. Use `--no-serve` for tests or automation that only need the bootstrap
-JSON.
+requests. Use `--no-serve` only for tests that intentionally do not need a
+running dashboard server.
 
 ## Direct Dashboard Start
 
