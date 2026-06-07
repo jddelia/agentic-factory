@@ -42,6 +42,11 @@ Use this mode when another agent CLI provides its own sub-agent or delegation
 mechanism. The lead agent should use that CLI's native mechanism and pass a
 compact baton or review packet generated from current factory state.
 
+This mode should still be agent-driven. The user invokes the plugin through the
+agent; the orchestration skill resolves the objective, mode, topology, and
+runtime policy; then the agent runs `factory.py up` to initialize the DB and
+local factory floor before the first baton.
+
 This mode is a compatibility approximation, not a guarantee that every agent
 CLI behaves like Codex. Before delegation, the lead agent must determine:
 
@@ -66,8 +71,15 @@ python3 /path/to/agentic-factory/scripts/factory.py agent packet \
 Optional factory-floor view:
 
 ```bash
-python3 /path/to/agentic-factory/scripts/factory.py dashboard serve --open
+python3 /path/to/agentic-factory/scripts/factory.py up \
+  --objective "Ship the requested project outcome" \
+  --runtime-mode agent_cli_subagents \
+  --open
 ```
+
+After `up`, the lead agent should present the dashboard URL, run ID, project
+root, topology, runtime mode, control state, and top-level operator, then wait
+for the user to confirm that factory operations can begin.
 
 See [Agent Packets](agent-packets.md) for the full portable delegation flow.
 See [Dashboard](dashboard.md) for local UI visibility in non-Codex runtimes.

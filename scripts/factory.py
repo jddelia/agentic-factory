@@ -14,6 +14,7 @@ import os
 import re
 import secrets
 import shlex
+import socket
 from pathlib import PurePosixPath
 import sqlite3
 import subprocess
@@ -52,6 +53,7 @@ MAX_SPAWN_TIMEOUT_SECONDS = 86400
 DEFAULT_SPAWN_OUTPUT_LIMIT = 20000
 MAX_SPAWN_OUTPUT_LIMIT = 200000
 DEFAULT_PACKET_DIR = ".agentic-factory/packets"
+DEFAULT_DASHBOARD_PORT = 8765
 DEFAULT_PROJECT_CONFIG: dict[str, Any] = {
     "default_mode": "balanced",
     "default_topology": "executive_as_ledger",
@@ -401,6 +403,19 @@ def current_run(conn: sqlite3.Connection) -> sqlite3.Row | None:
     ).fetchone()
 
 
+def run_metadata(run: sqlite3.Row) -> dict[str, Any]:
+    return json_loads_or_empty(run["metadata_json"], {})
+
+
+def merge_run_metadata(conn: sqlite3.Connection, run_id: str, values: dict[str, Any]) -> None:
+    row = conn.execute("SELECT metadata_json FROM factory_runs WHERE id = ?", (run_id,)).fetchone()
+    existing = json_loads_or_empty(row["metadata_json"] if row else "{}", {})
+    conn.execute(
+        "UPDATE factory_runs SET metadata_json = ?, updated_at = ? WHERE id = ?",
+        (json_dump({**existing, **values}), utc_now(), run_id),
+    )
+
+
 def require_run(conn: sqlite3.Connection) -> sqlite3.Row:
     run = current_run(conn)
     if run is None:
@@ -523,10 +538,38 @@ def cmd_init(args: argparse.Namespace) -> int:
         )
         return 0
 
+    run_id = create_factory_run(
+        conn,
+        root=root,
+        config=config,
+        mode=args.mode,
+        objective=args.objective,
+        topology=args.topology,
+        run_id=args.run_id,
+        actor=args.actor,
+        metadata={"created_by": "agentic-factory"},
+    )
+    conn.commit()
+    print_json({"status": "initialized", "db": str(db_path_for(root, args.db)), "run_id": run_id})
+    return 0
+
+
+def create_factory_run(
+    conn: sqlite3.Connection,
+    *,
+    root: Path,
+    config: dict[str, Any],
+    mode: str | None,
+    objective: str,
+    topology: str | None,
+    run_id: str,
+    actor: str,
+    metadata: dict[str, Any],
+) -> str:
     now = utc_now()
-    run_id = args.run_id or f"factory-{now.replace(':', '').replace('-', '').replace('Z', '')}"
-    work_mode = args.mode or config["default_mode"]
-    topology = args.topology or config["default_topology"]
+    effective_run_id = run_id or f"factory-{now.replace(':', '').replace('-', '').replace('Z', '')}"
+    work_mode = mode or config["default_mode"]
+    effective_topology = topology or config["default_topology"]
     conn.execute(
         """
         INSERT INTO factory_runs
@@ -534,27 +577,25 @@ def cmd_init(args: argparse.Namespace) -> int:
         VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)
         """,
         (
-            run_id,
+            effective_run_id,
             str(root),
-            args.objective or "",
+            objective or "",
             work_mode,
-            topology,
+            effective_topology,
             now,
             now,
-            json_dump({"created_by": "agentic-factory"}),
+            json_dump(metadata),
         ),
     )
     emit_event(
         conn,
         event_type="factory.started",
-        actor=args.actor,
-        run_id=run_id,
-        summary=args.objective or f"Factory started in {work_mode} mode",
-        payload={"work_mode": work_mode, "topology": topology, "project_root": str(root)},
+        actor=actor,
+        run_id=effective_run_id,
+        summary=objective or f"Factory started in {work_mode} mode",
+        payload={"work_mode": work_mode, "topology": effective_topology, "project_root": str(root)},
     )
-    conn.commit()
-    print_json({"status": "initialized", "db": str(db_path_for(root, args.db)), "run_id": run_id})
-    return 0
+    return effective_run_id
 
 
 def collect_status(conn: sqlite3.Connection, root: Path, db: str | None = None) -> dict[str, Any]:
@@ -2538,6 +2579,243 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return exit_code
 
 
+def topology_operator_specs(run: sqlite3.Row) -> list[dict[str, Any]]:
+    metadata = run_metadata(run)
+    topology = str(run["topology"] or "").strip()
+    runtime_mode = str(metadata.get("runtime_mode") or "").strip()
+    if topology == "principal_partner":
+        return [
+            {
+                "role": "Principal Partner",
+                "name": "Principal Partner",
+                "status": "ready",
+                "priority": 0,
+                "authority": ["configure", "pause", "supersede ledger", "begin operations"],
+                "summary": "Top-level human-facing operator for factory setup and checkpoints.",
+            },
+            {
+                "role": "Executive",
+                "name": "Executive",
+                "status": "ready",
+                "priority": 10,
+                "authority": ["scope", "route", "accept", "commit"],
+                "summary": "Owns baton routing, acceptance, product judgment, and quality.",
+            },
+        ]
+    if topology == "separate_ledger":
+        return [
+            {
+                "role": "Executive",
+                "name": "Executive",
+                "status": "ready",
+                "priority": 0,
+                "authority": ["scope", "route", "accept", "commit"],
+                "summary": "Top-level operator for product, quality, and acceptance decisions.",
+            },
+            {
+                "role": "Ledger",
+                "name": "Ledger",
+                "status": "ready",
+                "priority": 10,
+                "authority": ["state", "evidence", "ledger", "recovery notes"],
+                "summary": "Maintains durable state, evidence, handoffs, and ledger snapshots.",
+            },
+        ]
+    if topology == "serial_single_agent" or runtime_mode == "serial_single_agent":
+        return [
+            {
+                "role": "Solo Operator",
+                "name": "Solo Operator",
+                "status": "ready",
+                "priority": 0,
+                "authority": ["execute serial roles", "record evidence", "pause for review"],
+                "summary": "Runs Executive, Builder, Reviewer, and Ledger duties serially.",
+            }
+        ]
+    if runtime_mode in {"agent_cli_subagents", "adapter_spawn"}:
+        return [
+            {
+                "role": "Lead Agent",
+                "name": "Lead Agent",
+                "status": "ready",
+                "priority": 0,
+                "authority": ["coordinate runtime", "route packets", "pause", "begin operations"],
+                "summary": "Top-level operator for agent CLI orchestration and dashboard control.",
+            },
+            {
+                "role": "Executive",
+                "name": "Executive",
+                "status": "ready",
+                "priority": 10,
+                "authority": ["scope", "accept", "review routing"],
+                "summary": "Owns acceptance decisions and keeps the factory disciplined.",
+            },
+        ]
+    return [
+        {
+            "role": "Executive",
+            "name": "Executive",
+            "status": "ready",
+            "priority": 0,
+            "authority": ["scope", "route", "accept", "commit", "ledger"],
+            "summary": "Top-level operator for Codex-native or executive-as-ledger factories.",
+        }
+    ]
+
+
+def ensure_operator_records(conn: sqlite3.Connection, run: sqlite3.Row, *, actor: str) -> None:
+    existing = conn.execute(
+        "SELECT COUNT(*) FROM actors WHERE run_id = ?",
+        (run["id"],),
+    ).fetchone()[0]
+    if existing:
+        return
+    now = utc_now()
+    for spec in topology_operator_specs(run):
+        conn.execute(
+            """
+            INSERT INTO actors
+              (run_id, role, name, thread_id, model, reasoning, status, created_at, updated_at, metadata_json)
+            VALUES (?, ?, ?, '', '', '', ?, ?, ?, ?)
+            """,
+            (
+                run["id"],
+                spec["role"],
+                spec["name"],
+                spec["status"],
+                now,
+                now,
+                json_dump(
+                    {
+                        "priority": spec["priority"],
+                        "authority": spec["authority"],
+                        "summary": spec["summary"],
+                        "created_by": actor,
+                    }
+                ),
+            ),
+        )
+
+
+def collect_operators(conn: sqlite3.Connection, run: sqlite3.Row) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    rows = list(
+        conn.execute(
+            """
+            SELECT *
+            FROM actors
+            WHERE run_id = ?
+            ORDER BY id ASC
+            """,
+            (run["id"],),
+        )
+    )
+    operators: list[dict[str, Any]] = []
+    source_rows: list[dict[str, Any]]
+    if rows:
+        source_rows = [row_to_public_dict(row) or {} for row in rows]
+    else:
+        source_rows = []
+        for index, spec in enumerate(topology_operator_specs(run), start=1):
+            source_rows.append(
+                {
+                    "id": f"derived-{index}",
+                    "run_id": run["id"],
+                    "role": spec["role"],
+                    "name": spec["name"],
+                    "thread_id": "",
+                    "model": "",
+                    "reasoning": "",
+                    "status": spec["status"],
+                    "created_at": run["started_at"],
+                    "updated_at": run["updated_at"],
+                    "metadata": {
+                        "priority": spec["priority"],
+                        "authority": spec["authority"],
+                        "summary": spec["summary"],
+                        "derived": True,
+                    },
+                }
+            )
+    for row in source_rows:
+        metadata = row.get("metadata") or parse_json_field(str(row.get("metadata_json", "{}")))
+        priority = metadata.get("priority", 999) if isinstance(metadata, dict) else 999
+        authority = metadata.get("authority", []) if isinstance(metadata, dict) else []
+        summary = metadata.get("summary", "") if isinstance(metadata, dict) else ""
+        operators.append(
+            {
+                **row,
+                "priority": priority,
+                "authority": authority if isinstance(authority, list) else [],
+                "operator_summary": summary,
+                "is_primary": priority == 0,
+                "control_capabilities": {
+                    "can_record_message": True,
+                    "can_deliver_live_message": False,
+                    "mode": "operator_event",
+                },
+            }
+        )
+    def operator_sort_key(operator: dict[str, Any]) -> tuple[int, int]:
+        raw_priority = operator.get("priority")
+        priority = int(raw_priority) if raw_priority is not None else 999
+        raw_id = str(operator.get("id", ""))
+        operator_id = int(raw_id) if raw_id.isdigit() else 0
+        return priority, operator_id
+
+    operators.sort(key=operator_sort_key)
+    return operators, operators[0] if operators else None
+
+
+def require_operator(conn: sqlite3.Connection, run_id: str, operator_id: str) -> sqlite3.Row:
+    if not operator_id.isdigit():
+        raise FactoryError(f"Unknown operator: {operator_id}")
+    operator = conn.execute(
+        "SELECT * FROM actors WHERE id = ? AND run_id = ?",
+        (int(operator_id), run_id),
+    ).fetchone()
+    if operator is None:
+        raise FactoryError(f"Unknown operator: {operator_id}")
+    return operator
+
+
+def record_operator_message(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    operator_id: str,
+    actor: str,
+    message: str,
+) -> dict[str, Any]:
+    text = message.strip()
+    if not text:
+        raise FactoryError("Message must not be empty.")
+    if len(text) > 8000:
+        raise FactoryError("Message must be 8000 characters or fewer.")
+    operator = require_operator(conn, run_id, operator_id)
+    payload = {
+        "operator_id": operator_id,
+        "role": operator["role"],
+        "name": operator["name"],
+        "message": text,
+        "delivery": "recorded_only",
+        "control_mode": "operator_event",
+    }
+    now = utc_now()
+    emit_event(
+        conn,
+        event_type="operator.message.requested",
+        actor=actor or "Dashboard",
+        run_id=run_id,
+        summary=f"{operator['role']}: {shorten(text, 100)}",
+        payload=payload,
+    )
+    conn.execute(
+        "UPDATE actors SET updated_at = ?, status = ? WHERE id = ?",
+        (now, "messaged", int(operator_id)),
+    )
+    return payload
+
+
 def collect_agent_sessions(conn: sqlite3.Connection, run_id: str, recent: int) -> list[dict[str, Any]]:
     rows = list(
         conn.execute(
@@ -2641,10 +2919,13 @@ def collect_dashboard_snapshot(conn: sqlite3.Connection, root: Path, db: str | N
             "verification": [],
             "reviews": [],
             "sessions": [],
+            "operators": [],
+            "primary_operator": None,
         }
 
     run = status["run"]
     run_id = run["id"]
+    operators, primary_operator = collect_operators(conn, run)
     batons = [
         row
         for row in (
@@ -2695,6 +2976,8 @@ def collect_dashboard_snapshot(conn: sqlite3.Connection, root: Path, db: str | N
         "verification": verification,
         "reviews": reviews,
         "sessions": sessions,
+        "operators": operators,
+        "primary_operator": primary_operator,
     }
 
 
@@ -2762,51 +3045,258 @@ def is_loopback_host(host: str) -> bool:
     return host in {"127.0.0.1", "localhost", "::1"}
 
 
-def require_port(port: int) -> int:
+def require_port(port: int | None) -> int:
+    if port is None:
+        return DEFAULT_DASHBOARD_PORT
     if port < 1 or port > 65535:
         raise FactoryError("--port must be between 1 and 65535")
     return port
 
 
+def is_dashboard_port_available(host: str, port: int) -> bool:
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    try:
+        with socket.socket(family, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((host, port))
+            return True
+    except OSError:
+        return False
+
+
+def resolve_dashboard_port(host: str, requested_port: int | None) -> int:
+    if requested_port is not None:
+        port = require_port(requested_port)
+        if not is_dashboard_port_available(host, port):
+            raise FactoryError(f"Dashboard port {port} is already in use.")
+        return port
+    for port in range(DEFAULT_DASHBOARD_PORT, DEFAULT_DASHBOARD_PORT + 50):
+        if is_dashboard_port_available(host, port):
+            return port
+    raise FactoryError(
+        f"No dashboard port is available from {DEFAULT_DASHBOARD_PORT} to {DEFAULT_DASHBOARD_PORT + 49}."
+    )
+
+
+def dashboard_url(host: str, port: int, token: str) -> str:
+    display_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    return f"http://{display_host}:{port}/?token={token}"
+
+
+def record_dashboard_started(
+    conn: sqlite3.Connection,
+    *,
+    run: sqlite3.Row | None,
+    actor: str,
+    url: str,
+    control_enabled: bool,
+    source: str,
+) -> None:
+    if run is None:
+        return
+    emit_event(
+        conn,
+        event_type="factory.dashboard.started",
+        actor=actor,
+        run_id=run["id"],
+        summary=f"Dashboard started from {source}",
+        payload={
+            "url": url,
+            "control_enabled": control_enabled,
+            "source": source,
+        },
+    )
+
+
 def cmd_dashboard_serve(args: argparse.Namespace) -> int:
     root = resolve_root(args.root)
     require_limit(args.recent, field="recent")
-    port = require_port(args.port)
+    if args.read_only and args.enable_control:
+        raise FactoryError("Use either --read-only or --enable-control, not both.")
+    control_enabled = not args.read_only
     if not is_loopback_host(args.host) and not args.allow_remote:
         raise FactoryError("dashboard serve binds to loopback by default; pass --allow-remote for non-loopback hosts.")
+    port = resolve_dashboard_port(args.host, args.port)
 
     dist_dir = PLUGIN_ROOT / "dashboard" / "dist"
     if not (dist_dir / "index.html").is_file():
         raise FactoryError("Dashboard assets are missing. Run `cd dashboard && npm install && npm run build`.")
 
-    try:
-        import dashboard_server
-        dashboard_server.ensure_dependencies()
-    except ImportError as exc:
-        raise FactoryError(
-            "Dashboard server dependencies are missing. Install them with "
-            "`python3 -m pip install -r requirements-dashboard.txt`."
-        ) from exc
+    import dashboard_server
+    dashboard_server.ensure_dependencies()
 
     token = args.token or secrets.token_urlsafe(24)
-    url = f"http://{args.host}:{port}/?token={token}"
+    url = dashboard_url(args.host, port, token)
+    conn = connect(root, args.db)
+    run = current_run(conn)
+    if run is not None:
+        ensure_operator_records(conn, run, actor=args.actor)
+        run = current_run(conn)
+    record_dashboard_started(
+        conn,
+        run=run,
+        actor=args.actor,
+        url=url,
+        control_enabled=control_enabled,
+        source="dashboard serve",
+    )
+    conn.commit()
     print(f"Agentic Factory dashboard: {url}")
     print(f"Project root: {root}")
-    print(f"Control actions: {'enabled' if args.enable_control else 'read-only'}")
+    print(f"Control actions: {'enabled' if control_enabled else 'read-only'}")
     if args.open:
         webbrowser.open(url)
-    return int(
-        dashboard_server.serve(
-            factory=sys.modules[__name__],
-            root=root,
-            db=args.db,
-            host=args.host,
-            port=port,
-            token=token,
-            enable_control=args.enable_control,
-            recent=args.recent,
+    try:
+        return int(
+            dashboard_server.serve(
+                factory=sys.modules[__name__],
+                root=root,
+                db=args.db,
+                host=args.host,
+                port=port,
+                token=token,
+                enable_control=control_enabled,
+                recent=args.recent,
+            )
         )
+    except OSError as exc:
+        raise FactoryError(f"Unable to start dashboard server on {args.host}:{port}: {exc}") from exc
+
+
+def cmd_up(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    config = config_for_args(root, args)
+    require_limit(args.recent, field="recent")
+    if getattr(args, "open", False) and args.no_open:
+        raise FactoryError("Use either --open or --no-open, not both.")
+    if not is_loopback_host(args.host) and not args.allow_remote:
+        raise FactoryError("up binds the dashboard to loopback by default; pass --allow-remote for non-loopback hosts.")
+    port = resolve_dashboard_port(args.host, args.port)
+
+    dist_dir = PLUGIN_ROOT / "dashboard" / "dist"
+    if not (dist_dir / "index.html").is_file():
+        raise FactoryError("Dashboard assets are missing. Run `cd dashboard && npm install && npm run build`.")
+
+    import dashboard_server
+    dashboard_server.ensure_dependencies()
+
+    conn = connect(root, args.db)
+    existing = current_run(conn)
+    created = False
+    if existing is None or args.force:
+        create_factory_run(
+            conn,
+            root=root,
+            config=config,
+            mode=args.mode,
+            objective=args.objective,
+            topology=args.topology,
+            run_id=args.run_id,
+            actor=args.actor,
+            metadata={
+                "created_by": "agentic-factory-up",
+                "runtime_mode": args.runtime_mode,
+                "dashboard_policy": "read_only" if args.read_only else "control_enabled",
+                "bootstrap_phase": "ready_for_user",
+            },
+        )
+        created = True
+        run = require_run(conn)
+    else:
+        run = existing
+        merge_run_metadata(
+            conn,
+            run["id"],
+            {
+                "runtime_mode": args.runtime_mode,
+                "dashboard_policy": "read_only" if args.read_only else "control_enabled",
+                "bootstrap_phase": "ready_for_user",
+            },
+        )
+        if args.objective and not run["objective"]:
+            conn.execute(
+                "UPDATE factory_runs SET objective = ?, updated_at = ? WHERE id = ?",
+                (args.objective, utc_now(), run["id"]),
+            )
+        run = require_run(conn)
+
+    ensure_operator_records(conn, run, actor=args.actor)
+    operators, primary_operator = collect_operators(conn, run)
+    token = args.token or secrets.token_urlsafe(24)
+    url = dashboard_url(args.host, port, token)
+    control_enabled = not args.read_only
+    record_dashboard_started(
+        conn,
+        run=run,
+        actor=args.actor,
+        url=url,
+        control_enabled=control_enabled,
+        source="up",
     )
+    emit_event(
+        conn,
+        event_type="factory.ready_for_operations",
+        actor=args.actor,
+        run_id=run["id"],
+        summary="Factory floor is initialized and waiting for user readiness.",
+        payload={
+            "dashboard_url": url,
+            "url": url,
+            "control_enabled": control_enabled,
+            "runtime_mode": args.runtime_mode,
+            "topology": run["topology"],
+            "primary_operator": primary_operator,
+            "created_run": created,
+        },
+    )
+    conn.commit()
+
+    payload = {
+        "status": "ready_for_user",
+        "run_id": run["id"],
+        "created_run": created,
+        "root": str(root),
+        "db": str(db_path_for(root, args.db)),
+        "dashboard_url": url,
+        "control_enabled": control_enabled,
+        "mode": run["work_mode"],
+        "topology": run["topology"],
+        "runtime_mode": args.runtime_mode,
+        "primary_operator": primary_operator,
+        "operators": operators,
+        "message": "Factory floor is ready. Present this URL to the user and wait for readiness before assigning work.",
+    }
+    if args.no_serve:
+        print_json(payload)
+        return 0
+
+    print("Factory floor is ready.")
+    print(f"Dashboard: {url}")
+    print(f"Run ID: {run['id']}")
+    print(f"Project root: {root}")
+    print(f"Topology: {run['topology']}")
+    print(f"Runtime mode: {args.runtime_mode}")
+    print(f"Control actions: {'enabled' if control_enabled else 'read-only'}")
+    if primary_operator:
+        print(f"Top-level operator: {primary_operator.get('role', 'Operator')}")
+    print("Pause here: when the user is ready, begin factory operations.")
+    if not args.no_open:
+        webbrowser.open(url)
+    try:
+        return int(
+            dashboard_server.serve(
+                factory=sys.modules[__name__],
+                root=root,
+                db=args.db,
+                host=args.host,
+                port=port,
+                token=token,
+                enable_control=control_enabled,
+                recent=args.recent,
+            )
+        )
+    except OSError as exc:
+        raise FactoryError(f"Unable to start dashboard server on {args.host}:{port}: {exc}") from exc
 
 
 def add_common_args(parser: argparse.ArgumentParser) -> None:
@@ -2837,6 +3327,30 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--force", action="store_true")
     init.set_defaults(func=cmd_init)
 
+    up = subparsers.add_parser("up", help="Initialize the factory floor and serve the local dashboard.")
+    up.add_argument("--mode", default=None)
+    up.add_argument("--objective", default="")
+    up.add_argument("--topology", default=None)
+    up.add_argument(
+        "--runtime-mode",
+        choices=sorted(AGENT_PACKET_RUNTIME_MODES),
+        default="agent_cli_subagents",
+        help="Resolved runtime mode from the orchestration skill.",
+    )
+    up.add_argument("--actor", default="Agentic Factory")
+    up.add_argument("--run-id", default="")
+    up.add_argument("--force", action="store_true", help="Create a new run even if one already exists.")
+    up.add_argument("--host", default="127.0.0.1")
+    up.add_argument("--port", type=int, default=None, help=f"Dashboard port; defaults to first free port from {DEFAULT_DASHBOARD_PORT}.")
+    up.add_argument("--recent", type=int, default=100)
+    up.add_argument("--token", default="", help="Access token; generated by default.")
+    up.add_argument("--read-only", action="store_true", help="Disable dashboard control endpoints.")
+    up.add_argument("--allow-remote", action="store_true", help="Allow binding to a non-loopback host.")
+    up.add_argument("--open", action="store_true", help="Open the dashboard URL in the default browser. This is the default.")
+    up.add_argument("--no-open", action="store_true", help="Do not open the dashboard URL.")
+    up.add_argument("--no-serve", action="store_true", help="Initialize and print JSON without starting the server.")
+    up.set_defaults(func=cmd_up)
+
     status = subparsers.add_parser("status", help="Show current factory state.")
     status.add_argument("--json", action="store_true")
     status.add_argument("--compact", action="store_true")
@@ -2847,17 +3361,19 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard_snapshot = dashboard_sub.add_parser("snapshot", help="Print the dashboard read model as JSON.")
     dashboard_snapshot.add_argument("--recent", type=int, default=50)
     dashboard_snapshot.set_defaults(func=cmd_dashboard_snapshot)
-    dashboard_serve = dashboard_sub.add_parser("serve", help="Serve the optional local dashboard UI.")
+    dashboard_serve = dashboard_sub.add_parser("serve", help="Serve the local dashboard UI.")
     dashboard_serve.add_argument("--host", default="127.0.0.1")
-    dashboard_serve.add_argument("--port", type=int, default=8765)
+    dashboard_serve.add_argument("--port", type=int, default=None, help=f"Dashboard port; defaults to first free port from {DEFAULT_DASHBOARD_PORT}.")
     dashboard_serve.add_argument("--recent", type=int, default=100)
     dashboard_serve.add_argument("--token", default="", help="Access token; generated by default.")
     dashboard_serve.add_argument("--open", action="store_true", help="Open the dashboard URL in the default browser.")
     dashboard_serve.add_argument(
         "--enable-control",
         action="store_true",
-        help="Enable control endpoints such as dashboard message requests.",
+        help="Deprecated compatibility flag; controls are enabled by default.",
     )
+    dashboard_serve.add_argument("--read-only", action="store_true", help="Disable dashboard control endpoints.")
+    dashboard_serve.add_argument("--actor", default="Dashboard")
     dashboard_serve.add_argument(
         "--allow-remote",
         action="store_true",

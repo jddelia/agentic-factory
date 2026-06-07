@@ -14,21 +14,18 @@ or the orchestration skill.
 The dashboard has two layers:
 
 - State layer: reads the existing SQLite database and renders a bounded
-  snapshot of runs, batons, sessions, events, verification, reviews, locks, and
-  ledger state.
-- Control layer: optional endpoints for human control actions. Control is off
-  by default and must be enabled with `--enable-control`.
+  snapshot of runs, top-level operators, batons, sessions, events,
+  verification, reviews, locks, and ledger state.
+- Control layer: local endpoints for human control actions. Control is enabled
+  by default for the dashboard use case and can be disabled with `--read-only`.
 
 The UI is a React and TypeScript app built with Vite. Production assets are
-served by a local FastAPI server launched from the CLI.
+served by a dependency-free local Python server launched from the CLI.
 
 ## Requirements
 
-The core CLI remains stdlib-only. Dashboard serving is optional and requires:
-
-```bash
-python3 -m pip install -r requirements-dashboard.txt
-```
+The core CLI and packaged dashboard server use only the Python standard
+library. No `pip install` step is required to serve the bundled dashboard.
 
 Only dashboard contributors need Node.js:
 
@@ -41,9 +38,43 @@ npm run build
 The repository includes built assets under `dashboard/dist` so normal users do
 not need Node just to open the dashboard.
 
-## Start The Dashboard
+## Agent-Run Startup
 
-From the target project root, after `factory.py init`:
+In agent CLI workflows, the human should not have to initialize the database or
+dashboard manually. The lead agent should use the orchestration skill to infer
+or ask for the objective, mode, topology, and runtime policy, then run:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py up \
+  --objective "Ship the requested project outcome" \
+  --runtime-mode agent_cli_subagents \
+  --open
+```
+
+`up` creates or refreshes the run, creates topology-derived operator records,
+records a readiness checkpoint, starts the dashboard, and prints the values the
+user needs before factory work begins:
+
+```text
+Factory floor is ready.
+Dashboard: http://127.0.0.1:8765/?token=...
+Run: run-...
+Project: /path/to/project
+Topology: executive_as_ledger
+Runtime mode: agent_cli_subagents
+Control actions: enabled
+```
+
+The lead agent should pause at this point and ask the user to confirm that
+factory operations can begin.
+
+Use `--read-only` when the UI should observe without recording control
+requests. Use `--no-serve` for tests or automation that only need the bootstrap
+JSON.
+
+## Direct Dashboard Start
+
+From the target project root, after `factory.py init` or `factory.py up`:
 
 ```bash
 python3 /path/to/agentic-factory/scripts/factory.py dashboard serve --open
@@ -57,11 +88,15 @@ Agentic Factory dashboard: http://127.0.0.1:8765/?token=...
 
 The token is required for API calls. Keep it local.
 
-Enable message-request controls explicitly:
+When `--port` is omitted, the server starts on `8765` or the next available
+nearby port. If `--port` is supplied explicitly and already in use, startup
+fails instead of silently choosing another port.
+
+Start read-only:
 
 ```bash
 python3 /path/to/agentic-factory/scripts/factory.py dashboard serve \
-  --enable-control \
+  --read-only \
   --open
 ```
 
@@ -76,13 +111,16 @@ For automation, tests, or runtimes that only need JSON:
 python3 /path/to/agentic-factory/scripts/factory.py dashboard snapshot --recent 50
 ```
 
-This command does not require FastAPI or Node.
+This command does not require third-party Python packages or Node.
 
 ## What The UI Shows
 
 The first dashboard version includes:
 
 - current run status, mode, topology, objective, DB path, and Git summary;
+- primary operator command seat based on topology and runtime mode;
+- operator list for Executive, Ledger, Principal Partner, Lead Agent, or Solo
+  Operator records;
 - active factory metrics;
 - baton board grouped by status;
 - agent session list and detail pane;
@@ -91,6 +129,20 @@ The first dashboard version includes:
 - verification and review evidence;
 - recent event stream;
 - markdown ledger preview.
+
+## Operator Command Seat
+
+The most prominent panel is the top-level operator for the selected topology:
+
+- `Executive` for Codex-native and executive-as-ledger factories;
+- `Lead Agent` for generic agent CLI and adapter-heavy factories;
+- `Principal Partner` when user-facing oversight is configured;
+- `Solo Operator` for serial single-agent mode;
+- `Ledger` appears as a secondary operator in separate-ledger topologies.
+
+The command seat shows authority, status, and a message box. Messages are
+durable requests recorded in the DB, not a claim that the dashboard can steer a
+live terminal in every runtime.
 
 ## Agent Sessions
 
@@ -116,9 +168,10 @@ Codex-native thread integration.
 
 ## Message Controls
 
-When the dashboard is started with `--enable-control`, the session detail pane
-can record a message request for a session. For process adapters, this writes an
-`agent.message.requested` event with delivery `recorded_only`.
+When the dashboard is started in control mode, the operator command seat can
+record `operator.message.requested` events and session detail panes can record
+`agent.message.requested` events. For process adapters, delivery is
+`recorded_only`.
 
 That is intentional. The dashboard does not pretend that a completed or
 noninteractive process can receive live input. Future session-backed adapters
@@ -130,7 +183,8 @@ Defaults are conservative:
 
 - bind to `127.0.0.1`;
 - generate a random access token per server start;
-- disable control endpoints unless `--enable-control` is supplied;
+- keep control requests local and token-gated;
+- provide `--read-only` for observation-only mode;
 - require `--allow-remote` for non-loopback hosts;
 - serve bounded snapshots instead of unbounded event history;
 - avoid arbitrary shell execution from browser requests.

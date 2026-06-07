@@ -54,6 +54,7 @@ def validate(plugin_root: Path) -> list[str]:
         "SECURITY.md",
         "docs/installation.md",
         "docs/usage.md",
+        "docs/vision.md",
         "docs/runtime-modes.md",
         "docs/agent-packets.md",
         "docs/agent-adapters.md",

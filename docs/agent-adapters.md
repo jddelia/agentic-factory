@@ -158,8 +158,9 @@ python3 /path/to/agentic-factory/scripts/factory.py dashboard serve --open
 ```
 
 Process adapters are visible but not live-steerable. Dashboard message controls
-record `agent.message.requested` events unless a future session-backed adapter
-provides live delivery.
+are enabled by default and record `agent.message.requested` events unless a
+future session-backed adapter provides live delivery. Start the dashboard with
+`--read-only` when those control records should be disabled.
 
 ## When Not To Use Adapters
 

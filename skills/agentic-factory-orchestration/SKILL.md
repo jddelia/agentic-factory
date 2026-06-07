@@ -68,11 +68,14 @@ user request, project docs, tests, risk surface, and local tool constraints.
      readiness.
    - `verification_level`: default `focused_plus_build` for normal feature work.
    - `concurrency_policy`: default `single_writer`.
-4. For DB-backed factories, initialize or inspect state with `agentic-factory`:
-   `init`, `status --compact`, then `doctor`.
-5. Define the next baton with objective, scope, non-goals, risk, acceptance tier,
+4. For agent-CLI dashboard workflows, call `agentic-factory` `up` after this
+   preflight, present the dashboard URL/run/topology/runtime/operator values,
+   and pause until the user confirms factory operations can begin.
+5. For Codex-native or state-only DB-backed factories, initialize or inspect
+   state with `agentic-factory`: `init`, `status --compact`, then `doctor`.
+6. Define the next baton with objective, scope, non-goals, risk, acceptance tier,
    verification level, escalation triggers, owner, and handoff requirements.
-6. Assign only the roles needed for the chosen topology and runtime mode.
+7. Assign only the roles needed for the chosen topology and runtime mode.
 
 Ask at most three short questions when required. If the user's request gives
 enough signal, infer and proceed.
@@ -98,6 +101,27 @@ enough signal, infer and proceed.
 Read `docs/runtime-modes.md` when explaining or changing runtime behavior.
 Read `docs/dashboard.md` before presenting the local dashboard as a control
 surface.
+
+## Agent-CLI Startup Flow
+
+When the user invokes the plugin from a generic agent CLI, do not ask the user
+to manually run setup commands. Use this sequence:
+
+1. Briefly infer or ask for the build objective and hard constraints.
+2. Choose the work mode, topology, runtime mode, verification policy, and
+   dashboard policy. Keep the prompt short; infer low-risk defaults.
+3. Run `factory.py up` from the target project root. Use
+   `--runtime-mode agent_cli_subagents` unless preflight selected a safer
+   specific mode. Use `--read-only` only if controls should be disabled.
+4. Present the dashboard URL, run ID, project root, topology, runtime mode,
+   control state, and top-level operator.
+5. Pause and wait for the user to confirm readiness.
+6. Begin factory operations only after confirmation, starting with status,
+   doctor, and the first baton.
+
+This startup flow is a compatibility layer for non-Codex environments. It does
+not replace Codex-native thread orchestration when native Codex delegation is
+available.
 
 ## Capability Preflight
 
@@ -274,6 +298,8 @@ acceptance.
 - Treat `factory.py dashboard serve` as an optional visibility/control plane
   for non-Codex or adapter-heavy workflows, not a replacement for Codex app
   orchestration.
+- In agent-CLI dashboard workflows, prefer `factory.py up` over making the user
+  manually initialize state and start the dashboard.
 - If push/auth fails, keep local commits and record remote status.
 - If a design, browser, document, spreadsheet, GitHub, or other domain skill is
   explicitly named, use that skill for the relevant work.

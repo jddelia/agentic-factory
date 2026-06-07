@@ -73,7 +73,10 @@ One row per initialized factory run.
 
 ### `actors`
 
-Reserved for durable role/thread metadata.
+Durable role/thread/operator metadata. `factory.py up` and `dashboard serve`
+create topology-derived operator rows when a run has no actors yet. The
+dashboard uses these rows to choose the primary command seat and secondary
+operators.
 
 | Column | Type | Notes |
 | --- | --- | --- |
@@ -87,7 +90,11 @@ Reserved for durable role/thread metadata.
 | `status` | TEXT NOT NULL DEFAULT 'active' | Actor status. |
 | `created_at` | TEXT NOT NULL | UTC timestamp. |
 | `updated_at` | TEXT NOT NULL | UTC timestamp. |
-| `metadata_json` | TEXT NOT NULL DEFAULT '{}' | Extension data. |
+| `metadata_json` | TEXT NOT NULL DEFAULT '{}' | Extension data. Operator rows may include `priority`, `authority`, `summary`, and `created_by`. |
+
+Operator priority `0` is the top-level operator for the run. Common derived
+operators are `Executive`, `Lead Agent`, `Principal Partner`, `Ledger`, and
+`Solo Operator`.
 
 ### `agent_sessions`
 
@@ -301,6 +308,8 @@ The CLI writes these event types directly:
 | Event type | Command | Summary | Payload |
 | --- | --- | --- | --- |
 | `factory.started` | `init` | Objective or mode summary. | `work_mode`, `topology`, `project_root`. |
+| `factory.dashboard.started` | `up`, `dashboard serve` | Dashboard startup details. | `url`, `host`, `port`, `control_enabled`, `opened`, `dashboard_policy`. |
+| `factory.ready_for_operations` | `up` | Factory floor is initialized and waiting for user readiness. | `dashboard_url`, `runtime_mode`, `topology`, `control_enabled`, `primary_operator`. |
 | `baton.assigned` | `baton create` | Baton title. | `owner`, `scope`, `acceptance_tier`, `verification_level`, `lock_acquired`. |
 | `verification.completed` | `verify record` | `<result>: <command>`. | `result`, `command`, `package`. |
 | `baton.handed_off` | `baton handoff` | Handoff summary. | `owner`, `files_changed`, `commands_run`, `verification`. |
@@ -313,6 +322,7 @@ The CLI writes these event types directly:
 | `agent.spawn.started` | `agent spawn` | Adapter, role, and start status. | `session_id`, `adapter`, `role`, `baton_id`, `packet_path`, `timeout_seconds`, `command_preview`. |
 | `agent.spawn.completed` | `agent spawn` | Adapter, role, and terminal status. | `session_id`, `adapter`, `role`, `baton_id`, `packet_path`, `timeout_seconds`, `command_preview`, `status`, `returncode`, `duration_ms`. |
 | `agent.message.requested` | Dashboard control API | Dashboard message request. | `session_id`, `message`, `delivery`, `control_mode`, `control_ref`. |
+| `operator.message.requested` | Dashboard control API | Top-level operator message request. | `operator_id`, `role`, `name`, `message`, `delivery`, `control_mode`. |
 
 `event append` can write custom event types. Custom event names should be
 namespaced with dot notation, for example:
@@ -352,7 +362,7 @@ Read-only inspection commands use the same tables:
 - `review list`: bounded query on `reviews` and `review_findings`, scoped by
   baton or current run.
 - `dashboard snapshot`: bounded read model over current run, batons, events,
-  verification, reviews, locks, and `agent_sessions`.
+  verification, reviews, locks, operators from `actors`, and `agent_sessions`.
 
 Adapter spawn commands write packet files under `.agentic-factory/packets/` by
 default and store bounded process output in `agent_sessions.metadata_json`.

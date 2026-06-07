@@ -58,6 +58,24 @@ dev_server_status:
 blocker_decision:
 ```
 
+## Agent-CLI Bootstrap
+
+```text
+objective:
+runtime_mode:
+work_mode:
+topology:
+dashboard_policy:
+factory_command:
+dashboard_url:
+run_id:
+project_root:
+top_level_operator:
+control_state:
+readiness_checkpoint: waiting_for_user
+begin_operations_after_user_confirms:
+```
+
 ## Baton
 
 ```text

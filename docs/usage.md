@@ -26,6 +26,30 @@ Before assigning a baton, choose the safest available runtime mode:
 The CLI records state transitions. It does not directly spawn arbitrary worker
 processes.
 
+## Agent-CLI Factory Floor Startup
+
+In generic agent CLI environments, the human should invoke the plugin through
+the agent, not by manually running setup commands. The lead agent uses
+`agentic-factory-orchestration` to resolve the objective, work mode, topology,
+runtime mode, verification policy, and dashboard policy. After that setup is
+clear, the lead agent runs:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py up \
+  --objective "Ship the requested project outcome" \
+  --runtime-mode agent_cli_subagents \
+  --open
+```
+
+`up` initializes the DB if needed, creates topology-derived operator records,
+starts the local dashboard with controls enabled by default, records
+`factory.ready_for_operations`, prints the dashboard URL and run metadata, then
+pauses. The lead agent should wait for the user to confirm readiness before
+creating the first work baton.
+
+Use `--read-only` for observation-only dashboards. Use `--no-serve` when tests
+or automation only need bootstrap JSON.
+
 ## Initialize
 
 From the target project root:
@@ -137,8 +161,8 @@ Use [Agent Adapters](agent-adapters.md) for the full safety contract.
 
 ## Open The Dashboard
 
-Use the optional local dashboard when an agent CLI workflow needs a visible
-factory floor:
+Use the local dashboard when an agent CLI workflow needs a visible factory
+floor:
 
 ```bash
 python3 /path/to/agentic-factory/scripts/factory.py dashboard serve --open
@@ -146,19 +170,22 @@ python3 /path/to/agentic-factory/scripts/factory.py dashboard serve --open
 
 The dashboard is most useful for `agent_cli_subagents` and `adapter_spawn`
 workflows where the Codex app is not the primary UI. It shows batons, sessions,
-events, verification, reviews, and a ledger preview from the same SQLite DB.
+topology-derived operators, events, verification, reviews, and a ledger preview
+from the same SQLite DB.
 
-Enable message-request controls explicitly:
+Control mode is enabled by default. Start read-only when the dashboard should
+not record operator or session message requests:
 
 ```bash
 python3 /path/to/agentic-factory/scripts/factory.py dashboard serve \
-  --enable-control \
+  --read-only \
   --open
 ```
 
-For process adapters, dashboard messages are recorded as
-`agent.message.requested` events. They are not live terminal input unless a
-future session-backed adapter provides a live transport.
+For process adapters, dashboard session messages are recorded as
+`agent.message.requested` events. Operator command-seat messages are recorded
+as `operator.message.requested` events. They are not live terminal input unless
+a future session-backed adapter provides a live transport.
 
 For automation without the web server:
 

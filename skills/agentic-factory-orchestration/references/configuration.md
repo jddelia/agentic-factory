@@ -83,9 +83,10 @@ semantics. Use `serial_single_agent` when delegation is unavailable or unclear.
 Treat `adapter_spawn` as experimental and explicitly configured; dry-run before
 execution.
 
-Use `dashboard_policy: read_only` when a generic agent CLI workflow needs
-human-visible factory-floor state. Use `control_enabled` only when the user
-explicitly wants dashboard message-request controls.
+Use `dashboard_policy: control_enabled` by default when a generic agent CLI
+workflow needs the local factory-floor UI. Use `read_only` when the dashboard
+should observe state without recording operator or session message requests.
+Use `off` when Codex-native threads already provide the needed visibility.
 
 ## User Involvement
 

@@ -20,6 +20,7 @@ COMMANDS: tuple[tuple[str, ...], ...] = (
     ("config", "init"),
     ("config", "show"),
     ("init",),
+    ("up",),
     ("status",),
     ("dashboard",),
     ("dashboard", "snapshot"),
@@ -150,6 +151,43 @@ NOTES: dict[tuple[str, ...], str] = {
 
         - No run exists: initialize first with `factory.py init`.
     """,
+    ("up",): """
+        Required arguments: none, but orchestration agents should pass a resolved
+        objective, mode, topology, and runtime mode after using
+        `agentic-factory-orchestration`.
+
+        `up` is the low-friction agent-facing bootstrap. It initializes the DB
+        if needed, ensures operator records, starts the local dashboard with
+        controls enabled by default, records readiness events, prints the URL,
+        and then waits while the server runs. If the default port is occupied,
+        it picks the next free port. It does not assign the first baton.
+
+        Example:
+
+        ```bash
+        python3 scripts/factory.py up --objective "Build the todo app" --topology executive_as_ledger
+        ```
+
+        Nonblocking setup for automation:
+
+        ```bash
+        python3 scripts/factory.py up --objective "Build the todo app" --no-serve --no-open
+        ```
+
+        Example output shape with `--no-serve`:
+
+        ```json
+        {"status": "ready_for_user", "dashboard_url": "http://127.0.0.1:8765/?token=...", "control_enabled": true}
+        ```
+
+        Common failures:
+
+        - Dashboard assets are missing: run `cd dashboard && npm install && npm run build`.
+        - Non-loopback host without `--allow-remote`.
+        - `--port` is outside the allowed range.
+        - Explicit `--port` is already in use.
+        - Existing run plus `--force` with a duplicate `--run-id`.
+    """,
     ("dashboard", "snapshot"): """
         Required arguments: none.
 
@@ -172,8 +210,10 @@ NOTES: dict[tuple[str, ...], str] = {
     ("dashboard", "serve"): """
         Required arguments: none.
 
-        The dashboard server is optional. It requires `requirements-dashboard.txt`
-        and prebuilt frontend assets under `dashboard/dist`.
+        The default dashboard server is dependency-free and uses the Python
+        standard library. It requires prebuilt frontend assets under
+        `dashboard/dist`. If the default port is occupied, it picks the next
+        free port unless `--port` is supplied explicitly.
 
         Example:
 
@@ -181,18 +221,19 @@ NOTES: dict[tuple[str, ...], str] = {
         python3 scripts/factory.py dashboard serve --open
         ```
 
-        Enable message-request controls explicitly:
+        Control endpoints are enabled by default. Use read-only mode when
+        observation is desired without dashboard message controls:
 
         ```bash
-        python3 scripts/factory.py dashboard serve --enable-control
+        python3 scripts/factory.py dashboard serve --read-only
         ```
 
         Common failures:
 
         - Dashboard assets are missing: run `cd dashboard && npm install && npm run build`.
-        - Server dependencies are missing: install `requirements-dashboard.txt`.
         - Non-loopback host without `--allow-remote`.
         - `--port` is outside the allowed range.
+        - Explicit `--port` is already in use.
     """,
     ("agent", "packet"): """
         Required arguments: `--role`.
@@ -681,7 +722,7 @@ def render_doc() -> str:
         "- `--db <path>`: SQLite DB path; relative paths resolve under `--root`.",
         "- `--config <path>`: project config path; relative paths resolve under `--root`.",
         "",
-        "The CLI is local-first and stdlib-only. It does not execute shell input from command arguments or spawn agent processes.",
+        "The CLI is local-first and stdlib-only. It does not execute shell input from command arguments. Process spawning is limited to explicit experimental `agent spawn` adapters.",
         "",
     ]
     for command in COMMANDS:

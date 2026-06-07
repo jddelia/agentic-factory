@@ -8,6 +8,7 @@ node_modules/
 htmlcov/
 *.tsbuildinfo
 .venv/
+.venv-dashboard/
 venv/
 env/
 .agentic-factory/

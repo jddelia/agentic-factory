@@ -1,6 +1,6 @@
 ---
 name: agentic-factory
-description: "Use when directly recording, querying, validating, rendering, generating portable packets, opening the optional dashboard, or dry-running/using experimental adapters from Agentic Factory SQLite state with scripts/factory.py: init, status, doctor, dashboard, baton, agent packet, agent spawn, verification, review, pause/resume, lock, event, and render-ledger commands."
+description: "Use when directly bootstrapping, recording, querying, validating, rendering, generating portable packets, opening the local dashboard, or dry-running/using experimental adapters from Agentic Factory SQLite state with scripts/factory.py: up, init, status, doctor, dashboard, baton, agent packet, agent spawn, verification, review, pause/resume, lock, event, and render-ledger commands."
 ---
 
 # Agentic Factory
@@ -17,8 +17,8 @@ factory runs, the orchestration skill uses host delegation capabilities and this
 skill records the resulting state transitions. In other runtimes, the lead
 agent may use an agent CLI's own sub-agent mechanism, generated agent packets,
 experimental adapters, or serial role simulation while using the same records.
-The optional dashboard can provide local factory-floor visibility for those
-non-Codex or adapter-heavy workflows.
+The local dashboard can provide factory-floor visibility for those non-Codex
+or adapter-heavy workflows.
 
 ## Contract
 
@@ -58,6 +58,27 @@ name, preferred ledger output path, verification policy, and protected generated
 files. Invalid config fails fast before command behavior changes.
 
 ## First Touch
+
+For agent CLI dashboard workflows, prefer the agent-facing bootstrap after the
+orchestration skill has resolved objective, mode, topology, and runtime policy:
+
+```bash
+python3 <plugin-root>/scripts/factory.py up \
+  --objective "Build the requested outcome" \
+  --runtime-mode agent_cli_subagents \
+  --open
+```
+
+`up` initializes or refreshes the run, creates topology-derived operator
+records, starts the local dashboard with controls enabled by default, records
+a readiness checkpoint, prints the dashboard URL/run/topology/runtime values,
+and then waits for the lead agent to pause for user confirmation before
+factory operations begin.
+
+Use `--read-only` when the dashboard should not record control requests. Use
+`--no-serve` for test or automation bootstrap JSON.
+
+For Codex-native or manual state-only startup:
 
 Before recording baton work:
 
@@ -156,7 +177,7 @@ python3 <plugin-root>/scripts/factory.py dashboard snapshot --recent 50
 
 Add `--json` when another tool needs structured output.
 
-## Optional Dashboard
+## Local Dashboard
 
 Use the dashboard when a generic agent CLI or adapter workflow needs a visible
 factory floor:
@@ -165,15 +186,16 @@ factory floor:
 python3 <plugin-root>/scripts/factory.py dashboard serve --open
 ```
 
-The dashboard server is optional and requires `requirements-dashboard.txt`.
-Start it with `--enable-control` only when dashboard message-request controls
-are desired:
+The packaged dashboard server has no third-party Python dependencies. Control
+mode is enabled by default. Start it read-only when dashboard message requests
+should be disabled:
 
 ```bash
-python3 <plugin-root>/scripts/factory.py dashboard serve --enable-control --open
+python3 <plugin-root>/scripts/factory.py dashboard serve --read-only --open
 ```
 
-For process adapters, dashboard messages are recorded as
+Operator command-seat messages are recorded as `operator.message.requested`
+events. For process adapters, session messages are recorded as
 `agent.message.requested` events. They are not live terminal input unless a
 session-backed adapter provides live delivery.
 

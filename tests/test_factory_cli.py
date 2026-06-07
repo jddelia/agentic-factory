@@ -1,9 +1,13 @@
 import json
+import socket
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 
@@ -20,6 +24,11 @@ class FactoryCliTest(unittest.TestCase):
             stderr=subprocess.PIPE,
             check=False,
         )
+
+    def free_port(self) -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return int(sock.getsockname()[1])
 
     def test_baton_lifecycle_writes_structured_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -525,6 +534,97 @@ class FactoryCliTest(unittest.TestCase):
             )
             self.assertEqual(guarded.returncode, 2)
             self.assertIn("requires a held lock", guarded.stderr)
+
+    def test_up_bootstraps_dashboard_and_operator_control(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            up = self.run_cli(
+                root,
+                "up",
+                "--objective",
+                "Build the app",
+                "--topology",
+                "separate_ledger",
+                "--runtime-mode",
+                "agent_cli_subagents",
+                "--no-open",
+                "--no-serve",
+            )
+            self.assertEqual(up.returncode, 0, up.stderr)
+            payload = json.loads(up.stdout)
+            self.assertEqual(payload["status"], "ready_for_user")
+            self.assertTrue(payload["created_run"])
+            self.assertTrue(payload["control_enabled"])
+            self.assertIn("?token=", payload["dashboard_url"])
+            self.assertEqual(payload["primary_operator"]["role"], "Executive")
+            self.assertEqual([operator["role"] for operator in payload["operators"]], ["Executive", "Ledger"])
+
+            snapshot = json.loads(self.run_cli(root, "dashboard", "snapshot", "--recent", "20").stdout)
+            self.assertEqual(snapshot["primary_operator"]["role"], "Executive")
+            self.assertEqual([operator["role"] for operator in snapshot["operators"]], ["Executive", "Ledger"])
+            self.assertIn("factory.ready_for_operations", [event["event_type"] for event in snapshot["events"]])
+            ready_event = next(event for event in snapshot["events"] if event["event_type"] == "factory.ready_for_operations")
+            self.assertEqual(ready_event["payload"]["primary_operator"]["role"], "Executive")
+            self.assertEqual(ready_event["payload"]["dashboard_url"], payload["dashboard_url"])
+
+            port = self.free_port()
+            token = "test-token"
+            proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(CLI),
+                    "--root",
+                    str(root),
+                    "dashboard",
+                    "serve",
+                    "--port",
+                    str(port),
+                    "--token",
+                    token,
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            try:
+                health_payload = None
+                for _ in range(30):
+                    try:
+                        request = urllib.request.Request(
+                            f"http://127.0.0.1:{port}/api/health",
+                            headers={"x-factory-token": token},
+                        )
+                        with urllib.request.urlopen(request, timeout=1) as response:
+                            health_payload = json.loads(response.read().decode("utf-8"))
+                        break
+                    except (urllib.error.URLError, TimeoutError):
+                        time.sleep(0.1)
+                self.assertIsNotNone(health_payload)
+                self.assertTrue(health_payload["control_enabled"])
+
+                operator_id = str(snapshot["primary_operator"]["id"])
+                body = json.dumps({"actor": "Dashboard", "message": "pause until I say begin"}).encode("utf-8")
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/operators/{operator_id}/message",
+                    data=body,
+                    method="POST",
+                    headers={"x-factory-token": token, "content-type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=2) as response:
+                    message_payload = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(message_payload["status"], "recorded")
+                self.assertEqual(message_payload["delivery"], "recorded_only")
+            finally:
+                proc.terminate()
+                try:
+                    proc.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.communicate(timeout=5)
+
+            events = json.loads(self.run_cli(root, "events", "list", "--type", "operator.message.requested", "--json").stdout)
+            self.assertEqual(events["count"], 1)
+            self.assertEqual(events["events"][0]["payload"]["message"], "pause until I say begin")
 
     def test_project_config_controls_defaults_and_doctor(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

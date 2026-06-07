@@ -110,6 +110,26 @@ type AgentSession = {
   };
 };
 
+type Operator = {
+  id: number | string;
+  role: string;
+  name: string;
+  status: string;
+  priority: number;
+  authority: string[];
+  operator_summary: string;
+  is_primary: boolean;
+  updated_at?: string;
+  thread_id?: string;
+  model?: string;
+  reasoning?: string;
+  control_capabilities?: {
+    can_record_message: boolean;
+    can_deliver_live_message: boolean;
+    mode: string;
+  };
+};
+
 type DashboardSnapshot = {
   initialized: boolean;
   generated_at: string;
@@ -146,6 +166,8 @@ type DashboardSnapshot = {
   verification: VerificationRun[];
   reviews: Review[];
   sessions: AgentSession[];
+  operators: Operator[];
+  primary_operator: Operator | null;
 };
 
 const queryClient = new QueryClient({
@@ -349,6 +371,167 @@ function RunPanel({ snapshot }: { snapshot: DashboardSnapshot }) {
   );
 }
 
+function CommandSeat({
+  operator,
+  snapshot,
+  token,
+  controlEnabled,
+}: {
+  operator?: Operator | null;
+  snapshot: DashboardSnapshot;
+  token: string;
+  controlEnabled: boolean;
+}) {
+  const client = useQueryClient();
+  const [message, setMessage] = useState("");
+  const run = snapshot.status?.run;
+  const mutation = useMutation({
+    mutationFn: async () => {
+      if (!operator) throw new Error("No operator selected.");
+      return apiFetch(`/api/operators/${encodeURIComponent(String(operator.id))}/message`, token, {
+        method: "POST",
+        body: JSON.stringify({ actor: "Dashboard", message }),
+      });
+    },
+    onSuccess: () => {
+      setMessage("");
+      void client.invalidateQueries({ queryKey: ["snapshot"] });
+    },
+  });
+  const canRecord = Boolean(operator?.control_capabilities?.can_record_message);
+  const disabled = !operator || !controlEnabled || !canRecord || mutation.isPending;
+
+  return (
+    <section className="command-seat">
+      <div className="command-seat-main">
+        <div className="seat-kicker">
+          <Shield size={16} strokeWidth={1.8} />
+          <span>Factory Command</span>
+        </div>
+        <div className="seat-title-row">
+          <div>
+            <h2>{operator?.name ?? "No operator"}</h2>
+            <p>{operator?.role ?? "Run factory.py up to create the command seat."}</p>
+          </div>
+          <span className={statusClass(operator?.status ?? run?.status)}>{operator?.status ?? run?.status ?? "setup"}</span>
+        </div>
+        <p className="seat-summary">
+          {operator?.operator_summary ||
+            "The command seat is created during factory bootstrap and remains the top-level control context."}
+        </p>
+        <div className="authority-strip">
+          {(operator?.authority?.length ? operator.authority : ["configure", "pause", "begin operations"]).map((item) => (
+            <span key={item}>{item}</span>
+          ))}
+        </div>
+      </div>
+      <div className="seat-control">
+        <label htmlFor="operator-message">Message command seat</label>
+        <textarea
+          id="operator-message"
+          value={message}
+          onChange={(event) => setMessage(event.target.value)}
+          placeholder={
+            controlEnabled
+              ? "Tell the lead operator to begin, pause, summarize, or adjust the factory plan."
+              : "Dashboard is read-only."
+          }
+          disabled={!controlEnabled}
+        />
+        <div className="message-actions">
+          <span>{controlEnabled ? "Recorded as an operator event for the lead agent to consume." : "Read-only dashboard mode."}</span>
+          <button
+            type="button"
+            className="primary-button"
+            disabled={disabled || !message.trim()}
+            onClick={() => mutation.mutate()}
+            title="Record command-seat message"
+          >
+            <Send size={16} strokeWidth={1.8} />
+            Send
+          </button>
+        </div>
+        {mutation.error ? <p className="error-text">{mutation.error.message}</p> : null}
+      </div>
+    </section>
+  );
+}
+
+function OperatorsPanel({
+  operators,
+  sessions,
+  selectedOperator,
+  selectedSession,
+  onSelectOperator,
+  onSelectSession,
+}: {
+  operators: Operator[];
+  sessions: AgentSession[];
+  selectedOperator?: string;
+  selectedSession?: string;
+  onSelectOperator: (id: string) => void;
+  onSelectSession: (id: string) => void;
+}) {
+  return (
+    <section className="panel operators-panel">
+      <div className="panel-heading">
+        <div>
+          <p className="eyebrow">Operators</p>
+          <h2>Command hierarchy</h2>
+        </div>
+        <Radio size={18} strokeWidth={1.8} />
+      </div>
+      <div className="operator-list">
+        {operators.map((operator) => (
+          <button
+            className={`operator-row ${selectedOperator === String(operator.id) ? "selected" : ""}`}
+            key={operator.id}
+            type="button"
+            onClick={() => onSelectOperator(String(operator.id))}
+          >
+            <span className={operator.is_primary ? "operator-rank primary" : "operator-rank"}>{operator.priority}</span>
+            <div>
+              <strong>{operator.name}</strong>
+              <small>{operator.role}</small>
+            </div>
+            <span className={statusClass(operator.status)}>{operator.status}</span>
+          </button>
+        ))}
+        {!operators.length ? <p className="muted">No operators recorded.</p> : null}
+      </div>
+      <div className="worker-divider">
+        <span>Worker sessions</span>
+        <b>{sessions.length}</b>
+      </div>
+      <div className="session-list compact">
+        {sessions.map((session) => (
+          <button
+            className={`session-row ${selectedSession === session.id ? "selected" : ""}`}
+            key={session.id}
+            type="button"
+            onClick={() => onSelectSession(session.id)}
+          >
+            <span className={statusClass(session.status)}>{session.status}</span>
+            <div>
+              <strong>{session.label}</strong>
+              <small>
+                {session.role} · {session.adapter} · {session.baton_id ?? "factory"}
+              </small>
+            </div>
+            <span className="time">{formatTime(session.last_seen_at ?? session.started_at)}</span>
+          </button>
+        ))}
+        {!sessions.length ? (
+          <div className="empty-state compact">
+            <TerminalSquare size={22} strokeWidth={1.8} />
+            <p>No worker sessions yet.</p>
+          </div>
+        ) : null}
+      </div>
+    </section>
+  );
+}
+
 function BatonBoard({ batons, selected, onSelect }: {
   batons: Baton[];
   selected?: string;
@@ -519,7 +702,7 @@ function SessionDetail({
           id="session-message"
           value={message}
           onChange={(event) => setMessage(event.target.value)}
-          placeholder={controlEnabled ? "Ask this worker to pause, summarize, or adjust scope." : "Start dashboard with --enable-control to record messages."}
+          placeholder={controlEnabled ? "Ask this worker to pause, summarize, or adjust scope." : "Dashboard is read-only."}
           disabled={!controlEnabled}
         />
         <div className="message-actions">
@@ -667,6 +850,7 @@ function DashboardApp() {
   useFactoryEvents(token);
 
   const data = snapshot.data;
+  const [selectedOperatorId, setSelectedOperatorId] = useState<string | undefined>();
   const [selectedSessionId, setSelectedSessionId] = useState<string | undefined>();
   const [selectedBatonId, setSelectedBatonId] = useState<string | undefined>();
 
@@ -674,9 +858,20 @@ function DashboardApp() {
     if (!selectedSessionId && data?.sessions[0]) setSelectedSessionId(data.sessions[0].id);
   }, [data?.sessions, selectedSessionId]);
 
+  useEffect(() => {
+    const primaryId = data?.primary_operator?.id;
+    if (!selectedOperatorId && primaryId !== undefined && primaryId !== null) {
+      setSelectedOperatorId(String(primaryId));
+    }
+  }, [data?.primary_operator, selectedOperatorId]);
+
   const selectedSession = useMemo(
     () => data?.sessions.find((session) => session.id === selectedSessionId),
     [data?.sessions, selectedSessionId],
+  );
+  const selectedOperator = useMemo(
+    () => data?.operators.find((operator) => String(operator.id) === selectedOperatorId) ?? data?.primary_operator,
+    [data?.operators, data?.primary_operator, selectedOperatorId],
   );
 
   if (!token) {
@@ -718,13 +913,26 @@ function DashboardApp() {
       />
       <main className="dashboard-grid">
         <section className="main-column">
+          <CommandSeat
+            operator={selectedOperator}
+            snapshot={data}
+            token={token}
+            controlEnabled={Boolean(data.server?.control_enabled)}
+          />
           <Metrics snapshot={data} />
           <RunPanel snapshot={data} />
           <BatonBoard batons={data.batons} selected={selectedBatonId} onSelect={setSelectedBatonId} />
           <EvidencePanel verification={data.verification} reviews={data.reviews} />
         </section>
         <aside className="side-column">
-          <SessionsPanel sessions={data.sessions} selected={selectedSessionId} onSelect={setSelectedSessionId} />
+          <OperatorsPanel
+            operators={data.operators}
+            sessions={data.sessions}
+            selectedOperator={selectedOperatorId}
+            selectedSession={selectedSessionId}
+            onSelectOperator={setSelectedOperatorId}
+            onSelectSession={setSelectedSessionId}
+          />
           <SessionDetail
             session={selectedSession}
             token={token}

@@ -13,13 +13,9 @@ Agentic Factory is a local-first Codex plugin package. It includes:
 - Git, optional but recommended
 - No runtime Python package dependencies
 
-Optional dashboard serving requires:
-
-```bash
-python3 -m pip install -r requirements-dashboard.txt
-```
-
-Dashboard frontend development requires Node.js 20 or newer.
+The bundled dashboard server also has no Python package dependencies. It serves
+the checked-in production assets from `dashboard/dist`. Dashboard frontend
+development requires Node.js 20 or newer.
 
 ## Local Source Use
 
@@ -75,6 +71,10 @@ Use [Agent Adapters](agent-adapters.md) only when an experimental process-level
 bridge to an external agent CLI is explicitly desired.
 Use [Dashboard](dashboard.md) when a non-Codex or generic agent-CLI workflow
 needs a visible local factory floor.
+
+For the lowest-friction agent CLI path, the lead agent should perform
+orchestration preflight and then run `factory.py up`, which initializes state,
+starts the dashboard, and pauses for user confirmation before operations begin.
 
 See [Runtime Modes](runtime-modes.md) for the full mode contract.
 
