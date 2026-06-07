@@ -107,11 +107,25 @@ type AgentSession = {
     stdout_truncated?: boolean;
     stderr_truncated?: boolean;
     control_note?: string;
+    control_ref?: string;
+    attach_command?: string;
+    logs_command?: string;
+    stop_command?: string;
+    last_logs_stdout?: string;
+    last_logs_stderr?: string;
+    claude?: JsonObject;
   };
   control_capabilities?: {
     can_record_message: boolean;
     can_deliver_live_message: boolean;
+    can_attach_live?: boolean;
     mode: string;
+  };
+  commands?: {
+    agents?: string;
+    attach?: string;
+    logs?: string;
+    stop?: string;
   };
 };
 
@@ -974,7 +988,13 @@ function SessionDetail({
 
   const canRecord = Boolean(session.control_capabilities?.can_record_message);
   const liveDelivery = Boolean(session.control_capabilities?.can_deliver_live_message);
+  const canAttach = Boolean(session.control_capabilities?.can_attach_live);
   const disabled = !controlEnabled || !canRecord || mutation.isPending;
+  const sessionCommands = {
+    attach: session.commands?.attach ?? session.metadata?.attach_command,
+    logs: session.commands?.logs ?? session.metadata?.logs_command,
+    stop: session.commands?.stop ?? session.metadata?.stop_command,
+  };
 
   return (
     <section className="panel detail-panel">
@@ -988,7 +1008,7 @@ function SessionDetail({
       <dl className="detail-grid">
         <div>
           <dt>Control</dt>
-          <dd>{liveDelivery ? "live delivery" : "event request"}</dd>
+          <dd>{liveDelivery ? "live delivery" : canAttach ? "attachable session" : "event request"}</dd>
         </div>
         <div>
           <dt>Exit</dt>
@@ -1007,6 +1027,23 @@ function SessionDetail({
         <span>Command</span>
         <code>{shellPreview(session.command)}</code>
       </div>
+      {canAttach ? (
+        <div className="session-control-strip">
+          <div>
+            <span>Attach</span>
+            <code>{sessionCommands.attach}</code>
+          </div>
+          <div>
+            <span>Logs</span>
+            <code>{sessionCommands.logs}</code>
+          </div>
+          <div>
+            <span>Stop</span>
+            <code>{sessionCommands.stop}</code>
+          </div>
+        </div>
+      ) : null}
+      {session.metadata?.control_note ? <p className="session-note">{session.metadata.control_note}</p> : null}
       <div className="message-box">
         <label htmlFor="session-message">Send message</label>
         <textarea
@@ -1017,7 +1054,13 @@ function SessionDetail({
           disabled={!controlEnabled}
         />
         <div className="message-actions">
-          <span>{controlEnabled ? "Recorded as a factory event unless live transport is available." : "Read-only dashboard mode."}</span>
+          <span>
+            {controlEnabled
+              ? canAttach
+                ? "Queued in the DB; attach to the live session to converse directly."
+                : "Recorded as a factory event unless live transport is available."
+              : "Read-only dashboard mode."}
+          </span>
           <button
             type="button"
             className="primary-button"
@@ -1034,6 +1077,8 @@ function SessionDetail({
       </div>
       <OutputPane title="stdout" value={session.metadata?.stdout} truncated={session.metadata?.stdout_truncated} />
       <OutputPane title="stderr" value={session.metadata?.stderr} truncated={session.metadata?.stderr_truncated} />
+      <OutputPane title="latest logs" value={session.metadata?.last_logs_stdout} />
+      <OutputPane title="latest log errors" value={session.metadata?.last_logs_stderr} />
     </section>
   );
 }

@@ -537,6 +537,150 @@ class FactoryCliTest(unittest.TestCase):
             self.assertEqual(guarded.returncode, 2)
             self.assertIn("requires a held lock", guarded.stderr)
 
+    def test_agent_spawn_claude_code_background_session_and_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "fake-claude-state.json"
+            fake_claude = root / "fake-claude.py"
+            fake_claude.write_text(
+                f"""#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+
+state = pathlib.Path({str(state)!r})
+args = sys.argv[1:]
+session = {{
+    "sessionId": "7c5dcf5d",
+    "name": "factory-builder-B-001",
+    "status": "running",
+    "cwd": {str(root)!r},
+    "kind": "session",
+    "startedAt": "2026-06-07T00:00:00Z",
+}}
+if "--bg" in args:
+    state.write_text(json.dumps(session), encoding="utf-8")
+    print("backgrounded · 7c5dcf5d · factory-builder-B-001")
+    sys.exit(0)
+if args and args[0] == "agents" and "--json" in args:
+    payload = json.loads(state.read_text(encoding="utf-8")) if state.exists() else session
+    print(json.dumps([payload]))
+    sys.exit(0)
+if len(args) >= 2 and args[0] == "logs":
+    print("worker log for " + args[1])
+    sys.exit(0)
+if len(args) >= 2 and args[0] == "stop":
+    payload = json.loads(state.read_text(encoding="utf-8")) if state.exists() else session
+    payload["status"] = "stopped"
+    state.write_text(json.dumps(payload), encoding="utf-8")
+    print("stopped " + args[1])
+    sys.exit(0)
+print("unsupported fake claude args: " + repr(args), file=sys.stderr)
+sys.exit(2)
+""",
+                encoding="utf-8",
+            )
+            fake_claude.chmod(0o755)
+
+            self.assertEqual(self.run_cli(root, "init", "--run-id", "claude-spawn").returncode, 0)
+            self.assertEqual(
+                self.run_cli(root, "baton", "create", "B-001", "--title", "Claude spawn").returncode,
+                0,
+            )
+
+            dry_run = self.run_cli(
+                root,
+                "agent",
+                "spawn",
+                "--adapter",
+                "claude-code",
+                "--role",
+                "builder",
+                "--baton",
+                "B-001",
+                "--dry-run",
+                "--claude-bin",
+                str(fake_claude),
+                "--claude-worktree",
+            )
+            self.assertEqual(dry_run.returncode, 0, dry_run.stderr)
+            dry_payload = json.loads(dry_run.stdout)
+            self.assertEqual(dry_payload["status"], "dry_run")
+            self.assertIn("--bg", dry_payload["command"])
+            self.assertIn("--plugin-dir", dry_payload["command"])
+            self.assertIn(str(PLUGIN_ROOT), dry_payload["command"])
+            self.assertIn("--worktree", dry_payload["command"])
+
+            spawned = self.run_cli(
+                root,
+                "agent",
+                "spawn",
+                "--adapter",
+                "claude-code",
+                "--role",
+                "builder",
+                "--baton",
+                "B-001",
+                "--experimental",
+                "--claude-bin",
+                str(fake_claude),
+                "--timeout-seconds",
+                "10",
+            )
+            self.assertEqual(spawned.returncode, 0, spawned.stderr)
+            spawn_payload = json.loads(spawned.stdout)
+            self.assertEqual(spawn_payload["status"], "running")
+            self.assertEqual(spawn_payload["control_ref"], "7c5dcf5d")
+            self.assertEqual(spawn_payload["session_id"], "claude-7c5dcf5d")
+
+            session_list = self.run_cli(root, "agent", "session", "list", "--json")
+            self.assertEqual(session_list.returncode, 0, session_list.stderr)
+            session_payload = json.loads(session_list.stdout)
+            self.assertEqual(session_payload["count"], 1)
+            self.assertEqual(session_payload["sessions"][0]["control_ref"], "7c5dcf5d")
+            self.assertEqual(session_payload["sessions"][0]["control_mode"], "claude_bg")
+            self.assertIn("attach", session_payload["sessions"][0]["commands"])
+
+            state.write_text(
+                json.dumps(
+                    {
+                        "sessionId": "7c5dcf5d",
+                        "name": "factory-builder-B-001",
+                        "status": "waiting",
+                        "waitingFor": "input needed",
+                        "cwd": str(root),
+                        "kind": "session",
+                        "startedAt": "2026-06-07T00:00:00Z",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            snapshot = self.run_cli(root, "dashboard", "snapshot", "--recent", "10")
+            self.assertEqual(snapshot.returncode, 0, snapshot.stderr)
+            snapshot_payload = json.loads(snapshot.stdout)
+            self.assertEqual(snapshot_payload["sessions"][0]["status"], "waiting")
+            self.assertEqual(snapshot_payload["sessions"][0]["commands"]["attach"], f"{fake_claude} attach 7c5dcf5d")
+
+            sync = self.run_cli(root, "agent", "session", "sync", "--adapter", "claude-code")
+            self.assertEqual(sync.returncode, 0, sync.stderr)
+            sync_payload = json.loads(sync.stdout)
+            self.assertEqual(sync_payload["updated"], 1)
+
+            shown = self.run_cli(root, "agent", "session", "show", "claude-7c5dcf5d", "--json")
+            self.assertEqual(shown.returncode, 0, shown.stderr)
+            shown_payload = json.loads(shown.stdout)
+            self.assertEqual(shown_payload["status"], "waiting")
+            self.assertEqual(shown_payload["metadata"]["claude"]["waitingFor"], "input needed")
+
+            logs = self.run_cli(root, "agent", "session", "logs", "claude-7c5dcf5d")
+            self.assertEqual(logs.returncode, 0, logs.stderr)
+            self.assertIn("worker log for 7c5dcf5d", logs.stdout)
+
+            stopped = self.run_cli(root, "agent", "session", "stop", "claude-7c5dcf5d")
+            self.assertEqual(stopped.returncode, 0, stopped.stderr)
+            stopped_payload = json.loads(stopped.stdout)
+            self.assertEqual(stopped_payload["status"], "stopped")
+
     def test_up_bootstraps_dashboard_and_operator_control(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

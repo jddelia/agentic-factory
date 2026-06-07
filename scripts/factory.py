@@ -42,10 +42,14 @@ AGENT_PACKET_RUNTIME_MODES = {
     "adapter_spawn",
 }
 AGENT_PACKET_WRITE_POLICIES = {"auto", "read-only", "write"}
-AGENT_SPAWN_ADAPTERS = {"codex-cli", "custom"}
+AGENT_SPAWN_ADAPTERS = {"claude-code", "codex-cli", "custom"}
 CODEX_SPAWN_SANDBOXES = {"auto", "read-only", "workspace-write"}
 CODEX_APPROVAL_POLICIES = {"never", "on-request", "untrusted", "on-failure"}
 SESSION_ACTIVE_STATUSES = {"planned", "running", "waiting", "blocked"}
+CLAUDE_CODE_TERMINAL_STATUSES = {"completed", "done", "failed", "stopped", "exited", "removed"}
+CLAUDE_CODE_BACKGROUND_ID_RE = re.compile(
+    r"(?:backgrounded\s*[^\w\s]\s*|claude\s+attach\s+)([A-Za-z0-9][A-Za-z0-9_-]{2,})"
+)
 CONTROL_MESSAGE_EVENT_TYPES = {
     "operator.message.requested",
     "agent.message.requested",
@@ -1622,6 +1626,60 @@ def build_codex_spawn_command(root: Path, packet: dict[str, Any], args: argparse
     return command
 
 
+def claude_session_name(packet: dict[str, Any], args: argparse.Namespace) -> str:
+    baton = packet.get("baton") or {}
+    pieces = [
+        "factory",
+        str(packet.get("role") or args.role),
+        str(baton.get("id") or args.baton or "run"),
+    ]
+    return safe_slug("-".join(pieces), fallback="factory-session")
+
+
+def claude_background_prompt(packet_path: Path, packet: dict[str, Any]) -> str:
+    role = str(packet.get("role") or "worker")
+    baton = packet.get("baton") or {}
+    baton_id = str(baton.get("id") or "factory")
+    return (
+        "You are an Agentic Factory worker session. Read the packet file at "
+        f"{packet_path} and follow it exactly. Role: {role}. Baton: {baton_id}. "
+        "Use the packet's recording commands to write durable factory evidence "
+        "when safe. If this session is running in an isolated worktree, edit the "
+        "current working directory but record factory state through the packet's "
+        "absolute CLI commands. Stop after the packet completion contract is met "
+        "or when you need lead/user input."
+    )
+
+
+def build_claude_spawn_command(root: Path, packet: dict[str, Any], packet_path: Path, args: argparse.Namespace) -> list[str]:
+    command = [args.claude_bin]
+    if args.claude_model:
+        command.extend(["--model", args.claude_model])
+    if args.claude_permission_mode:
+        command.extend(["--permission-mode", args.claude_permission_mode])
+    if args.claude_agent:
+        command.extend(["--agent", args.claude_agent])
+    if args.claude_worktree:
+        command.append("--worktree")
+        if args.claude_worktree != "auto":
+            command.append(args.claude_worktree)
+    if not args.claude_no_plugin_dir:
+        command.extend(["--plugin-dir", str(PLUGIN_ROOT)])
+    for plugin_dir in args.claude_plugin_dir or []:
+        command.extend(["--plugin-dir", plugin_dir])
+    for add_dir in args.claude_add_dir or []:
+        command.extend(["--add-dir", add_dir])
+    command.extend(
+        [
+            "--bg",
+            "--name",
+            claude_session_name(packet, args),
+            claude_background_prompt(packet_path, packet),
+        ]
+    )
+    return command
+
+
 CUSTOM_PLACEHOLDER_RE = re.compile(r"\{[A-Za-z_][A-Za-z0-9_]*\}")
 
 
@@ -1654,6 +1712,8 @@ def build_custom_spawn_command(root: Path, packet_path: Path, args: argparse.Nam
 
 
 def build_spawn_command(root: Path, packet: dict[str, Any], packet_path: Path, args: argparse.Namespace) -> tuple[list[str], str | None]:
+    if args.adapter == "claude-code":
+        return build_claude_spawn_command(root, packet, packet_path, args), None
     if args.adapter == "codex-cli":
         return build_codex_spawn_command(root, packet, args), agent_packet_text(packet, args.packet_format)
     if args.adapter == "custom":
@@ -1716,6 +1776,43 @@ def run_spawn_command(
         }
 
 
+def parse_claude_background_session_id(stdout: str, stderr: str) -> str:
+    combined = "\n".join(part for part in (stdout, stderr) if part)
+    match = CLAUDE_CODE_BACKGROUND_ID_RE.search(combined)
+    return match.group(1) if match else ""
+
+
+def claude_session_id_for(control_ref: str, *, role: str, baton_id: str | None) -> str:
+    if control_ref:
+        return f"claude-{safe_slug(control_ref, fallback='session')}"
+    return make_agent_session_id(role=role, baton_id=baton_id)
+
+
+def run_claude_background_spawn(
+    *,
+    command: list[str],
+    root: Path,
+    timeout_seconds: int,
+    output_limit: int,
+) -> dict[str, Any]:
+    execution = run_spawn_command(
+        command=command,
+        stdin=None,
+        root=root,
+        timeout_seconds=timeout_seconds,
+        output_limit=output_limit,
+    )
+    control_ref = ""
+    if execution["returncode"] == 0:
+        control_ref = parse_claude_background_session_id(execution["stdout"], execution["stderr"])
+    status = "running" if execution["returncode"] == 0 else execution["status"]
+    return {
+        **execution,
+        "status": status,
+        "control_ref": control_ref,
+    }
+
+
 def make_agent_session_id(*, role: str, baton_id: str | None) -> str:
     stamp = utc_now().replace(":", "").replace("-", "").replace("Z", "")
     nonce = secrets.token_hex(4)
@@ -1746,14 +1843,29 @@ def create_agent_session_record(
     packet_path: Path,
     command: list[str],
     timeout_seconds: int,
+    status: str = "running",
+    control_mode: str = "process",
+    control_ref: str = "",
+    summary: str | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> None:
     now = utc_now()
+    base_metadata = {
+        "timeout_seconds": timeout_seconds,
+        "control_note": (
+            "This session records process state and output. Live steering requires a "
+            "session-backed adapter such as Claude Code background sessions, tmux, Zellij, "
+            "PTY, or a Codex-native thread."
+        ),
+    }
+    if metadata:
+        base_metadata.update(metadata)
     conn.execute(
         """
         INSERT INTO agent_sessions
           (id, run_id, baton_id, role, adapter, label, status, control_mode, control_ref,
            packet_path, command_json, started_at, last_seen_at, summary, metadata_json)
-        VALUES (?, ?, ?, ?, ?, ?, 'running', 'process', '', ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             session_id,
@@ -1762,20 +1874,15 @@ def create_agent_session_record(
             role,
             adapter,
             session_label(role=role, baton_id=baton_id, adapter=adapter),
+            status,
+            control_mode,
+            control_ref,
             str(packet_path),
             json_dump(command),
             now,
             now,
-            f"{adapter} spawn running for {role}",
-            json_dump(
-                {
-                    "timeout_seconds": timeout_seconds,
-                    "control_note": (
-                        "This session records process state and output. Live steering requires a "
-                        "session-backed adapter such as tmux, Zellij, PTY, or a Codex-native thread."
-                    ),
-                }
-            ),
+            summary or f"{adapter} spawn {status} for {role}",
+            json_dump(base_metadata),
         ),
     )
 
@@ -1813,6 +1920,182 @@ def update_agent_session_record(
             session_id,
         ),
     )
+
+
+def session_metadata(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    raw = row["metadata_json"] if isinstance(row, sqlite3.Row) else row.get("metadata_json")
+    parsed = json_loads_or_empty(str(raw or "{}"), {})
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def merge_agent_session_metadata(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    values: dict[str, Any],
+) -> None:
+    row = conn.execute("SELECT metadata_json FROM agent_sessions WHERE id = ?", (session_id,)).fetchone()
+    existing = session_metadata(row) if row else {}
+    conn.execute(
+        "UPDATE agent_sessions SET metadata_json = ? WHERE id = ?",
+        (json_dump({**existing, **values}), session_id),
+    )
+
+
+def claude_status_to_factory_status(entry: dict[str, Any]) -> str:
+    raw = str(entry.get("status") or "").strip().lower()
+    if raw in {"waiting", "needs_input", "needs-input", "input_needed"}:
+        return "waiting"
+    if raw in {"blocked"}:
+        return "blocked"
+    if raw in {"failed", "error"}:
+        return "failed"
+    if raw in {"done", "completed", "success", "succeeded"}:
+        return "completed"
+    if raw in {"stopped", "killed", "canceled", "cancelled"}:
+        return "stopped"
+    if raw in {"exited", "removed"}:
+        return raw
+    if entry.get("pid"):
+        return "running"
+    return raw or "running"
+
+
+def run_claude_agents_json(
+    *,
+    root: Path,
+    claude_bin: str,
+    timeout_seconds: int,
+    output_limit: int,
+) -> dict[str, Any]:
+    command = [claude_bin, "agents", "--json", "--cwd", str(root)]
+    execution = run_spawn_command(
+        command=command,
+        stdin=None,
+        root=root,
+        timeout_seconds=timeout_seconds,
+        output_limit=output_limit,
+    )
+    if execution["returncode"] != 0:
+        fallback = [claude_bin, "agents", "--json"]
+        execution = run_spawn_command(
+            command=fallback,
+            stdin=None,
+            root=root,
+            timeout_seconds=timeout_seconds,
+            output_limit=output_limit,
+        )
+        execution["command"] = fallback
+    else:
+        execution["command"] = command
+    if execution["returncode"] != 0:
+        return {"ok": False, "entries": [], "execution": execution}
+    try:
+        entries = json.loads(execution["stdout"] or "[]")
+    except json.JSONDecodeError as exc:
+        execution["stderr"] = (execution["stderr"] + f"\nInvalid JSON from claude agents: {exc}").strip()
+        return {"ok": False, "entries": [], "execution": execution}
+    if not isinstance(entries, list):
+        execution["stderr"] = (execution["stderr"] + "\nclaude agents --json did not return an array.").strip()
+        return {"ok": False, "entries": [], "execution": execution}
+    normalized = [entry for entry in entries if isinstance(entry, dict)]
+    return {"ok": True, "entries": normalized, "execution": execution}
+
+
+def claude_bin_for_session(row: sqlite3.Row) -> str:
+    command = json_loads_or_empty(row["command_json"], [])
+    if isinstance(command, list) and command:
+        first = command[0]
+        if isinstance(first, str) and first.strip():
+            return first
+    return "claude"
+
+
+def sync_claude_code_sessions(
+    conn: sqlite3.Connection,
+    *,
+    root: Path,
+    run_id: str,
+    timeout_seconds: int = 5,
+    output_limit: int = 20000,
+    actor: str = "Agentic Factory",
+    emit: bool = False,
+) -> dict[str, Any]:
+    rows = list(
+        conn.execute(
+            """
+            SELECT *
+            FROM agent_sessions
+            WHERE run_id = ? AND adapter = 'claude-code'
+            ORDER BY COALESCE(last_seen_at, started_at, '') DESC, id DESC
+            """,
+            (run_id,),
+        )
+    )
+    if not rows:
+        return {"status": "no_sessions", "checked": 0, "updated": 0, "errors": []}
+
+    rows_by_ref = {row["control_ref"]: row for row in rows if row["control_ref"]}
+    claude_bins = sorted({claude_bin_for_session(row) for row in rows if row["status"] in SESSION_ACTIVE_STATUSES})
+    if not claude_bins:
+        return {"status": "no_active_sessions", "checked": len(rows), "updated": 0, "errors": []}
+
+    now = utc_now()
+    updated = 0
+    errors: list[dict[str, Any]] = []
+    for claude_bin in claude_bins:
+        result = run_claude_agents_json(
+            root=root,
+            claude_bin=claude_bin,
+            timeout_seconds=timeout_seconds,
+            output_limit=output_limit,
+        )
+        execution = result["execution"]
+        if not result["ok"]:
+            errors.append(
+                {
+                    "claude_bin": claude_bin,
+                    "returncode": execution["returncode"],
+                    "stderr": execution["stderr"],
+                }
+            )
+            continue
+        for entry in result["entries"]:
+            control_ref = str(entry.get("sessionId") or entry.get("id") or "").strip()
+            if not control_ref or control_ref not in rows_by_ref:
+                continue
+            row = rows_by_ref[control_ref]
+            status = claude_status_to_factory_status(entry)
+            ended_at = now if status in CLAUDE_CODE_TERMINAL_STATUSES else row["ended_at"]
+            summary = str(entry.get("name") or entry.get("currentActivity") or row["summary"] or "")
+            metadata = session_metadata(row)
+            metadata.update(
+                {
+                    "last_sync_at": now,
+                    "claude": entry,
+                    "claude_sync_command": shell_join(execution["command"]),
+                }
+            )
+            conn.execute(
+                """
+                UPDATE agent_sessions
+                SET status = ?, last_seen_at = ?, ended_at = ?, summary = ?, metadata_json = ?
+                WHERE id = ?
+                """,
+                (status, now, ended_at, summary, json_dump(metadata), row["id"]),
+            )
+            updated += 1
+            if emit:
+                emit_event(
+                    conn,
+                    event_type="agent.session.synced",
+                    actor=actor,
+                    run_id=run_id,
+                    baton_id=row["baton_id"],
+                    summary=f"Claude Code session {control_ref} synced as {status}",
+                    payload={"session_id": row["id"], "control_ref": control_ref, "status": status},
+                )
+    return {"status": "synced" if not errors else "partial", "checked": len(rows), "updated": updated, "errors": errors}
 
 
 def spawn_event_payload(
@@ -1883,6 +2166,108 @@ def cmd_agent_spawn(args: argparse.Namespace) -> int:
         print_json(result)
         return 0
 
+    if args.adapter == "claude-code":
+        launch = run_claude_background_spawn(
+            command=command,
+            root=root,
+            timeout_seconds=min(timeout_seconds, 120),
+            output_limit=output_limit,
+        )
+        control_ref = launch["control_ref"]
+        if control_ref:
+            session_id = claude_session_id_for(control_ref, role=args.role, baton_id=args.baton)
+            result["session_id"] = session_id
+        metadata = {
+            "duration_ms": launch["duration_ms"],
+            "stdout": launch["stdout"],
+            "stderr": launch["stderr"],
+            "stdout_truncated": launch["stdout_truncated"],
+            "stderr_truncated": launch["stderr_truncated"],
+            "output_limit": output_limit,
+            "control_ref": control_ref,
+            "attach_command": f"{args.claude_bin} attach {control_ref}" if control_ref else "",
+            "logs_command": f"{args.claude_bin} logs {control_ref}" if control_ref else "",
+            "stop_command": f"{args.claude_bin} stop {control_ref}" if control_ref else "",
+            "control_note": (
+                "Claude Code owns this background session. Use `claude agents`, "
+                "`claude attach <id>`, `claude logs <id>`, or `claude stop <id>` "
+                "for live control."
+            ),
+        }
+        create_agent_session_record(
+            conn,
+            session_id=session_id,
+            run_id=run["id"],
+            baton_id=args.baton,
+            role=args.role,
+            adapter=args.adapter,
+            packet_path=packet_path,
+            command=command,
+            timeout_seconds=timeout_seconds,
+            status=launch["status"],
+            control_mode="claude_bg",
+            control_ref=control_ref,
+            summary=(
+                f"Claude Code background session {control_ref or 'launch failed'} "
+                f"{launch['status']} for {args.role}"
+            ),
+            metadata=metadata,
+        )
+        conn.commit()
+        if not args.no_event:
+            emit_event(
+                conn,
+                event_type="agent.spawn.started",
+                actor=args.actor,
+                run_id=run["id"],
+                baton_id=args.baton,
+                summary=f"Claude Code spawn {launch['status']} for {args.role}",
+                payload={
+                    **spawn_event_payload(
+                        session_id=session_id,
+                        adapter=args.adapter,
+                        role=args.role,
+                        baton_id=args.baton,
+                        packet_path=packet_path,
+                        command=command,
+                        timeout_seconds=timeout_seconds,
+                        status=launch["status"],
+                        returncode=launch["returncode"],
+                        duration_ms=launch["duration_ms"],
+                    ),
+                    "control_mode": "claude_bg",
+                    "control_ref": control_ref,
+                },
+            )
+            if launch["returncode"] != 0:
+                emit_event(
+                    conn,
+                    event_type="agent.spawn.completed",
+                    actor=args.actor,
+                    run_id=run["id"],
+                    baton_id=args.baton,
+                    summary=f"Claude Code spawn {launch['status']} for {args.role}",
+                    payload=spawn_event_payload(
+                        session_id=session_id,
+                        adapter=args.adapter,
+                        role=args.role,
+                        baton_id=args.baton,
+                        packet_path=packet_path,
+                        command=command,
+                        timeout_seconds=timeout_seconds,
+                        status=launch["status"],
+                        returncode=launch["returncode"],
+                        duration_ms=launch["duration_ms"],
+                    ),
+                )
+            conn.commit()
+            result["events_recorded"] = True
+        result.update(launch)
+        result["control_mode"] = "claude_bg"
+        result["control_ref"] = control_ref
+        print_json(result)
+        return int(launch["returncode"])
+
     create_agent_session_record(
         conn,
         session_id=session_id,
@@ -1952,6 +2337,258 @@ def cmd_agent_spawn(args: argparse.Namespace) -> int:
         conn.commit()
 
     print_json(result)
+    return int(execution["returncode"])
+
+
+def list_agent_session_rows(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    recent: int,
+    adapter: str = "",
+) -> list[sqlite3.Row]:
+    where = "WHERE run_id = ?"
+    params: list[Any] = [run_id]
+    if adapter:
+        where += " AND adapter = ?"
+        params.append(adapter)
+    params.append(require_limit(recent, field="recent"))
+    return list(
+        conn.execute(
+            f"""
+            SELECT *
+            FROM agent_sessions
+            {where}
+            ORDER BY COALESCE(last_seen_at, started_at, '') DESC, id DESC
+            LIMIT ?
+            """,
+            params,
+        )
+    )
+
+
+def agent_session_public(row: sqlite3.Row) -> dict[str, Any]:
+    payload = row_to_public_dict(row) or {}
+    if payload.get("adapter") == "claude-code" and payload.get("control_ref"):
+        claude_bin = claude_bin_for_session(row)
+        payload["commands"] = {
+            "agents": f"{claude_bin} agents",
+            "attach": f"{claude_bin} attach {payload['control_ref']}",
+            "logs": f"{claude_bin} logs {payload['control_ref']}",
+            "stop": f"{claude_bin} stop {payload['control_ref']}",
+        }
+    return payload
+
+
+def cmd_agent_session_list(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    conn = connect(root, args.db)
+    run = require_run(conn)
+    if args.sync:
+        sync_claude_code_sessions(
+            conn,
+            root=root,
+            run_id=run["id"],
+            timeout_seconds=require_timeout(args.sync_timeout_seconds),
+            output_limit=require_output_limit(args.output_limit),
+            actor=args.actor,
+            emit=True,
+        )
+        conn.commit()
+    rows = list_agent_session_rows(conn, run_id=run["id"], recent=args.recent, adapter=args.adapter)
+    sessions = [agent_session_public(row) for row in rows]
+    if args.json:
+        print_json({"count": len(sessions), "sessions": sessions})
+    else:
+        print_table(
+            sessions,
+            [
+                ("id", "ID"),
+                ("role", "Role"),
+                ("baton_id", "Baton"),
+                ("adapter", "Adapter"),
+                ("status", "Status"),
+                ("control_ref", "Ref"),
+                ("last_seen_at", "Last Seen"),
+            ],
+            empty="No agent sessions recorded.",
+        )
+    return 0
+
+
+def cmd_agent_session_show(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    conn = connect(root, args.db)
+    run = require_run(conn)
+    if args.sync:
+        sync_claude_code_sessions(
+            conn,
+            root=root,
+            run_id=run["id"],
+            timeout_seconds=require_timeout(args.sync_timeout_seconds),
+            output_limit=require_output_limit(args.output_limit),
+            actor=args.actor,
+            emit=True,
+        )
+        conn.commit()
+    row = require_agent_session(conn, run["id"], args.session_id)
+    payload = agent_session_public(row)
+    if args.json:
+        print_json(payload)
+    else:
+        print_json(payload)
+    return 0
+
+
+def cmd_agent_session_sync(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    conn = connect(root, args.db)
+    run = require_run(conn)
+    if args.adapter not in {"claude-code", "all"}:
+        raise FactoryError("Only the claude-code adapter currently supports live sync.")
+    result = sync_claude_code_sessions(
+        conn,
+        root=root,
+        run_id=run["id"],
+        timeout_seconds=require_timeout(args.timeout_seconds),
+        output_limit=require_output_limit(args.output_limit),
+        actor=args.actor,
+        emit=not args.no_event,
+    )
+    conn.commit()
+    print_json(result)
+    return 0 if not result.get("errors") else 1
+
+
+def run_claude_session_command(
+    *,
+    row: sqlite3.Row,
+    action: str,
+    root: Path,
+    timeout_seconds: int,
+    output_limit: int,
+) -> dict[str, Any]:
+    if row["adapter"] != "claude-code" or not row["control_ref"]:
+        raise FactoryError("This session is not controlled by a Claude Code background-session adapter.")
+    claude_bin = claude_bin_for_session(row)
+    command = [claude_bin, action, row["control_ref"]]
+    execution = run_spawn_command(
+        command=command,
+        stdin=None,
+        root=root,
+        timeout_seconds=timeout_seconds,
+        output_limit=output_limit,
+    )
+    execution["command"] = command
+    return execution
+
+
+def cmd_agent_session_logs(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    conn = connect(root, args.db)
+    run = require_run(conn)
+    row = require_agent_session(conn, run["id"], args.session_id)
+    if row["adapter"] == "claude-code":
+        execution = run_claude_session_command(
+            row=row,
+            action="logs",
+            root=root,
+            timeout_seconds=require_timeout(args.timeout_seconds),
+            output_limit=require_output_limit(args.output_limit),
+        )
+        merge_agent_session_metadata(
+            conn,
+            session_id=row["id"],
+            values={
+                "last_logs_at": utc_now(),
+                "last_logs_stdout": execution["stdout"],
+                "last_logs_stderr": execution["stderr"],
+                "last_logs_returncode": execution["returncode"],
+            },
+        )
+        conn.commit()
+        if args.json:
+            print_json(execution)
+        else:
+            if execution["stdout"]:
+                print(execution["stdout"], end="" if execution["stdout"].endswith("\n") else "\n")
+            if execution["stderr"]:
+                print(execution["stderr"], file=sys.stderr, end="" if execution["stderr"].endswith("\n") else "\n")
+        return int(execution["returncode"])
+
+    metadata = session_metadata(row)
+    if args.json:
+        print_json(
+            {
+                "status": "recorded_output",
+                "stdout": metadata.get("stdout", ""),
+                "stderr": metadata.get("stderr", ""),
+            }
+        )
+    else:
+        stdout = str(metadata.get("stdout", ""))
+        stderr = str(metadata.get("stderr", ""))
+        if stdout:
+            print(stdout, end="" if stdout.endswith("\n") else "\n")
+        if stderr:
+            print(stderr, file=sys.stderr, end="" if stderr.endswith("\n") else "\n")
+    return 0
+
+
+def cmd_agent_session_stop(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    conn = connect(root, args.db)
+    run = require_run(conn)
+    row = require_agent_session(conn, run["id"], args.session_id)
+    execution = run_claude_session_command(
+        row=row,
+        action="stop",
+        root=root,
+        timeout_seconds=require_timeout(args.timeout_seconds),
+        output_limit=require_output_limit(args.output_limit),
+    )
+    now = utc_now()
+    status = "stopped" if execution["returncode"] == 0 else row["status"]
+    conn.execute(
+        """
+        UPDATE agent_sessions
+        SET status = ?, last_seen_at = ?, ended_at = ?, summary = ?
+        WHERE id = ?
+        """,
+        (
+            status,
+            now,
+            now if status == "stopped" else row["ended_at"],
+            "Claude Code background session stopped" if status == "stopped" else row["summary"],
+            row["id"],
+        ),
+    )
+    merge_agent_session_metadata(
+        conn,
+        session_id=row["id"],
+        values={
+            "last_stop_at": now,
+            "last_stop_stdout": execution["stdout"],
+            "last_stop_stderr": execution["stderr"],
+            "last_stop_returncode": execution["returncode"],
+        },
+    )
+    emit_event(
+        conn,
+        event_type="agent.session.stopped",
+        actor=args.actor,
+        run_id=run["id"],
+        baton_id=row["baton_id"],
+        summary=f"Claude Code session {row['control_ref']} stop returned {execution['returncode']}",
+        payload={
+            "session_id": row["id"],
+            "control_ref": row["control_ref"],
+            "returncode": execution["returncode"],
+            "status": status,
+        },
+    )
+    conn.commit()
+    print_json({"status": status, "returncode": execution["returncode"], "stdout": execution["stdout"], "stderr": execution["stderr"]})
     return int(execution["returncode"])
 
 
@@ -2873,9 +3510,18 @@ def collect_agent_sessions(conn: sqlite3.Connection, run_id: str, recent: int) -
     for row in rows:
         payload = row_to_public_dict(row) or {}
         control_mode = payload.get("control_mode") or "none"
+        if payload.get("adapter") == "claude-code" and payload.get("control_ref"):
+            claude_bin = claude_bin_for_session(row)
+            payload["commands"] = {
+                "agents": f"{claude_bin} agents",
+                "attach": f"{claude_bin} attach {payload['control_ref']}",
+                "logs": f"{claude_bin} logs {payload['control_ref']}",
+                "stop": f"{claude_bin} stop {payload['control_ref']}",
+            }
         payload["control_capabilities"] = {
             "can_record_message": True,
             "can_deliver_live_message": control_mode in {"tmux", "zellij", "pty", "codex_thread"},
+            "can_attach_live": control_mode in {"claude_bg", "tmux", "zellij", "pty", "codex_thread"},
             "mode": control_mode,
         }
         sessions.append(payload)
@@ -3091,6 +3737,14 @@ def collect_dashboard_snapshot(conn: sqlite3.Connection, root: Path, db: str | N
     run = status["run"]
     run_id = run["id"]
     operators, primary_operator = collect_operators(conn, run)
+    sync_claude_code_sessions(
+        conn,
+        root=root,
+        run_id=run_id,
+        timeout_seconds=3,
+        output_limit=DEFAULT_SPAWN_OUTPUT_LIMIT,
+    )
+    conn.commit()
     batons = [
         row
         for row in (
@@ -3694,7 +4348,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     dashboard_serve.set_defaults(func=cmd_dashboard_serve)
 
-    agent = subparsers.add_parser("agent", help="Generate portable agent packets.")
+    agent = subparsers.add_parser("agent", help="Generate packets and manage spawned agent sessions.")
     agent_sub = agent.add_subparsers(dest="agent_command", required=True)
     agent_packet = agent_sub.add_parser("packet", help="Generate a role packet for delegation.")
     agent_packet.add_argument("--role", required=True, choices=sorted(AGENT_PACKET_ROLES))
@@ -3719,7 +4373,7 @@ def build_parser() -> argparse.ArgumentParser:
     agent_packet.add_argument("--non-goal", action="append", default=[], help="Non-goal to include.")
     agent_packet.set_defaults(func=cmd_agent_packet)
 
-    agent_spawn = agent_sub.add_parser("spawn", help="Experimentally spawn a packet through an adapter.")
+    agent_spawn = agent_sub.add_parser("spawn", help="Spawn a packet through a session or process adapter.")
     agent_spawn.add_argument("--adapter", required=True, choices=sorted(AGENT_SPAWN_ADAPTERS))
     agent_spawn.add_argument("--experimental", action="store_true", help="Required to execute the adapter.")
     agent_spawn.add_argument("--dry-run", action="store_true", help="Write packet and print argv without execution.")
@@ -3758,6 +4412,78 @@ def build_parser() -> argparse.ArgumentParser:
     agent_spawn.add_argument("--codex-approval", choices=sorted(CODEX_APPROVAL_POLICIES), default="never")
     agent_spawn.add_argument("--codex-skip-git-repo-check", action="store_true")
     agent_spawn.set_defaults(func=cmd_agent_spawn)
+
+    agent_spawn.add_argument("--claude-bin", default="claude")
+    agent_spawn.add_argument("--claude-model", default="")
+    agent_spawn.add_argument("--claude-agent", default="", help="Claude Code subagent name to run as the session's main agent.")
+    agent_spawn.add_argument("--claude-permission-mode", default="", help="Optional Claude Code permission mode.")
+    agent_spawn.add_argument(
+        "--claude-worktree",
+        nargs="?",
+        const="auto",
+        default="",
+        help="Start the Claude Code session in an isolated worktree; omit the value for an auto-generated name.",
+    )
+    agent_spawn.add_argument(
+        "--claude-plugin-dir",
+        action="append",
+        default=[],
+        help="Additional Claude Code plugin directory or zip to load for this session.",
+    )
+    agent_spawn.add_argument(
+        "--claude-no-plugin-dir",
+        action="store_true",
+        help="Do not automatically load this Agentic Factory plugin with Claude Code.",
+    )
+    agent_spawn.add_argument(
+        "--claude-add-dir",
+        action="append",
+        default=[],
+        help="Additional directory to expose to the Claude Code background session.",
+    )
+
+    agent_session = agent_sub.add_parser("session", help="Inspect and control spawned agent sessions.")
+    agent_session_sub = agent_session.add_subparsers(dest="agent_session_command", required=True)
+    agent_session_list = agent_session_sub.add_parser("list", help="List recorded agent sessions.")
+    agent_session_list.add_argument("--recent", type=int, default=DEFAULT_LIST_LIMIT)
+    agent_session_list.add_argument("--adapter", choices=sorted(AGENT_SPAWN_ADAPTERS), default="")
+    agent_session_list.add_argument("--sync", action="store_true", help="Refresh Claude Code session state before listing.")
+    agent_session_list.add_argument("--sync-timeout-seconds", type=int, default=5)
+    agent_session_list.add_argument("--output-limit", type=int, default=DEFAULT_SPAWN_OUTPUT_LIMIT)
+    agent_session_list.add_argument("--actor", default="Executive")
+    agent_session_list.add_argument("--json", action="store_true")
+    agent_session_list.set_defaults(func=cmd_agent_session_list)
+
+    agent_session_show = agent_session_sub.add_parser("show", help="Show one recorded agent session.")
+    agent_session_show.add_argument("session_id")
+    agent_session_show.add_argument("--sync", action="store_true", help="Refresh Claude Code session state before showing.")
+    agent_session_show.add_argument("--sync-timeout-seconds", type=int, default=5)
+    agent_session_show.add_argument("--output-limit", type=int, default=DEFAULT_SPAWN_OUTPUT_LIMIT)
+    agent_session_show.add_argument("--actor", default="Executive")
+    agent_session_show.add_argument("--json", action="store_true")
+    agent_session_show.set_defaults(func=cmd_agent_session_show)
+
+    agent_session_sync = agent_session_sub.add_parser("sync", help="Refresh live adapter session state into the DB.")
+    agent_session_sync.add_argument("--adapter", choices=["all", "claude-code"], default="claude-code")
+    agent_session_sync.add_argument("--timeout-seconds", type=int, default=5)
+    agent_session_sync.add_argument("--output-limit", type=int, default=DEFAULT_SPAWN_OUTPUT_LIMIT)
+    agent_session_sync.add_argument("--actor", default="Executive")
+    agent_session_sync.add_argument("--no-event", action="store_true")
+    agent_session_sync.set_defaults(func=cmd_agent_session_sync)
+
+    agent_session_logs = agent_session_sub.add_parser("logs", help="Show recent output for an agent session.")
+    agent_session_logs.add_argument("session_id")
+    agent_session_logs.add_argument("--timeout-seconds", type=int, default=10)
+    agent_session_logs.add_argument("--output-limit", type=int, default=DEFAULT_SPAWN_OUTPUT_LIMIT)
+    agent_session_logs.add_argument("--json", action="store_true")
+    agent_session_logs.set_defaults(func=cmd_agent_session_logs)
+
+    agent_session_stop = agent_session_sub.add_parser("stop", help="Stop a live agent session when the adapter supports it.")
+    agent_session_stop.add_argument("session_id")
+    agent_session_stop.add_argument("--timeout-seconds", type=int, default=10)
+    agent_session_stop.add_argument("--output-limit", type=int, default=DEFAULT_SPAWN_OUTPUT_LIMIT)
+    agent_session_stop.add_argument("--actor", default="Executive")
+    agent_session_stop.set_defaults(func=cmd_agent_session_stop)
 
     event = subparsers.add_parser("event", help="Record a raw event.")
     event_sub = event.add_subparsers(dest="event_command", required=True)

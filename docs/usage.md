@@ -3,8 +3,8 @@
 This guide shows the durable Agentic Factory lifecycle. In the primary Codex
 app mode, the Executive, Builder, Reviewer, and Ledger roles emit these CLI
 commands as part of an orchestrated run. In other runtimes, a lead agent can use
-the same commands with that runtime's sub-agent mechanism or simulate the roles
-serially.
+the same commands with that runtime's sub-agent mechanism, visible background
+sessions, or serial role boundaries.
 
 Use `agentic-factory-orchestration` when deciding runtime mode, work mode,
 roles, review depth, and verification policy. Use `agentic-factory` when
@@ -19,12 +19,15 @@ Before assigning a baton, choose the safest available runtime mode:
   capabilities for role-specific workers.
 - `agent_cli_subagents`: use another agent CLI's delegation mechanism after
   capability preflight, usually with generated agent packets.
-- `serial_single_agent`: perform roles sequentially when delegation is not
+- `adapter_spawn`: use a first-class session-backed adapter, especially
+  `claude-code`, when the CLI exposes visible background sessions through shell
+  commands.
+- `serial_single_agent`: perform roles sequentially only when delegation is not
   available or not safe.
 - `manual_protocol`: run commands directly for tests, examples, and debugging.
 
-The CLI records state transitions. It does not directly spawn arbitrary worker
-processes.
+The CLI records state transitions and can launch explicitly selected
+session/process adapters. It does not spawn arbitrary worker processes.
 
 ## Agent-CLI Factory Floor Startup
 
@@ -99,8 +102,9 @@ By default, baton creation acquires the `main-worktree` lock. Use
 In `codex_native` mode, the Executive normally records this baton before
 delegating the scoped prompt to a Builder worker. In `agent_cli_subagents`, the
 lead agent should pass the same baton scope through that CLI's delegation
-mechanism. In `serial_single_agent`, keep the Builder role boundary explicit
-before editing.
+mechanism. In Claude Code CLI workflows, prefer a visible background session
+for substantial Builder/Reviewer work. In `serial_single_agent`, keep the
+Builder role boundary explicit before editing.
 
 ## Generate Agent Packets
 
@@ -134,11 +138,28 @@ python3 /path/to/agentic-factory/scripts/factory.py agent packet \
 Use `--format json` when another tool needs structured packet data. See
 [Agent Packets](agent-packets.md) for packet fields and runtime guidance.
 
-## Spawn Through Experimental Adapters
+## Spawn Through Session Adapters
 
-Adapters are optional process-level bridges for runtimes that need to launch an
-external agent CLI with a packet file. Prefer Codex-native orchestration when
-available.
+Adapters are optional session/process bridges for runtimes that need to launch
+an external agent CLI with a packet file. Prefer Codex-native orchestration
+when available.
+
+Claude Code background session:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py agent spawn \
+  --adapter claude-code \
+  --role builder \
+  --baton B-001 \
+  --experimental
+```
+
+Refresh and inspect sessions:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py agent session list --sync --json
+python3 /path/to/agentic-factory/scripts/factory.py agent session logs claude-7c5dcf5d
+```
 
 Preview first:
 
@@ -188,11 +209,12 @@ python3 /path/to/agentic-factory/scripts/factory.py dashboard serve \
   --open
 ```
 
-For process adapters, dashboard session messages are recorded as
-`agent.message.requested` events. Operator command-seat messages are recorded
-as `operator.message.requested` events. Selected baton messages are recorded as
-`baton.message.requested` events. They are not live terminal input unless a
-future session-backed adapter provides a live transport.
+For process adapters and Claude Code background sessions, dashboard session
+messages are recorded as `agent.message.requested` events. Operator
+command-seat messages are recorded as `operator.message.requested` events.
+Selected baton messages are recorded as `baton.message.requested` events. They
+are not live terminal input. Attach to a live Claude session when direct
+conversation is needed.
 
 In agent CLI workflows, the lead agent should inspect new dashboard control
 events before creating batons, accepting work, or continuing after handoffs:

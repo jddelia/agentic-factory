@@ -98,10 +98,11 @@ operators are `Executive`, `Lead Agent`, `Principal Partner`, `Ledger`, and
 
 ### `agent_sessions`
 
-Durable registry for spawned or session-backed workers. Current process
-adapters create rows here for dashboard visibility. Future tmux, Zellij, PTY,
-or Codex-thread adapters should update the same table rather than inventing a
-parallel registry.
+Durable registry for spawned or session-backed workers. Process adapters create
+rows here for dashboard visibility. Session-backed adapters such as
+`claude-code` store the external session id in `control_ref`. Future tmux,
+Zellij, PTY, or Codex-thread adapters should update the same table rather than
+inventing a parallel registry.
 
 | Column | Type | Notes |
 | --- | --- | --- |
@@ -109,11 +110,11 @@ parallel registry.
 | `run_id` | TEXT NOT NULL | References `factory_runs(id)`. |
 | `baton_id` | TEXT | Optional reference to `batons(id)`. |
 | `role` | TEXT NOT NULL | `builder`, `reviewer`, or `executive`. |
-| `adapter` | TEXT NOT NULL | Adapter name such as `custom` or `codex-cli`. |
+| `adapter` | TEXT NOT NULL | Adapter name such as `custom`, `codex-cli`, or `claude-code`. |
 | `label` | TEXT NOT NULL DEFAULT '' | Human-readable dashboard label. |
 | `status` | TEXT NOT NULL DEFAULT 'planned' | `planned`, `running`, `completed`, `failed`, `timed_out`, or adapter-specific status. |
-| `control_mode` | TEXT NOT NULL DEFAULT 'none' | `process` for current spawn adapters; future values may include `tmux`, `zellij`, `pty`, or `codex_thread`. |
-| `control_ref` | TEXT NOT NULL DEFAULT '' | Adapter-specific target such as a pane ID, socket path, or thread ID. |
+| `control_mode` | TEXT NOT NULL DEFAULT 'none' | `process` for one-shot process adapters, `claude_bg` for Claude Code background sessions, and future values such as `tmux`, `zellij`, `pty`, or `codex_thread`. |
+| `control_ref` | TEXT NOT NULL DEFAULT '' | Adapter-specific target such as a Claude Code session id, pane ID, socket path, or thread ID. |
 | `packet_path` | TEXT NOT NULL DEFAULT '' | Generated packet path. |
 | `command_json` | TEXT NOT NULL DEFAULT '[]' | JSON argv array. |
 | `started_at` | TEXT | UTC timestamp when execution/session started. |
@@ -121,7 +122,7 @@ parallel registry.
 | `ended_at` | TEXT | UTC timestamp when execution/session ended. |
 | `exit_code` | INTEGER | Process exit code when known. |
 | `summary` | TEXT NOT NULL DEFAULT '' | Latest session summary. |
-| `metadata_json` | TEXT NOT NULL DEFAULT '{}' | Extension data, including bounded stdout/stderr for process adapters. |
+| `metadata_json` | TEXT NOT NULL DEFAULT '{}' | Extension data, including bounded stdout/stderr for process adapters and attach/log/stop references or synced Claude Code state for `claude-code`. |
 
 ### `batons`
 
@@ -320,8 +321,10 @@ The CLI writes these event types directly:
 | `factory.resumed` | `resume` | Resume reason. | `reason`. |
 | `lock.acquired` | `lock acquire` | Lock holder summary. | `lock`. |
 | `lock.released` | `lock release` | Lock release summary. | `lock`. |
-| `agent.spawn.started` | `agent spawn` | Adapter, role, and start status. | `session_id`, `adapter`, `role`, `baton_id`, `packet_path`, `timeout_seconds`, `command_preview`. |
+| `agent.spawn.started` | `agent spawn` | Adapter, role, and start status. | `session_id`, `adapter`, `role`, `baton_id`, `packet_path`, `timeout_seconds`, `command_preview`, `control_mode`, `control_ref` when available. |
 | `agent.spawn.completed` | `agent spawn` | Adapter, role, and terminal status. | `session_id`, `adapter`, `role`, `baton_id`, `packet_path`, `timeout_seconds`, `command_preview`, `status`, `returncode`, `duration_ms`. |
+| `agent.session.synced` | `agent session sync` | Live adapter state refreshed into the DB. | `session_id`, `control_ref`, `status`. |
+| `agent.session.stopped` | `agent session stop` | Live adapter stop request completed. | `session_id`, `control_ref`, `returncode`, `status`. |
 | `agent.message.requested` | Dashboard control API | Dashboard session message request. | `session_id`, `message`, `delivery`, `control_mode`, `control_ref`. |
 | `operator.message.requested` | Dashboard control API | Top-level operator message request. | `operator_id`, `role`, `name`, `message`, `delivery`, `control_mode`. |
 | `baton.message.requested` | Dashboard control API | Baton-owner message request. | `baton_id`, `owner`, `message`, `delivery`, `control_mode`. |

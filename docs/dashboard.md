@@ -130,6 +130,7 @@ The first dashboard version includes:
   adapter session exists;
 - agent session list and detail pane;
 - packet path and adapter command preview for spawned sessions;
+- attach/log/stop command references for Claude Code background sessions;
 - bounded stdout/stderr for completed adapter sessions;
 - verification and review evidence;
 - recent event stream;
@@ -151,37 +152,42 @@ live terminal in every runtime.
 
 ## Agent Sessions
 
-Real `factory.py agent spawn` executions now create rows in `agent_sessions`.
-The dashboard reads those rows to show visible workers even when the underlying
-runtime is a generic process.
+Real `factory.py agent spawn` executions create rows in `agent_sessions`. The
+dashboard reads those rows to show visible workers even when the underlying
+runtime is a generic process or external background-session supervisor.
 
-Current process adapters record:
+Current session records include:
 
 - session ID;
 - role;
 - baton ID;
 - adapter;
 - status;
+- control mode and external control reference;
 - packet path;
 - command argv;
 - bounded output;
 - start, last-seen, and end timestamps.
 
-These rows are a durable registry, not a full terminal transport. Live terminal
-delivery requires a future session-backed adapter such as tmux, Zellij, PTY, or
-Codex-native thread integration.
+Process adapters are a durable registry, not a full terminal transport. Claude
+Code background sessions use `control_mode: claude_bg` and show attach/log/stop
+commands in the detail pane. The snapshot endpoint refreshes active Claude Code
+session state with bounded `claude agents --json` sync when such sessions are
+present.
 
 ## Message Controls
 
 When the dashboard is started in control mode, the operator command seat can
 record `operator.message.requested` events, selected batons can record
 `baton.message.requested` events, and session detail panes can record
-`agent.message.requested` events. For process adapters, delivery is
-`recorded_only`.
+`agent.message.requested` events. For process adapters and Claude Code
+background sessions, dashboard message delivery is `recorded_only`.
 
 That is intentional. The dashboard does not pretend that a completed or
-noninteractive process can receive live input. Future session-backed adapters
-can upgrade the same control path to live delivery.
+noninteractive process can receive live input. For Claude Code background
+sessions, attach to the live session through Claude's own session UI or
+`claude attach <id>` when a true conversation is needed. Future transport
+adapters can upgrade the same control path to direct live delivery.
 
 The dashboard also renders a control inbox from recent message events. In
 generic agent CLI workflows, the lead agent must poll or inspect those control

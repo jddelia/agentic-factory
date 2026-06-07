@@ -136,9 +136,9 @@ Supported values match [Runtime Modes](runtime-modes.md):
 - `manual_protocol`
 - `adapter_spawn`
 
-`adapter_spawn` is experimental and opt-in. The packet command still only
-renders instructions; use [Agent Adapters](agent-adapters.md) for process-level
-execution.
+`adapter_spawn` is explicit and opt-in. The packet command still only renders
+instructions; use [Agent Adapters](agent-adapters.md) for session-backed or
+process-level execution, including Claude Code background sessions.
 
 ## Builder Packet Use
 

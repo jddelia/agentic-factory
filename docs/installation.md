@@ -64,11 +64,13 @@ remains the durable state layer in every mode.
 
 Other agent CLIs can still use the plugin by following the same baton,
 handoff, review, and verification protocol with their own delegation features.
-When delegation is unavailable or unsafe, one agent can run the roles serially.
+When visible background sessions are available, such as Claude Code background
+sessions, prefer separate worker sessions for substantial work. When delegation
+is unavailable or unsafe, one agent can run the roles serially.
 Use [Agent Packets](agent-packets.md) when a non-Codex runtime needs a concrete
 role prompt for Builder, Reviewer, or Executive work.
-Use [Agent Adapters](agent-adapters.md) only when an experimental process-level
-bridge to an external agent CLI is explicitly desired.
+Use [Agent Adapters](agent-adapters.md) when an explicit session/process bridge
+to an external agent CLI is desired.
 Use [Dashboard](dashboard.md) when a non-Codex or generic agent-CLI workflow
 needs a visible local factory floor.
 

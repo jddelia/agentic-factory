@@ -1,6 +1,6 @@
 ---
 name: agentic-factory
-description: "Use when directly bootstrapping, recording, querying, validating, rendering, generating portable packets, opening the local dashboard, or dry-running/using experimental adapters from Agentic Factory SQLite state with scripts/factory.py: up, init, status, doctor, dashboard, baton, agent packet, agent spawn, verification, review, pause/resume, lock, event, and render-ledger commands."
+description: "Use when directly bootstrapping, recording, querying, validating, rendering, generating portable packets, opening the local dashboard, or using session/process adapters from Agentic Factory SQLite state with scripts/factory.py: up, init, status, doctor, dashboard, baton, agent packet, agent spawn, agent session, verification, review, pause/resume, lock, event, and render-ledger commands."
 ---
 
 # Agentic Factory
@@ -16,7 +16,8 @@ This skill does not spawn agents or choose worker topology. In Codex-native
 factory runs, the orchestration skill uses host delegation capabilities and this
 skill records the resulting state transitions. In other runtimes, the lead
 agent may use an agent CLI's own sub-agent mechanism, generated agent packets,
-experimental adapters, or serial role simulation while using the same records.
+session/process adapters, or serial role simulation while using the same
+records.
 The local dashboard can provide factory-floor visibility for those non-Codex
 or adapter-heavy workflows.
 
@@ -260,8 +261,33 @@ rendered instructions and command templates; they do not spawn workers.
 ## Experimental Adapters
 
 Use adapters only when the host runtime cannot provide safer native delegation
-and the user or project explicitly wants a process-level bridge. Always dry-run
-first:
+and the user or project explicitly wants a session/process bridge. Prefer
+first-class session-backed adapters over generic process commands when
+available.
+
+For Claude Code CLI background sessions:
+
+```bash
+python3 <plugin-root>/scripts/factory.py agent spawn \
+  --adapter claude-code \
+  --role builder \
+  --baton B-001 \
+  --experimental
+```
+
+Then refresh, inspect, log, or stop the live session:
+
+```bash
+python3 <plugin-root>/scripts/factory.py agent session list --sync --json
+python3 <plugin-root>/scripts/factory.py agent session show claude-<id> --json
+python3 <plugin-root>/scripts/factory.py agent session logs claude-<id>
+python3 <plugin-root>/scripts/factory.py agent session stop claude-<id>
+```
+
+Use `--claude-worktree` only when isolated write worktrees and merge handling
+are intentional.
+
+For custom process commands, always dry-run first:
 
 ```bash
 python3 <plugin-root>/scripts/factory.py agent spawn \
@@ -295,9 +321,9 @@ python3 <plugin-root>/scripts/factory.py agent spawn \
 ```
 
 Adapters write packet files under `.agentic-factory/packets/`, run without
-`shell=True`, enforce timeouts, capture bounded output, and record
-`agent_sessions` rows plus `agent.spawn.started` / `agent.spawn.completed`
-events for real executions unless `--no-event` is supplied.
+`shell=True`, enforce bounded launch/process timeouts, capture bounded output,
+and record `agent_sessions` rows plus spawn/session events for real executions
+unless `--no-event` is supplied.
 
 ## Pause, Resume, And Ledger
 

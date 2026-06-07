@@ -16,3 +16,4 @@ docs/build_ledger.md
 *.sqlite
 *.sqlite3
 *.db
+docs/vision.md

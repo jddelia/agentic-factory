@@ -32,7 +32,9 @@ bootstrap.
 The dashboard is a local factory floor. It should show the top-level operator
 prominently, then make batons, worker sessions, events, verification, reviews,
 and ledger state easy to inspect. It records control requests honestly as
-events unless a future session-backed adapter provides live delivery.
+events unless a transport can truly deliver live input. Claude Code background
+sessions should be shown as attachable live sessions with explicit attach,
+logs, and stop commands.
 
 ## Technical Direction
 

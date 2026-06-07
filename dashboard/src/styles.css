@@ -843,6 +843,8 @@ dd {
 }
 
 .command-block,
+.session-control-strip,
+.session-note,
 .message-box,
 .output-pane,
 .ledger-preview {
@@ -855,12 +857,34 @@ dd {
 }
 
 .command-block span,
+.session-control-strip span,
 .output-pane span,
 .message-box label {
   color: var(--muted);
   font-size: 0.72rem;
   font-weight: 800;
   text-transform: uppercase;
+}
+
+.session-control-strip {
+  display: grid;
+  gap: 8px;
+}
+
+.session-control-strip > div {
+  display: grid;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-quiet);
+}
+
+.session-note {
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-weight: 650;
+  line-height: 1.45;
 }
 
 code,

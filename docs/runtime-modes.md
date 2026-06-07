@@ -13,8 +13,9 @@ factory operating model from worker creation:
   recovery behavior.
 - `agentic-factory` is the durable state and CLI contract. It records batons,
   handoffs, verification, reviews, locks, pauses, resumes, and rendered ledgers.
-- The host runtime owns worker creation. The core CLI does not directly spawn
-  arbitrary agent processes.
+- The host runtime owns native worker creation. The CLI can also launch
+  explicitly selected session/process adapters when native delegation is not
+  available.
 - Agent packets provide portable delegation prompts for runtimes that need a
   concrete sub-agent handoff contract.
 
@@ -38,9 +39,10 @@ Expected behavior:
 
 ### `agent_cli_subagents`
 
-Use this mode when another agent CLI provides its own sub-agent or delegation
-mechanism. The lead agent should use that CLI's native mechanism and pass a
-compact baton or review packet generated from current factory state.
+Use this mode when another agent CLI provides its own sub-agent, background
+session, or delegation mechanism. The lead agent should use that CLI's native
+mechanism when available and pass a compact baton or review packet generated
+from current factory state.
 
 This mode should still be agent-driven. The user invokes the plugin through the
 agent; the orchestration skill resolves the objective, mode, topology, and
@@ -57,8 +59,11 @@ CLI behaves like Codex. Before delegation, the lead agent must determine:
 - how the lead receives handoff output;
 - how the lead cancels, pauses, or recovers stale workers.
 
-If any of those answers are unclear and the work is risky, use
-`serial_single_agent` or ask the user before launching external processes.
+If the CLI exposes visible background sessions, such as Claude Code's
+background agents, prefer separate sessions over `serial_single_agent` for
+substantial work. Context isolation is a core factory benefit. If workspace,
+permission, or recovery behavior is unclear and the work is risky, pause or use
+`serial_single_agent` until the ambiguity is resolved.
 
 Packet bridge:
 
@@ -91,8 +96,10 @@ the Executive, Builder, Reviewer, and Ledger responsibilities serially. Keep the
 role boundaries explicit and record the same durable CLI events.
 
 Serial mode is valid for small or constrained tasks. It is not the preferred
-mode for substantial work because review independence and concurrency are
-weaker.
+mode for substantial work because review independence, context isolation, and
+factory visibility are weaker. Do not choose serial mode merely because workers
+do not inherit plugin context; generated packets and session-backed adapters are
+designed to carry that context explicitly.
 
 ### `manual_protocol`
 
@@ -105,10 +112,10 @@ not the primary user experience.
 
 ### `adapter_spawn`
 
-This mode is reserved for future optional adapters that may launch external
-agent CLI processes. It is experimental and opt-in.
+This mode is for optional adapters that launch external agent CLI sessions or
+processes from generated packets. It is explicit and opt-in.
 
-Adapters should remain opt-in because process-level spawning has additional
+Adapters should remain deliberate because external spawning has additional
 risks: authentication differences, sandbox mismatch, command hangs,
 unstructured output, cancellation complexity, shared-worktree collisions, and
 unclear credential inheritance.
@@ -117,7 +124,9 @@ Use `factory.py agent spawn --dry-run` before execution, and require
 `--experimental` for real adapter runs. See [Agent Adapters](agent-adapters.md)
 for the full safety contract.
 
-Real adapter executions also create `agent_sessions` rows. The optional
+Real adapter executions also create `agent_sessions` rows. Session-backed
+adapters such as `claude-code` return quickly with an attachable external
+session id; process adapters remain visible as bounded command executions. The
 dashboard reads those rows to provide a visible process/session registry for
 generic agent CLI workflows.
 
@@ -165,6 +174,8 @@ Prefer modes in this order:
 
 1. `codex_native` for full Codex app utility.
 2. `agent_cli_subagents` when the host CLI has clear, safe delegation support.
-3. `serial_single_agent` when delegation is unavailable or ambiguous.
-4. `manual_protocol` for tests, examples, and debugging.
-5. `adapter_spawn` only for explicit experimental adapters.
+3. `adapter_spawn` with a session-backed adapter, especially `claude-code`,
+   when native CLI delegation is best reached through a controlled background
+   session.
+4. `serial_single_agent` when delegation is unavailable, unsafe, or ambiguous.
+5. `manual_protocol` for tests, examples, and debugging.

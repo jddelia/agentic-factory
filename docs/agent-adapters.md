@@ -1,9 +1,8 @@
 # Agent Adapters
 
-Agent adapters are an experimental, opt-in bridge from Agentic Factory packets
-to external agent CLI processes. They are useful when a runtime does not provide
-Codex-native thread orchestration but can run a separate agent process from the
-shell.
+Agent adapters bridge Agentic Factory packets to external agent CLI sessions or
+processes. They are useful when a runtime does not provide Codex-native visible
+threads but can run a separate local agent session from the shell.
 
 Adapters are not the primary runtime model. Prefer Codex-native orchestration
 when available. Use adapters only when the workspace, credentials, sandbox,
@@ -19,14 +18,15 @@ timeouts, and recovery behavior are understood.
 - expands only documented placeholders for custom commands;
 - requires `--experimental` for real execution;
 - supports `--dry-run` for preview;
-- enforces a timeout;
-- captures bounded stdout and stderr;
+- enforces bounded launch or process timeouts;
+- captures bounded launch/process stdout and stderr;
 - creates an `agent_sessions` row for real executions;
 - records `agent.spawn.started` and `agent.spawn.completed` events for real
   executions unless `--no-event` is supplied.
 
-The command does not create a native Codex app thread. It launches a local
-process.
+Session-backed adapters may return immediately with a live external session
+reference. Process adapters block until the child exits. The command does not
+create a native Codex app thread.
 
 ## Dry Run First
 
@@ -69,6 +69,52 @@ Supported placeholders:
 
 Unknown placeholders fail fast. `{packet}` is required so the spawned process
 receives the delegation contract.
+
+## Claude Code Background-Session Adapter
+
+Use `claude-code` when the local Claude Code CLI is installed, authenticated,
+and supports background sessions:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py agent spawn \
+  --adapter claude-code \
+  --role builder \
+  --baton B-001 \
+  --experimental
+```
+
+The adapter launches `claude --bg`, loads this plugin with `--plugin-dir` by
+default, writes a packet file, and asks the new background session to read that
+packet. On success it returns quickly with:
+
+- the Agentic Factory session id;
+- the Claude Code background session id in `control_ref`;
+- `claude attach <id>`, `claude logs <id>`, and `claude stop <id>` commands in
+  session metadata;
+- an `agent_sessions` row with `control_mode: claude_bg`.
+
+Useful options:
+
+```bash
+--claude-bin claude
+--claude-model sonnet
+--claude-agent builder
+--claude-permission-mode plan
+--claude-worktree
+--claude-worktree feature-baton-001
+--claude-plugin-dir /path/to/another-plugin
+--claude-no-plugin-dir
+--claude-add-dir /path/to/shared-context
+```
+
+Use `--claude-worktree` for isolated write-capable work when the merge plan is
+clear. Without it, the factory lock still enforces the one-writer rule for the
+shared worktree.
+
+The adapter follows the current Claude Code CLI background-session contract:
+`claude --bg` starts a visible background session, `claude agents --json`
+reports session state, and `claude attach`, `claude logs`, and `claude stop`
+control that session.
 
 ## Codex CLI Adapter
 
@@ -137,7 +183,9 @@ return exit code `127`.
 Real executions record:
 
 - `agent.spawn.started`
-- `agent.spawn.completed`
+- `agent.spawn.completed` for process adapters and failed session launches
+- `agent.session.synced` when live adapter state is refreshed
+- `agent.session.stopped` when a live session is stopped through the CLI
 
 The event payload includes session id, adapter, role, baton id, packet path,
 timeout, command preview, status, return code, and duration.
@@ -159,8 +207,37 @@ python3 /path/to/agentic-factory/scripts/factory.py dashboard serve --open
 
 Process adapters are visible but not live-steerable. Dashboard message controls
 are enabled by default and record `agent.message.requested` events unless a
-future session-backed adapter provides live delivery. Start the dashboard with
-`--read-only` when those control records should be disabled.
+future transport provides live delivery. Claude Code background sessions are
+attachable: the dashboard shows attach/log/stop commands, and snapshots refresh
+active Claude Code session state through bounded `claude agents --json` sync.
+Start the dashboard with `--read-only` when control records should be disabled.
+
+## Session Inspection
+
+List sessions:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py agent session list --sync
+```
+
+Show one session:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py agent session show claude-7c5dcf5d --json
+```
+
+Refresh live adapter state:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py agent session sync --adapter claude-code
+```
+
+Read logs or stop a live Claude Code session:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py agent session logs claude-7c5dcf5d
+python3 /path/to/agentic-factory/scripts/factory.py agent session stop claude-7c5dcf5d
+```
 
 ## When Not To Use Adapters
 

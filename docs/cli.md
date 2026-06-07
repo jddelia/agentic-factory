@@ -30,7 +30,7 @@ positional arguments:
     up                  Initialize the factory floor and serve the local dashboard.
     status              Show current factory state.
     dashboard           Inspect or serve the local factory dashboard.
-    agent               Generate portable agent packets.
+    agent               Generate packets and manage spawned agent sessions.
     event               Record a raw event.
     baton               Create, hand off, or accept batons.
     verify              Record verification commands.
@@ -365,15 +365,16 @@ Common failures:
 ## `factory.py agent`
 
 ```text
-usage: factory.py agent [-h] {packet,spawn} ...
+usage: factory.py agent [-h] {packet,spawn,session} ...
 
 positional arguments:
-  {packet,spawn}
-    packet        Generate a role packet for delegation.
-    spawn         Experimentally spawn a packet through an adapter.
+  {packet,spawn,session}
+    packet              Generate a role packet for delegation.
+    spawn               Spawn a packet through a session or process adapter.
+    session             Inspect and control spawned agent sessions.
 
 options:
-  -h, --help      show this help message and exit
+  -h, --help            show this help message and exit
 ```
 
 ## `factory.py agent packet`
@@ -436,8 +437,8 @@ Common failures:
 ## `factory.py agent spawn`
 
 ```text
-usage: factory.py agent spawn [-h] --adapter {codex-cli,custom} [--experimental] [--dry-run]
-                              --role {builder,executive,reviewer} [--baton BATON]
+usage: factory.py agent spawn [-h] --adapter {claude-code,codex-cli,custom} [--experimental]
+                              [--dry-run] --role {builder,executive,reviewer} [--baton BATON]
                               [--recent RECENT] [--packet-format {json,markdown}]
                               [--packet-dir PACKET_DIR] [--write-policy {auto,read-only,write}]
                               [--allowed ALLOWED] [--restricted RESTRICTED]
@@ -449,11 +450,16 @@ usage: factory.py agent spawn [-h] --adapter {codex-cli,custom} [--experimental]
                               [--codex-profile CODEX_PROFILE]
                               [--codex-sandbox {auto,read-only,workspace-write}]
                               [--codex-approval {never,on-failure,on-request,untrusted}]
-                              [--codex-skip-git-repo-check]
+                              [--codex-skip-git-repo-check] [--claude-bin CLAUDE_BIN]
+                              [--claude-model CLAUDE_MODEL] [--claude-agent CLAUDE_AGENT]
+                              [--claude-permission-mode CLAUDE_PERMISSION_MODE]
+                              [--claude-worktree [CLAUDE_WORKTREE]]
+                              [--claude-plugin-dir CLAUDE_PLUGIN_DIR] [--claude-no-plugin-dir]
+                              [--claude-add-dir CLAUDE_ADD_DIR]
 
 options:
   -h, --help            show this help message and exit
-  --adapter {codex-cli,custom}
+  --adapter {claude-code,codex-cli,custom}
   --experimental        Required to execute the adapter.
   --dry-run             Write packet and print argv without execution.
   --role {builder,executive,reviewer}
@@ -482,6 +488,21 @@ options:
   --codex-sandbox {auto,read-only,workspace-write}
   --codex-approval {never,on-failure,on-request,untrusted}
   --codex-skip-git-repo-check
+  --claude-bin CLAUDE_BIN
+  --claude-model CLAUDE_MODEL
+  --claude-agent CLAUDE_AGENT
+                        Claude Code subagent name to run as the session's main agent.
+  --claude-permission-mode CLAUDE_PERMISSION_MODE
+                        Optional Claude Code permission mode.
+  --claude-worktree [CLAUDE_WORKTREE]
+                        Start the Claude Code session in an isolated worktree; omit the value for
+                        an auto-generated name.
+  --claude-plugin-dir CLAUDE_PLUGIN_DIR
+                        Additional Claude Code plugin directory or zip to load for this session.
+  --claude-no-plugin-dir
+                        Do not automatically load this Agentic Factory plugin with Claude Code.
+  --claude-add-dir CLAUDE_ADD_DIR
+                        Additional directory to expose to the Claude Code background session.
 ```
 
 Required arguments: `--adapter`, `--role`.

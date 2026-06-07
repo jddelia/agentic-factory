@@ -12,11 +12,12 @@ operations and one skill for full software-factory orchestration. Earlier local
 versions referenced a private `software-factory-v2` skill; this repository does
 not require that skill and does not ship a conflicting copy of it.
 
-The CLI is the factory control plane and ledger. It does not need to know how
-every host runtime spawns workers. The orchestration skill chooses the best
-runtime mode: Codex-native delegation when available, another agent CLI's
-sub-agent mechanism when safe, serial role simulation when necessary, or manual
-protocol execution for testing and debugging.
+The CLI is the factory control plane and ledger. The orchestration skill
+chooses the best runtime mode: Codex-native delegation when available, another
+agent CLI's sub-agent or background-session mechanism when safe, a first-class
+session adapter such as Claude Code background sessions when useful, serial role
+simulation only when necessary, or manual protocol execution for testing and
+debugging.
 
 ## What It Provides
 
@@ -26,7 +27,8 @@ protocol execution for testing and debugging.
 - Direct inspection commands for batons, events, verification, and reviews
 - Agent-facing `up` bootstrap for CLI-hosted factory floors
 - Agent packet generation for portable Builder, Reviewer, and Executive handoffs
-- Experimental adapter spawning for packet-based external agent CLI delegation
+- Session/process adapter spawning for packet-based external agent CLI delegation
+- Claude Code background-session adapter with sync, logs, and stop commands
 - Dependency-free local dashboard for agent-CLI factory-floor visibility
 - Top-level operator command seat derived from runtime mode and topology
 - Project-local config through `.agentic-factory/config.json`
@@ -98,6 +100,18 @@ python3 /path/to/agentic-factory/scripts/factory.py up \
 with controls enabled by default, records a ready checkpoint, prints the
 dashboard URL and top-level operator, then returns so the agent can pause for
 the user to review setup before factory operations begin.
+
+When Claude Code CLI is the host and Codex-native visible threads are not
+available, the lead agent can create a visible worker session from a baton
+packet:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py agent spawn \
+  --adapter claude-code \
+  --role builder \
+  --baton B-001 \
+  --experimental
+```
 
 For manual protocol testing or a direct CLI smoke check, run commands from the
 target project root with the installed plugin directory:
