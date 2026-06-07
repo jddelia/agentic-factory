@@ -21,6 +21,40 @@ features, generated agent packets, or serial role simulation. The `factory.py`
 CLI records state, renders packets, can expose an optional dashboard, and can
 run explicitly authorized experimental adapter spawns.
 
+## Required Sequence
+
+This sequence is a contract, not a recommendation. Violating it is incorrect
+behavior regardless of task size, project clarity, or implementation urgency.
+
+For generic agent CLI runtimes, or whenever Codex-native visible worker threads
+are not available, follow these hard stops in order:
+
+1. Inspect only enough project and factory state to identify the repository,
+   existing `.agentic-factory` state, dirty worktree, obvious stack, likely
+   checks, and available runtime/delegation capabilities.
+2. Resolve the startup configuration: objective, hard constraints, work mode,
+   topology, runtime mode, verification policy, and dashboard policy. Inferring
+   safe defaults is allowed; skipping presentation of those defaults is not.
+3. Present the resolved startup brief to the user and ask for confirmation or
+   missing information in normal chat. Ask at most three questions. Do not use
+   a special user-input tool unless the runtime explicitly provides one.
+4. After confirmation, run `factory.py up` from the target project root. In
+   agent-CLI dashboard workflows, `up` is the first mutating factory command.
+5. PAUSE. Present the dashboard URL, run ID, project root, topology, runtime
+   mode, control state, and top-level operator. Wait for the user to say that
+   factory operations may begin.
+6. Only after the user confirms readiness, run `status --compact`, `doctor`,
+   create the first baton, generate packets, spawn workers, or edit project
+   files.
+
+Before step 5 is complete, do not run `baton create`, `agent packet`,
+`agent spawn`, implementation commands, file edits, or acceptance commands.
+
+For Codex-native runtimes with visible native worker threads, use native
+thread orchestration as the primary UI. Durable state is still required, but
+`init` may replace `up` only when the Codex app already provides the visible
+factory floor and the user does not need the local dashboard.
+
 ## Outcome
 
 Create a factory that matches the project's risk, maturity, and delivery target:
@@ -78,7 +112,8 @@ user request, project docs, tests, risk surface, and local tool constraints.
 7. Assign only the roles needed for the chosen topology and runtime mode.
 
 Ask at most three short questions when required. If the user's request gives
-enough signal, infer and proceed.
+enough signal, infer defaults, present them for confirmation, then proceed only
+after the required startup sequence allows it.
 
 ## Runtime Modes
 

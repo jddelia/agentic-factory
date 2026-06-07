@@ -18,4 +18,7 @@
 - Added agent-facing `factory.py up` bootstrap for generic agent CLI factory
   floors, including readiness checkpoint, dashboard startup, and
   pause-before-operations flow.
+- Strengthened skill startup gates so agent CLI factories must present setup,
+  run `factory.py up`, show the dashboard/operator state, and wait for user
+  readiness before batons or edits.
 - Added SQLite-backed factory CLI, schema migration, templates, and tests.

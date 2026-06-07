@@ -50,6 +50,11 @@ creating the first work baton.
 Use `--read-only` for observation-only dashboards. Use `--no-serve` when tests
 or automation only need bootstrap JSON.
 
+This is a required gate for agent CLI dashboard workflows. Do not create a
+baton, generate packets, spawn workers, or edit project files before the agent
+has presented the resolved setup, run `factory.py up`, shown the dashboard URL
+and top-level operator, and received user confirmation to begin operations.
+
 ## Initialize
 
 From the target project root:

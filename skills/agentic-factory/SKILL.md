@@ -20,6 +20,26 @@ experimental adapters, or serial role simulation while using the same records.
 The local dashboard can provide factory-floor visibility for those non-Codex
 or adapter-heavy workflows.
 
+## Build Request Gate
+
+If the user asks to build, implement, run, or operate a full factory, do not
+start with baton commands just because the objective is clear. First use
+`agentic-factory-orchestration` and follow its Required Sequence.
+
+For generic agent CLI runtimes, that means:
+
+1. the orchestration skill resolves and presents the startup configuration;
+2. the user confirms the setup;
+3. the agent runs `factory.py up`;
+4. the agent presents the dashboard URL and top-level operator;
+5. the agent pauses until the user says factory operations may begin.
+
+Only after that readiness gate should this CLI/state skill be used for
+`status`, `doctor`, `baton create`, packets, handoffs, verification, review, or
+acceptance. Direct use of the command examples below is appropriate for
+manual protocol testing, state inspection, recovery, or explicit state-only
+requests.
+
 ## Contract
 
 - Run the CLI from the target project root unless `--root` is supplied.

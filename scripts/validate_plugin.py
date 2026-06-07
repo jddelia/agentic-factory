@@ -46,6 +46,7 @@ def validate(plugin_root: Path) -> list[str]:
     if manifest is not None:
         reject_todos(manifest, "$", errors)
         validate_manifest(plugin_root, manifest, errors)
+    validate_factory_contracts(plugin_root, errors)
 
     for required_file in (
         "README.md",
@@ -75,6 +76,40 @@ def validate(plugin_root: Path) -> list[str]:
     if not (plugin_root / "tests").is_dir():
         errors.append("missing `tests/` directory")
     return errors
+
+
+def validate_factory_contracts(plugin_root: Path, errors: list[str]) -> None:
+    orchestration = plugin_root / "skills" / "agentic-factory-orchestration" / "SKILL.md"
+    operational = plugin_root / "skills" / "agentic-factory" / "SKILL.md"
+    required_orchestration_markers = (
+        "## Required Sequence",
+        "This sequence is a contract, not a recommendation.",
+        "run `factory.py up`",
+        "PAUSE.",
+        "factory operations may begin",
+        "Before step 5 is complete, do not run `baton create`",
+    )
+    required_operational_markers = (
+        "## Build Request Gate",
+        "start with baton commands",
+        "`agentic-factory-orchestration` and follow its Required Sequence",
+        "the agent runs `factory.py up`",
+    )
+    validate_text_markers(orchestration, required_orchestration_markers, errors)
+    validate_text_markers(operational, required_operational_markers, errors)
+
+
+def validate_text_markers(path: Path, markers: tuple[str, ...], errors: list[str]) -> None:
+    if not path.is_file():
+        return
+    try:
+        contents = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        errors.append(f"unable to read `{path}`: {exc}")
+        return
+    for marker in markers:
+        if marker not in contents:
+            errors.append(f"`{path.relative_to(path.parents[2])}` is missing required contract marker: {marker}")
 
 
 def load_json_object(path: Path, errors: list[str]) -> dict[str, Any] | None:
