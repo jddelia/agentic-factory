@@ -322,8 +322,9 @@ The CLI writes these event types directly:
 | `lock.released` | `lock release` | Lock release summary. | `lock`. |
 | `agent.spawn.started` | `agent spawn` | Adapter, role, and start status. | `session_id`, `adapter`, `role`, `baton_id`, `packet_path`, `timeout_seconds`, `command_preview`. |
 | `agent.spawn.completed` | `agent spawn` | Adapter, role, and terminal status. | `session_id`, `adapter`, `role`, `baton_id`, `packet_path`, `timeout_seconds`, `command_preview`, `status`, `returncode`, `duration_ms`. |
-| `agent.message.requested` | Dashboard control API | Dashboard message request. | `session_id`, `message`, `delivery`, `control_mode`, `control_ref`. |
+| `agent.message.requested` | Dashboard control API | Dashboard session message request. | `session_id`, `message`, `delivery`, `control_mode`, `control_ref`. |
 | `operator.message.requested` | Dashboard control API | Top-level operator message request. | `operator_id`, `role`, `name`, `message`, `delivery`, `control_mode`. |
+| `baton.message.requested` | Dashboard control API | Baton-owner message request. | `baton_id`, `owner`, `message`, `delivery`, `control_mode`. |
 
 `event append` can write custom event types. Custom event names should be
 namespaced with dot notation, for example:
@@ -363,7 +364,8 @@ Read-only inspection commands use the same tables:
 - `review list`: bounded query on `reviews` and `review_findings`, scoped by
   baton or current run.
 - `dashboard snapshot`: bounded read model over current run, batons, events,
-  verification, reviews, locks, operators from `actors`, and `agent_sessions`.
+  verification, reviews, locks, operators from `actors`, `agent_sessions`,
+  derived baton workers, and recent dashboard control messages.
 
 Adapter spawn commands write packet files under `.agentic-factory/packets/` by
 default and store bounded process output in `agent_sessions.metadata_json`.

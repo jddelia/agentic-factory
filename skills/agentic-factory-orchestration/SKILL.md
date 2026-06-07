@@ -162,6 +162,26 @@ This startup flow is a compatibility layer for non-Codex environments. It does
 not replace Codex-native thread orchestration when native Codex delegation is
 available.
 
+## Dashboard Control Loop
+
+In agent-CLI dashboard workflows, dashboard messages are durable control
+events, not guaranteed live terminal input. The lead agent must actively
+consume them.
+
+Before creating a baton, after every worker handoff, before acceptance, and at
+least once per visible dashboard checkpoint:
+
+```bash
+python3 <plugin-root>/scripts/factory.py events list --type operator.message.requested --recent 20 --json
+python3 <plugin-root>/scripts/factory.py events list --type baton.message.requested --recent 20 --json
+python3 <plugin-root>/scripts/factory.py events list --type agent.message.requested --recent 20 --json
+```
+
+If a new dashboard message requests pause, scope change, status, review,
+handoff, or cancellation, respond in chat and record the appropriate factory
+event or baton transition before continuing. Do not silently ignore dashboard
+control events.
+
 ## Capability Preflight
 
 Before delegating to workers, establish the runtime capability profile without

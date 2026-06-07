@@ -9,6 +9,7 @@ import {
 } from "@tanstack/react-query";
 import {
   Activity,
+  Bell,
   Boxes,
   CheckCircle2,
   ClipboardCheck,
@@ -19,6 +20,7 @@ import {
   MessageSquareText,
   Radio,
   RefreshCw,
+  Route,
   Send,
   Shield,
   TerminalSquare,
@@ -41,11 +43,14 @@ type Baton = {
   id: string;
   title: string;
   owner: string;
+  owner_thread?: string;
   status: string;
   scope: string;
   acceptance_tier: string;
   verification_level: string;
   assigned_at: string;
+  handed_off_at?: string | null;
+  accepted_at?: string | null;
   commit_sha: string;
   summary: string;
 };
@@ -130,6 +135,40 @@ type Operator = {
   };
 };
 
+type WorkerItem = {
+  id: string;
+  kind: "baton" | "session";
+  baton_id: string | null;
+  session_id?: string;
+  role: string;
+  label: string;
+  status: string;
+  summary: string;
+  last_seen_at?: string | null;
+  source: string;
+  session_count?: number;
+  control_capabilities?: {
+    can_record_message: boolean;
+    can_deliver_live_message: boolean;
+    mode: string;
+  };
+};
+
+type ControlMessage = {
+  id: number;
+  occurred_at: string;
+  actor: string;
+  event_type: string;
+  target_type: "operator" | "session" | "baton" | "factory";
+  target_id: string;
+  target_label: string;
+  baton_id: string | null;
+  message: string;
+  delivery: string;
+  control_mode: string;
+  status: string;
+};
+
 type DashboardSnapshot = {
   initialized: boolean;
   generated_at: string;
@@ -160,12 +199,17 @@ type DashboardSnapshot = {
     failed_verification?: number;
     blocked_verification?: number;
     recent_events?: number;
+    workers?: number;
+    control_messages?: number;
+    queued_control_messages?: number;
   };
   batons: Baton[];
   events: FactoryEvent[];
   verification: VerificationRun[];
   reviews: Review[];
   sessions: AgentSession[];
+  workers: WorkerItem[];
+  control_messages: ControlMessage[];
   operators: Operator[];
   primary_operator: Operator | null;
 };
@@ -175,7 +219,7 @@ const queryClient = new QueryClient({
     queries: {
       refetchOnWindowFocus: false,
       retry: 1,
-      staleTime: 1500,
+      staleTime: 1000,
     },
   },
 });
@@ -217,7 +261,7 @@ function useSnapshot(token: string) {
     queryKey: ["snapshot"],
     enabled: Boolean(token),
     queryFn: () => apiFetch<DashboardSnapshot>("/api/snapshot", token),
-    refetchInterval: 15000,
+    refetchInterval: 5000,
   });
 }
 
@@ -310,13 +354,14 @@ function Metrics({ snapshot }: { snapshot: DashboardSnapshot }) {
   const metrics = snapshot.metrics;
   const items = [
     { label: "Active Batons", value: metrics.active_batons ?? 0, icon: ClipboardCheck },
-    { label: "Agent Sessions", value: metrics.active_sessions ?? 0, icon: TerminalSquare },
+    { label: "Workers", value: metrics.workers ?? 0, icon: TerminalSquare },
     { label: "Pending Review", value: metrics.pending_reviews ?? 0, icon: Shield },
     {
       label: "Verification Issues",
       value: (metrics.failed_verification ?? 0) + (metrics.blocked_verification ?? 0),
       icon: TriangleAlert,
     },
+    { label: "Control Queue", value: metrics.queued_control_messages ?? 0, icon: Bell },
   ];
   return (
     <section className="metric-strip" aria-label="Factory metrics">
@@ -329,6 +374,56 @@ function Metrics({ snapshot }: { snapshot: DashboardSnapshot }) {
           </div>
         </div>
       ))}
+    </section>
+  );
+}
+
+function FactoryStatePanel({ snapshot }: { snapshot: DashboardSnapshot }) {
+  const run = snapshot.status?.run;
+  const activeBaton = snapshot.status?.active_batons?.[0] ?? snapshot.batons.find((baton) =>
+    ["assigned", "active", "in_progress", "handed_off", "review"].includes(baton.status),
+  );
+  const latest = snapshot.events[0] ?? snapshot.status?.latest_event;
+  const queued = snapshot.control_messages.length;
+  const heldLocks = snapshot.status?.held_locks?.length ?? 0;
+  const nextAction = queued
+    ? "Lead should inspect the dashboard control queue."
+    : activeBaton
+      ? `Continue or review ${activeBaton.id}.`
+      : run
+        ? "Ready for next baton or checkpoint."
+        : "Initialize a factory run.";
+
+  return (
+    <section className="state-panel">
+      <div className="state-primary">
+        <div className="seat-kicker">
+          <Route size={16} strokeWidth={1.8} />
+          <span>Current Factory State</span>
+        </div>
+        <h2>{nextAction}</h2>
+        <p>
+          {run?.objective || "Factory state is read from the local SQLite ledger. Start a run to populate this view."}
+        </p>
+      </div>
+      <div className="state-grid">
+        <div>
+          <span>Active baton</span>
+          <strong>{activeBaton ? `${activeBaton.id} · ${activeBaton.status}` : "none"}</strong>
+        </div>
+        <div>
+          <span>Control queue</span>
+          <strong>{queued}</strong>
+        </div>
+        <div>
+          <span>Held locks</span>
+          <strong>{heldLocks}</strong>
+        </div>
+        <div>
+          <span>Latest event</span>
+          <strong>{latest?.event_type ?? "none"}</strong>
+        </div>
+      </div>
     </section>
   );
 }
@@ -384,17 +479,19 @@ function CommandSeat({
 }) {
   const client = useQueryClient();
   const [message, setMessage] = useState("");
+  const [queuedNotice, setQueuedNotice] = useState<string | null>(null);
   const run = snapshot.status?.run;
   const mutation = useMutation({
     mutationFn: async () => {
       if (!operator) throw new Error("No operator selected.");
-      return apiFetch(`/api/operators/${encodeURIComponent(String(operator.id))}/message`, token, {
+      return apiFetch<{ status: string; delivery: string }>(`/api/operators/${encodeURIComponent(String(operator.id))}/message`, token, {
         method: "POST",
         body: JSON.stringify({ actor: "Dashboard", message }),
       });
     },
-    onSuccess: () => {
+    onSuccess: (result) => {
       setMessage("");
+      setQueuedNotice(`Queued for ${operator?.role ?? "operator"} as ${result.delivery}.`);
       void client.invalidateQueries({ queryKey: ["snapshot"] });
     },
   });
@@ -448,9 +545,10 @@ function CommandSeat({
             title="Record command-seat message"
           >
             <Send size={16} strokeWidth={1.8} />
-            Send
+            Queue
           </button>
         </div>
+        {queuedNotice ? <p className="queued-text">{queuedNotice}</p> : null}
         {mutation.error ? <p className="error-text">{mutation.error.message}</p> : null}
       </div>
     </section>
@@ -460,18 +558,25 @@ function CommandSeat({
 function OperatorsPanel({
   operators,
   sessions,
+  workers,
   selectedOperator,
   selectedSession,
+  selectedBaton,
   onSelectOperator,
   onSelectSession,
+  onSelectBaton,
 }: {
   operators: Operator[];
   sessions: AgentSession[];
+  workers: WorkerItem[];
   selectedOperator?: string;
   selectedSession?: string;
+  selectedBaton?: string;
   onSelectOperator: (id: string) => void;
   onSelectSession: (id: string) => void;
+  onSelectBaton: (id: string) => void;
 }) {
+  const batonWorkers = workers.filter((worker) => worker.kind === "baton");
   return (
     <section className="panel operators-panel">
       <div className="panel-heading">
@@ -500,7 +605,34 @@ function OperatorsPanel({
         {!operators.length ? <p className="muted">No operators recorded.</p> : null}
       </div>
       <div className="worker-divider">
-        <span>Worker sessions</span>
+        <span>Baton workers</span>
+        <b>{batonWorkers.length}</b>
+      </div>
+      <div className="session-list compact">
+        {batonWorkers.map((worker) => (
+          <button
+            className={`session-row ${selectedBaton === worker.baton_id ? "selected" : ""}`}
+            key={worker.id}
+            type="button"
+            onClick={() => worker.baton_id && onSelectBaton(worker.baton_id)}
+          >
+            <span className={statusClass(worker.status)}>{worker.status}</span>
+            <div>
+              <strong>{worker.label}</strong>
+              <small>{worker.summary || `${worker.session_count ?? 0} process sessions`}</small>
+            </div>
+            <span className="time">{formatTime(worker.last_seen_at)}</span>
+          </button>
+        ))}
+        {!batonWorkers.length ? (
+          <div className="empty-state compact">
+            <ClipboardCheck size={22} strokeWidth={1.8} />
+            <p>No baton workers yet.</p>
+          </div>
+        ) : null}
+      </div>
+      <div className="worker-divider">
+        <span>Process sessions</span>
         <b>{sessions.length}</b>
       </div>
       <div className="session-list compact">
@@ -524,7 +656,7 @@ function OperatorsPanel({
         {!sessions.length ? (
           <div className="empty-state compact">
             <TerminalSquare size={22} strokeWidth={1.8} />
-            <p>No worker sessions yet.</p>
+            <p>No process sessions recorded.</p>
           </div>
         ) : null}
       </div>
@@ -573,6 +705,183 @@ function BatonBoard({ batons, selected, onSelect }: {
             </div>
           </div>
         ))}
+      </div>
+    </section>
+  );
+}
+
+function BatonDetail({
+  baton,
+  sessions,
+  verification,
+  reviews,
+  events,
+  token,
+  controlEnabled,
+}: {
+  baton?: Baton;
+  sessions: AgentSession[];
+  verification: VerificationRun[];
+  reviews: Review[];
+  events: FactoryEvent[];
+  token: string;
+  controlEnabled: boolean;
+}) {
+  const client = useQueryClient();
+  const [message, setMessage] = useState("");
+  const [queuedNotice, setQueuedNotice] = useState<string | null>(null);
+  const mutation = useMutation({
+    mutationFn: async () => {
+      if (!baton) throw new Error("No baton selected.");
+      return apiFetch<{ status: string; delivery: string }>(`/api/batons/${encodeURIComponent(baton.id)}/message`, token, {
+        method: "POST",
+        body: JSON.stringify({ actor: "Dashboard", message }),
+      });
+    },
+    onSuccess: (result) => {
+      setMessage("");
+      setQueuedNotice(`Queued for ${baton?.owner || "baton owner"} as ${result.delivery}.`);
+      void client.invalidateQueries({ queryKey: ["snapshot"] });
+    },
+  });
+
+  if (!baton) {
+    return (
+      <section className="panel baton-detail-panel">
+        <div className="empty-state">
+          <ClipboardCheck size={24} strokeWidth={1.8} />
+          <p>Select a baton to inspect scope, owner, evidence, related sessions, and message controls.</p>
+        </div>
+      </section>
+    );
+  }
+
+  const relatedSessions = sessions.filter((session) => session.baton_id === baton.id);
+  const relatedChecks = verification.filter((item) => item.baton_id === baton.id);
+  const relatedReviews = reviews.filter((item) => item.baton_id === baton.id);
+  const relatedEvents = events.filter((event) => event.baton_id === baton.id).slice(0, 5);
+  const disabled = !controlEnabled || mutation.isPending;
+
+  return (
+    <section className="panel baton-detail-panel">
+      <div className="panel-heading">
+        <div>
+          <p className="eyebrow">Selected Baton</p>
+          <h2>{baton.id} · {baton.title}</h2>
+        </div>
+        <span className={statusClass(baton.status)}>{baton.status}</span>
+      </div>
+      <div className="baton-detail-body">
+        <div className="baton-brief">
+          <p>{baton.scope || "No scope recorded."}</p>
+          <dl className="mini-grid">
+            <div>
+              <dt>Owner</dt>
+              <dd>{baton.owner || "unassigned"}</dd>
+            </div>
+            <div>
+              <dt>Tier</dt>
+              <dd>{baton.acceptance_tier}</dd>
+            </div>
+            <div>
+              <dt>Verification</dt>
+              <dd>{baton.verification_level}</dd>
+            </div>
+            <div>
+              <dt>Commit</dt>
+              <dd>{baton.commit_sha || "not accepted"}</dd>
+            </div>
+          </dl>
+        </div>
+        <div className="message-box baton-message">
+          <label htmlFor="baton-message">Message baton owner</label>
+          <textarea
+            id="baton-message"
+            value={message}
+            onChange={(event) => setMessage(event.target.value)}
+            placeholder={controlEnabled ? "Ask for handoff, pause, scope clarification, or a focused update." : "Dashboard is read-only."}
+            disabled={!controlEnabled}
+          />
+          <div className="message-actions">
+            <span>{controlEnabled ? "Queued as a baton event for the lead agent to consume." : "Read-only dashboard mode."}</span>
+            <button
+              type="button"
+              className="primary-button"
+              disabled={disabled || !message.trim()}
+              onClick={() => mutation.mutate()}
+              title="Queue baton message"
+            >
+              <Send size={16} strokeWidth={1.8} />
+              Queue
+            </button>
+          </div>
+          {queuedNotice ? <p className="queued-text">{queuedNotice}</p> : null}
+          {mutation.error ? <p className="error-text">{mutation.error.message}</p> : null}
+        </div>
+      </div>
+      <div className="baton-evidence-strip">
+        <div>
+          <strong>{relatedSessions.length}</strong>
+          <span>sessions</span>
+        </div>
+        <div>
+          <strong>{relatedChecks.length}</strong>
+          <span>checks</span>
+        </div>
+        <div>
+          <strong>{relatedReviews.length}</strong>
+          <span>reviews</span>
+        </div>
+        <div>
+          <strong>{relatedEvents.length}</strong>
+          <span>recent events</span>
+        </div>
+      </div>
+      <div className="related-list">
+        {relatedEvents.map((event) => (
+          <div className="related-row" key={event.id}>
+            <span className="event-dot" />
+            <div>
+              <strong>{event.event_type}</strong>
+              <small>{formatTime(event.occurred_at)} · {event.summary || "No summary"}</small>
+            </div>
+          </div>
+        ))}
+        {!relatedEvents.length ? <p className="muted">No baton-scoped events in the current snapshot.</p> : null}
+      </div>
+    </section>
+  );
+}
+
+function ControlInbox({ messages }: { messages: ControlMessage[] }) {
+  return (
+    <section className="panel control-inbox-panel">
+      <div className="panel-heading">
+        <div>
+          <p className="eyebrow">Control Inbox</p>
+          <h2>{messages.length ? `${messages.length} queued requests` : "No queued requests"}</h2>
+        </div>
+        <Bell size={18} strokeWidth={1.8} />
+      </div>
+      <div className="control-list">
+        {messages.map((item) => (
+          <div className="control-row" key={item.id}>
+            <span className={statusClass(item.status)}>{item.status}</span>
+            <div>
+              <strong>{item.target_label}</strong>
+              <p>{item.message || "No message text recorded."}</p>
+              <small>
+                {formatTime(item.occurred_at)} · {item.actor || "Dashboard"} · {item.delivery}
+              </small>
+            </div>
+          </div>
+        ))}
+        {!messages.length ? (
+          <div className="empty-state compact">
+            <Bell size={22} strokeWidth={1.8} />
+            <p>Dashboard messages will appear here so the lead agent can consume them explicitly.</p>
+          </div>
+        ) : null}
       </div>
     </section>
   );
@@ -636,16 +945,18 @@ function SessionDetail({
 }) {
   const client = useQueryClient();
   const [message, setMessage] = useState("");
+  const [queuedNotice, setQueuedNotice] = useState<string | null>(null);
   const mutation = useMutation({
     mutationFn: async () => {
       if (!session) throw new Error("No session selected.");
-      return apiFetch(`/api/sessions/${encodeURIComponent(session.id)}/message`, token, {
+      return apiFetch<{ status: string; delivery: string }>(`/api/sessions/${encodeURIComponent(session.id)}/message`, token, {
         method: "POST",
         body: JSON.stringify({ actor: "Dashboard", message }),
       });
     },
-    onSuccess: () => {
+    onSuccess: (result) => {
       setMessage("");
+      setQueuedNotice(`Queued for ${session?.label ?? "session"} as ${result.delivery}.`);
       void client.invalidateQueries({ queryKey: ["snapshot"] });
     },
   });
@@ -715,9 +1026,10 @@ function SessionDetail({
             title="Record dashboard message request"
           >
             <Send size={16} strokeWidth={1.8} />
-            Send
+            Queue
           </button>
         </div>
+        {queuedNotice ? <p className="queued-text">{queuedNotice}</p> : null}
         {mutation.error ? <p className="error-text">{mutation.error.message}</p> : null}
       </div>
       <OutputPane title="stdout" value={session.metadata?.stdout} truncated={session.metadata?.stdout_truncated} />
@@ -859,6 +1171,13 @@ function DashboardApp() {
   }, [data?.sessions, selectedSessionId]);
 
   useEffect(() => {
+    if (!selectedBatonId && data?.batons[0]) setSelectedBatonId(data.batons[0].id);
+    if (selectedBatonId && data && !data.batons.some((baton) => baton.id === selectedBatonId)) {
+      setSelectedBatonId(data.batons[0]?.id);
+    }
+  }, [data, selectedBatonId]);
+
+  useEffect(() => {
     const primaryId = data?.primary_operator?.id;
     if (!selectedOperatorId && primaryId !== undefined && primaryId !== null) {
       setSelectedOperatorId(String(primaryId));
@@ -872,6 +1191,10 @@ function DashboardApp() {
   const selectedOperator = useMemo(
     () => data?.operators.find((operator) => String(operator.id) === selectedOperatorId) ?? data?.primary_operator,
     [data?.operators, data?.primary_operator, selectedOperatorId],
+  );
+  const selectedBaton = useMemo(
+    () => data?.batons.find((baton) => baton.id === selectedBatonId),
+    [data?.batons, selectedBatonId],
   );
 
   if (!token) {
@@ -919,20 +1242,34 @@ function DashboardApp() {
             token={token}
             controlEnabled={Boolean(data.server?.control_enabled)}
           />
+          <FactoryStatePanel snapshot={data} />
           <Metrics snapshot={data} />
           <RunPanel snapshot={data} />
           <BatonBoard batons={data.batons} selected={selectedBatonId} onSelect={setSelectedBatonId} />
+          <BatonDetail
+            baton={selectedBaton}
+            sessions={data.sessions}
+            verification={data.verification}
+            reviews={data.reviews}
+            events={data.events}
+            token={token}
+            controlEnabled={Boolean(data.server?.control_enabled)}
+          />
           <EvidencePanel verification={data.verification} reviews={data.reviews} />
         </section>
         <aside className="side-column">
           <OperatorsPanel
             operators={data.operators}
             sessions={data.sessions}
+            workers={data.workers}
             selectedOperator={selectedOperatorId}
             selectedSession={selectedSessionId}
+            selectedBaton={selectedBatonId}
             onSelectOperator={setSelectedOperatorId}
             onSelectSession={setSelectedSessionId}
+            onSelectBaton={setSelectedBatonId}
           />
+          <ControlInbox messages={data.control_messages} />
           <SessionDetail
             session={selectedSession}
             token={token}

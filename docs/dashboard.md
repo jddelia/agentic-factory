@@ -121,8 +121,13 @@ The first dashboard version includes:
 - primary operator command seat based on topology and runtime mode;
 - operator list for Executive, Ledger, Principal Partner, Lead Agent, or Solo
   Operator records;
+- current factory state summary and control queue count;
 - active factory metrics;
 - baton board grouped by status;
+- selected baton detail with scope, owner, evidence, related events, and baton
+  message controls;
+- derived baton workers that update from baton state even when no process
+  adapter session exists;
 - agent session list and detail pane;
 - packet path and adapter command preview for spawned sessions;
 - bounded stdout/stderr for completed adapter sessions;
@@ -169,13 +174,19 @@ Codex-native thread integration.
 ## Message Controls
 
 When the dashboard is started in control mode, the operator command seat can
-record `operator.message.requested` events and session detail panes can record
+record `operator.message.requested` events, selected batons can record
+`baton.message.requested` events, and session detail panes can record
 `agent.message.requested` events. For process adapters, delivery is
 `recorded_only`.
 
 That is intentional. The dashboard does not pretend that a completed or
 noninteractive process can receive live input. Future session-backed adapters
 can upgrade the same control path to live delivery.
+
+The dashboard also renders a control inbox from recent message events. In
+generic agent CLI workflows, the lead agent must poll or inspect those control
+events during operation and respond in chat; the browser cannot force a
+separate agent process to answer unless a live transport exists.
 
 ## Security
 

@@ -46,6 +46,11 @@ AGENT_SPAWN_ADAPTERS = {"codex-cli", "custom"}
 CODEX_SPAWN_SANDBOXES = {"auto", "read-only", "workspace-write"}
 CODEX_APPROVAL_POLICIES = {"never", "on-request", "untrusted", "on-failure"}
 SESSION_ACTIVE_STATUSES = {"planned", "running", "waiting", "blocked"}
+CONTROL_MESSAGE_EVENT_TYPES = {
+    "operator.message.requested",
+    "agent.message.requested",
+    "baton.message.requested",
+}
 DEFAULT_LIST_LIMIT = 20
 MAX_LIST_LIMIT = 500
 DEFAULT_SPAWN_TIMEOUT_SECONDS = 1800
@@ -2816,6 +2821,41 @@ def record_operator_message(
     return payload
 
 
+def record_baton_message(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    baton_id: str,
+    actor: str,
+    message: str,
+) -> dict[str, Any]:
+    text = message.strip()
+    if not text:
+        raise FactoryError("Message must not be empty.")
+    if len(text) > 8000:
+        raise FactoryError("Message must be 8000 characters or fewer.")
+    baton = require_baton(conn, baton_id)
+    if baton["run_id"] != run_id:
+        raise FactoryError(f"Baton {baton_id} does not belong to current run {run_id}.")
+    payload = {
+        "baton_id": baton_id,
+        "owner": baton["owner"],
+        "message": text,
+        "delivery": "recorded_only",
+        "control_mode": "baton_event",
+    }
+    emit_event(
+        conn,
+        event_type="baton.message.requested",
+        actor=actor or "Dashboard",
+        run_id=run_id,
+        baton_id=baton_id,
+        summary=f"{baton_id}: {shorten(text, 100)}",
+        payload=payload,
+    )
+    return payload
+
+
 def collect_agent_sessions(conn: sqlite3.Connection, run_id: str, recent: int) -> list[dict[str, Any]]:
     rows = list(
         conn.execute(
@@ -2840,6 +2880,124 @@ def collect_agent_sessions(conn: sqlite3.Connection, run_id: str, recent: int) -
         }
         sessions.append(payload)
     return sessions
+
+
+def collect_baton_workers(batons: list[dict[str, Any]], sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    sessions_by_baton: dict[str, list[dict[str, Any]]] = {}
+    for session in sessions:
+        baton_id = session.get("baton_id")
+        if isinstance(baton_id, str) and baton_id:
+            sessions_by_baton.setdefault(baton_id, []).append(session)
+
+    workers: list[dict[str, Any]] = []
+    for baton in batons:
+        baton_id = str(baton.get("id") or "")
+        if not baton_id:
+            continue
+        related_sessions = sessions_by_baton.get(baton_id, [])
+        owner = str(baton.get("owner") or "Builder")
+        status = str(baton.get("status") or "assigned")
+        last_seen = baton.get("accepted_at") or baton.get("handed_off_at") or baton.get("assigned_at")
+        workers.append(
+            {
+                "id": f"baton:{baton_id}",
+                "kind": "baton",
+                "baton_id": baton_id,
+                "role": owner,
+                "label": f"{owner} · {baton_id}",
+                "status": status,
+                "summary": baton.get("summary") or baton.get("title") or "",
+                "last_seen_at": last_seen,
+                "source": "baton",
+                "session_count": len(related_sessions),
+                "control_capabilities": {
+                    "can_record_message": True,
+                    "can_deliver_live_message": False,
+                    "mode": "baton_event",
+                },
+            }
+        )
+
+    for session in sessions:
+        workers.append(
+            {
+                "id": f"session:{session.get('id')}",
+                "kind": "session",
+                "session_id": session.get("id"),
+                "baton_id": session.get("baton_id"),
+                "role": session.get("role"),
+                "label": session.get("label") or session.get("id"),
+                "status": session.get("status"),
+                "summary": session.get("summary"),
+                "last_seen_at": session.get("last_seen_at") or session.get("started_at"),
+                "source": session.get("adapter"),
+                "control_capabilities": session.get("control_capabilities"),
+            }
+        )
+
+    def worker_sort_key(worker: dict[str, Any]) -> tuple[str, str]:
+        return str(worker.get("last_seen_at") or ""), str(worker.get("id") or "")
+
+    workers.sort(key=worker_sort_key, reverse=True)
+    return workers
+
+
+def control_message_from_event(event: dict[str, Any]) -> dict[str, Any]:
+    event_type = str(event.get("event_type") or "")
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    payload = payload if isinstance(payload, dict) else {}
+    target_type = "factory"
+    target_id = ""
+    target_label = "Factory"
+    if event_type == "operator.message.requested":
+        target_type = "operator"
+        target_id = str(payload.get("operator_id") or "")
+        target_label = str(payload.get("role") or payload.get("name") or "Operator")
+    elif event_type == "agent.message.requested":
+        target_type = "session"
+        target_id = str(payload.get("session_id") or "")
+        target_label = target_id or "Agent session"
+    elif event_type == "baton.message.requested":
+        target_type = "baton"
+        target_id = str(payload.get("baton_id") or event.get("baton_id") or "")
+        owner = str(payload.get("owner") or "Baton owner")
+        target_label = f"{owner} · {target_id}" if target_id else owner
+    return {
+        "id": event.get("id"),
+        "occurred_at": event.get("occurred_at"),
+        "actor": event.get("actor"),
+        "event_type": event_type,
+        "target_type": target_type,
+        "target_id": target_id,
+        "target_label": target_label,
+        "baton_id": event.get("baton_id") or payload.get("baton_id"),
+        "message": payload.get("message") or event.get("summary") or "",
+        "delivery": payload.get("delivery") or "recorded_only",
+        "control_mode": payload.get("control_mode") or "event",
+        "status": "queued",
+    }
+
+
+def collect_control_messages(conn: sqlite3.Connection, run_id: str, recent: int) -> list[dict[str, Any]]:
+    placeholders = ",".join("?" for _ in CONTROL_MESSAGE_EVENT_TYPES)
+    rows = [
+        row
+        for row in (
+            row_to_public_dict(row)
+            for row in conn.execute(
+                f"""
+                SELECT *
+                FROM events
+                WHERE run_id = ? AND event_type IN ({placeholders})
+                ORDER BY occurred_at DESC, id DESC
+                LIMIT ?
+                """,
+                (run_id, *sorted(CONTROL_MESSAGE_EVENT_TYPES), recent),
+            )
+        )
+        if row is not None
+    ]
+    return [control_message_from_event(row) for row in rows]
 
 
 def collect_recent_verification(conn: sqlite3.Connection, run_id: str, recent: int) -> list[dict[str, Any]]:
@@ -2883,6 +3041,8 @@ def collect_dashboard_metrics(
     verification: list[dict[str, Any]],
     reviews: list[dict[str, Any]],
     sessions: list[dict[str, Any]],
+    workers: list[dict[str, Any]],
+    control_messages: list[dict[str, Any]],
 ) -> dict[str, Any]:
     failed_checks = sum(1 for row in verification if row.get("result") == "fail")
     blocked_checks = sum(1 for row in verification if row.get("result") == "blocked")
@@ -2898,6 +3058,9 @@ def collect_dashboard_metrics(
         "failed_verification": failed_checks,
         "blocked_verification": blocked_checks,
         "recent_events": len(events),
+        "workers": len(workers),
+        "control_messages": len(control_messages),
+        "queued_control_messages": sum(1 for row in control_messages if row.get("status") == "queued"),
     }
 
 
@@ -2919,6 +3082,8 @@ def collect_dashboard_snapshot(conn: sqlite3.Connection, root: Path, db: str | N
             "verification": [],
             "reviews": [],
             "sessions": [],
+            "workers": [],
+            "control_messages": [],
             "operators": [],
             "primary_operator": None,
         }
@@ -2957,12 +3122,16 @@ def collect_dashboard_snapshot(conn: sqlite3.Connection, root: Path, db: str | N
     verification = collect_recent_verification(conn, run_id, recent)
     reviews = collect_recent_reviews(conn, run_id, recent)
     sessions = collect_agent_sessions(conn, run_id, recent)
+    workers = collect_baton_workers(batons, sessions)
+    control_messages = collect_control_messages(conn, run_id, recent)
     metrics = collect_dashboard_metrics(
         batons=batons,
         events=events,
         verification=verification,
         reviews=reviews,
         sessions=sessions,
+        workers=workers,
+        control_messages=control_messages,
     )
     return {
         "initialized": True,
@@ -2976,6 +3145,8 @@ def collect_dashboard_snapshot(conn: sqlite3.Connection, root: Path, db: str | N
         "verification": verification,
         "reviews": reviews,
         "sessions": sessions,
+        "workers": workers,
+        "control_messages": control_messages,
         "operators": operators,
         "primary_operator": primary_operator,
     }

@@ -70,7 +70,9 @@ button {
 .metric,
 .panel-heading,
 .lane-heading,
-.message-actions {
+.message-actions,
+.state-grid,
+.baton-evidence-strip {
   display: flex;
   align-items: center;
 }
@@ -235,8 +237,76 @@ textarea:disabled {
 
 .metric-strip {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 8px;
+}
+
+.state-panel {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(360px, 0.9fr);
+  gap: 1px;
+  overflow: hidden;
+  border: 1px solid #c5cdd6;
+  border-radius: var(--radius);
+  background: #c5cdd6;
+}
+
+.state-primary,
+.state-grid {
+  min-width: 0;
+  background: var(--surface);
+}
+
+.state-primary {
+  display: grid;
+  align-content: center;
+  gap: 10px;
+  padding: 16px;
+}
+
+.state-primary h2 {
+  font-size: clamp(1.15rem, 1rem + 0.5vw, 1.45rem);
+}
+
+.state-primary p {
+  max-width: 80ch;
+  margin-bottom: 0;
+  color: #3d4651;
+  line-height: 1.45;
+}
+
+.state-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1px;
+  background: var(--line);
+}
+
+.state-grid div {
+  min-width: 0;
+  padding: 14px;
+  background: var(--surface-quiet);
+}
+
+.state-grid span,
+.baton-evidence-strip span {
+  display: block;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.state-grid strong,
+.baton-evidence-strip strong {
+  display: block;
+  min-width: 0;
+  margin-top: 5px;
+  overflow: hidden;
+  font-size: 0.94rem;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .command-seat {
@@ -432,7 +502,9 @@ dd {
 .message-actions span,
 .session-row small,
 .event-row small,
-.evidence-row small {
+.evidence-row small,
+.related-row small,
+.control-row small {
   color: var(--muted);
 }
 
@@ -495,7 +567,8 @@ dd {
 .baton-card:hover,
 .session-row:hover,
 .icon-button:hover,
-.text-button:hover {
+.text-button:hover,
+.primary-button:hover {
   border-color: var(--line-strong);
 }
 
@@ -610,6 +683,103 @@ dd {
 
 .session-list.compact {
   max-height: 300px;
+}
+
+.baton-detail-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(300px, 0.8fr);
+  gap: 1px;
+  background: var(--line);
+}
+
+.baton-brief,
+.baton-message {
+  min-width: 0;
+  margin: 0;
+  padding: 14px;
+  background: #ffffff;
+}
+
+.baton-brief {
+  display: grid;
+  align-content: start;
+  gap: 14px;
+}
+
+.baton-brief p {
+  margin-bottom: 0;
+  color: #313943;
+  line-height: 1.5;
+}
+
+.mini-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin: 0;
+}
+
+.mini-grid div {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-quiet);
+}
+
+.baton-evidence-strip {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 1px;
+  background: var(--line);
+  border-top: 1px solid var(--line);
+}
+
+.baton-evidence-strip div {
+  min-width: 0;
+  padding: 12px 14px;
+  background: #ffffff;
+}
+
+.related-list,
+.control-list {
+  display: grid;
+  max-height: 340px;
+  overflow: auto;
+}
+
+.related-row,
+.control-row {
+  display: grid;
+  gap: 10px;
+  padding: 12px 14px;
+  border-top: 1px solid var(--line);
+}
+
+.related-row {
+  grid-template-columns: 12px minmax(0, 1fr);
+}
+
+.control-row {
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+}
+
+.related-row strong,
+.related-row small,
+.control-row strong,
+.control-row p,
+.control-row small {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.control-row p {
+  margin-bottom: 3px;
+  color: #313943;
 }
 
 .session-row {
@@ -750,6 +920,13 @@ button:focus-visible {
   margin: 0;
   color: var(--bad);
   font-weight: 700;
+}
+
+.queued-text {
+  margin: 0;
+  color: var(--accent-ink);
+  font-size: 0.8rem;
+  font-weight: 800;
 }
 
 .output-pane {
@@ -895,7 +1072,8 @@ button:focus-visible {
   }
 
   .detail-panel,
-  .event-panel {
+  .event-panel,
+  .control-inbox-panel {
     grid-column: span 2;
   }
 }
@@ -919,13 +1097,19 @@ button:focus-visible {
 
   .metric-strip,
   .command-seat,
+  .state-panel,
+  .state-grid,
   .evidence-grid,
-  .side-column {
+  .side-column,
+  .baton-detail-body,
+  .baton-evidence-strip,
+  .mini-grid {
     grid-template-columns: 1fr;
   }
 
   .detail-panel,
-  .event-panel {
+  .event-panel,
+  .control-inbox-panel {
     grid-column: auto;
   }
 

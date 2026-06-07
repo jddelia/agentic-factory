@@ -198,6 +198,21 @@ python3 <plugin-root>/scripts/factory.py dashboard snapshot --recent 50
 
 Add `--json` when another tool needs structured output.
 
+## Dashboard Control Messages
+
+Dashboard messages are recorded as events. They do not automatically interrupt
+or steer an agent unless the lead agent reads them. In agent-CLI dashboard
+workflows, inspect these queues before material state transitions:
+
+```bash
+python3 <plugin-root>/scripts/factory.py events list --type operator.message.requested --recent 20 --json
+python3 <plugin-root>/scripts/factory.py events list --type baton.message.requested --recent 20 --json
+python3 <plugin-root>/scripts/factory.py events list --type agent.message.requested --recent 20 --json
+```
+
+Respond to new control events in chat and record any resulting pause, baton,
+handoff, review, or acceptance change before continuing.
+
 ## Local Dashboard
 
 Use the dashboard when a generic agent CLI or adapter workflow needs a visible

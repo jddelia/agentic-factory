@@ -571,6 +571,23 @@ class FactoryCliTest(unittest.TestCase):
             self.assertEqual(no_server_event["payload"]["primary_operator"]["role"], "Executive")
             self.assertFalse(no_server_event["payload"]["server_running"])
 
+            create_baton = self.run_cli(
+                root,
+                "baton",
+                "create",
+                "B-001",
+                "--title",
+                "Dashboard wiring",
+                "--owner",
+                "Builder",
+                "--scope",
+                "Exercise dashboard baton detail and worker list",
+            )
+            self.assertEqual(create_baton.returncode, 0, create_baton.stderr)
+            snapshot = json.loads(self.run_cli(root, "dashboard", "snapshot", "--recent", "20").stdout)
+            self.assertEqual(snapshot["workers"][0]["kind"], "baton")
+            self.assertEqual(snapshot["workers"][0]["baton_id"], "B-001")
+
             port = self.free_port()
             token = "test-token"
             proc = subprocess.Popen(
@@ -618,6 +635,27 @@ class FactoryCliTest(unittest.TestCase):
                     message_payload = json.loads(response.read().decode("utf-8"))
                 self.assertEqual(message_payload["status"], "recorded")
                 self.assertEqual(message_payload["delivery"], "recorded_only")
+
+                body = json.dumps({"actor": "Dashboard", "message": "please hand off the baton"}).encode("utf-8")
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/batons/B-001/message",
+                    data=body,
+                    method="POST",
+                    headers={"x-factory-token": token, "content-type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=2) as response:
+                    baton_message_payload = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(baton_message_payload["status"], "recorded")
+                self.assertEqual(baton_message_payload["payload"]["baton_id"], "B-001")
+
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/snapshot",
+                    headers={"x-factory-token": token},
+                )
+                with urllib.request.urlopen(request, timeout=2) as response:
+                    live_snapshot = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(len(live_snapshot["control_messages"]), 2)
+                self.assertEqual(live_snapshot["metrics"]["queued_control_messages"], 2)
             finally:
                 proc.terminate()
                 try:
@@ -629,6 +667,9 @@ class FactoryCliTest(unittest.TestCase):
             events = json.loads(self.run_cli(root, "events", "list", "--type", "operator.message.requested", "--json").stdout)
             self.assertEqual(events["count"], 1)
             self.assertEqual(events["events"][0]["payload"]["message"], "pause until I say begin")
+            baton_events = json.loads(self.run_cli(root, "events", "list", "--type", "baton.message.requested", "--json").stdout)
+            self.assertEqual(baton_events["count"], 1)
+            self.assertEqual(baton_events["events"][0]["payload"]["message"], "please hand off the baton")
 
     def test_up_background_starts_dashboard_server(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

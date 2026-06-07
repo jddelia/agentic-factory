@@ -190,8 +190,19 @@ python3 /path/to/agentic-factory/scripts/factory.py dashboard serve \
 
 For process adapters, dashboard session messages are recorded as
 `agent.message.requested` events. Operator command-seat messages are recorded
-as `operator.message.requested` events. They are not live terminal input unless
-a future session-backed adapter provides a live transport.
+as `operator.message.requested` events. Selected baton messages are recorded as
+`baton.message.requested` events. They are not live terminal input unless a
+future session-backed adapter provides a live transport.
+
+In agent CLI workflows, the lead agent should inspect new dashboard control
+events before creating batons, accepting work, or continuing after handoffs:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py events list \
+  --type operator.message.requested \
+  --recent 20 \
+  --json
+```
 
 For automation without the web server:
 

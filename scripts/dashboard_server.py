@@ -136,6 +136,10 @@ def create_handler(
                 operator_id = path.removeprefix("/api/operators/").removesuffix("/message").strip("/")
                 self._record_operator_message(unquote(operator_id))
                 return
+            if path.startswith("/api/batons/") and path.endswith("/message"):
+                baton_id = path.removeprefix("/api/batons/").removesuffix("/message").strip("/")
+                self._record_baton_message(unquote(baton_id))
+                return
             self._send_error(HTTPStatus.NOT_FOUND, "Not found.")
 
         def _require_auth(self, query: dict[str, list[str]]) -> None:
@@ -207,6 +211,28 @@ def create_handler(
                     conn,
                     run_id=run["id"],
                     operator_id=operator_id,
+                    actor=actor,
+                    message=message,
+                )
+                conn.commit()
+                self._send_json({"status": "recorded", "delivery": payload["delivery"], "payload": payload})
+            except factory.FactoryError as exc:
+                self._send_error(HTTPStatus.BAD_REQUEST, str(exc))
+            finally:
+                conn.close()
+
+        def _record_baton_message(self, baton_id: str) -> None:
+            fields = self._message_fields()
+            if fields is None:
+                return
+            message, actor = fields
+            conn = factory.connect(root, db)
+            try:
+                run = factory.require_run(conn)
+                payload = factory.record_baton_message(
+                    conn,
+                    run_id=run["id"],
+                    baton_id=baton_id,
                     actor=actor,
                     message=message,
                 )
