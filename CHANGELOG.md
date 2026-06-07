@@ -12,4 +12,7 @@
   delegation contracts.
 - Added experimental adapter spawning for packet-based external agent CLI
   delegation.
+- Added optional local dashboard with React/Vite frontend, FastAPI serving,
+  dashboard snapshots, event streaming, session registry visibility, and guarded
+  message-request controls.
 - Added SQLite-backed factory CLI, schema migration, templates, and tests.

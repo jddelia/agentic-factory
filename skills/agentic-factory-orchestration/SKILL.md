@@ -18,8 +18,8 @@ The primary runtime is the Codex app. Prefer Codex-native thread or sub-agent
 capabilities when they are available and safe for the selected work. Other
 agent CLIs may approximate the same factory model through their own delegation
 features, generated agent packets, or serial role simulation. The `factory.py`
-CLI records state and renders packets; it does not directly spawn arbitrary
-workers.
+CLI records state, renders packets, can expose an optional dashboard, and can
+run explicitly authorized experimental adapter spawns.
 
 ## Outcome
 
@@ -35,6 +35,7 @@ Create a factory that matches the project's risk, maturity, and delivery target:
 - explicit baton lifecycle, handoff evidence, review policy, and acceptance tier;
 - explicit stop/resume controls with recoverable state;
 - explicit runtime mode and delegation capability preflight;
+- optional local dashboard visibility for agent-CLI factory floors;
 - explicit permission, model, approval, destructive-action, credential, and
   external-effect policy;
 - commits only for accepted work unless the user explicitly delegates otherwise.
@@ -95,6 +96,8 @@ enough signal, infer and proceed.
   unless the user or project configuration explicitly authorizes them.
 
 Read `docs/runtime-modes.md` when explaining or changing runtime behavior.
+Read `docs/dashboard.md` before presenting the local dashboard as a control
+surface.
 
 ## Capability Preflight
 
@@ -268,6 +271,9 @@ acceptance.
   compatibility modes.
 - Treat `factory.py agent spawn` as experimental and opt-in. Prefer packets
   without process spawning when runtime safety is unclear.
+- Treat `factory.py dashboard serve` as an optional visibility/control plane
+  for non-Codex or adapter-heavy workflows, not a replacement for Codex app
+  orchestration.
 - If push/auth fails, keep local commits and record remote status.
 - If a design, browser, document, spreadsheet, GitHub, or other domain skill is
   explicitly named, use that skill for the relevant work.

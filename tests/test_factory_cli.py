@@ -435,12 +435,22 @@ class FactoryCliTest(unittest.TestCase):
             executed_payload = json.loads(executed.stdout)
             self.assertEqual(executed_payload["status"], "completed")
             self.assertEqual(executed_payload["returncode"], 0)
+            self.assertTrue(executed_payload["session_id"])
             self.assertIn("# Agent Packet: Builder", executed_payload["stdout"])
             events = json.loads(
                 self.run_cli(root, "events", "list", "--type", "agent.spawn.completed", "--json").stdout
             )
             self.assertEqual(events["count"], 1)
+            self.assertEqual(events["events"][0]["payload"]["session_id"], executed_payload["session_id"])
             self.assertEqual(events["events"][0]["payload"]["status"], "completed")
+
+            snapshot = json.loads(self.run_cli(root, "dashboard", "snapshot", "--recent", "10").stdout)
+            self.assertTrue(snapshot["initialized"])
+            self.assertEqual(snapshot["metrics"]["active_sessions"], 0)
+            self.assertEqual(len(snapshot["sessions"]), 1)
+            self.assertEqual(snapshot["sessions"][0]["id"], executed_payload["session_id"])
+            self.assertEqual(snapshot["sessions"][0]["status"], "completed")
+            self.assertIn("stdout", snapshot["sessions"][0]["metadata"])
 
             missing_placeholder = self.run_cli(
                 root,

@@ -21,6 +21,7 @@ timeouts, and recovery behavior are understood.
 - supports `--dry-run` for preview;
 - enforces a timeout;
 - captures bounded stdout and stderr;
+- creates an `agent_sessions` row for real executions;
 - records `agent.spawn.started` and `agent.spawn.completed` events for real
   executions unless `--no-event` is supplied.
 
@@ -138,12 +139,27 @@ Real executions record:
 - `agent.spawn.started`
 - `agent.spawn.completed`
 
-The event payload includes adapter, role, baton id, packet path, timeout,
-command preview, status, return code, and duration. Full stdout and stderr are
-returned to the caller but are not stored in event payloads.
+The event payload includes session id, adapter, role, baton id, packet path,
+timeout, command preview, status, return code, and duration.
+
+Real executions also create or update an `agent_sessions` row. The session row
+stores bounded stdout/stderr in `metadata_json` so the dashboard can show
+completed process output. Event payloads keep only compact audit metadata.
 
 Use `--no-event` only for experiments where durable audit records are not
 appropriate.
+
+## Dashboard Visibility
+
+The optional dashboard reads `agent_sessions` to show adapter-spawned workers:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py dashboard serve --open
+```
+
+Process adapters are visible but not live-steerable. Dashboard message controls
+record `agent.message.requested` events unless a future session-backed adapter
+provides live delivery.
 
 ## When Not To Use Adapters
 

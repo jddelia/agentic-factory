@@ -1,7 +1,7 @@
 {
   "name": "agentic-factory",
   "version": "0.1.0",
-  "description": "Database-backed agentic software factory operations with structured events, baton state, reviews, verification history, pause/resume controls, and markdown ledger rendering.",
+  "description": "Database-backed agentic software factory operations with structured events, baton state, reviews, verification history, pause/resume controls, markdown ledger rendering, and an optional local dashboard.",
   "author": {
     "name": "Agentic Factory contributors"
   },
@@ -20,7 +20,7 @@
   "interface": {
     "displayName": "Agentic Factory",
     "shortDescription": "Run durable agentic factories with SQLite-backed ledgers.",
-    "longDescription": "Agentic Factory adds executable infrastructure and public orchestration guidance for long-running agent-driven software builds. Its primary mode is Codex app orchestration with durable SQLite state, baton assignment and handoff commands, review and verification records, pause/resume checkpoints, doctor checks, markdown ledger rendering, agent packet generation, experimental adapter spawning, and explicit runtime-mode guidance for portable agent CLI approximations. It ships separate skills for CLI/state operations and orchestration, so it works without private skill dependencies.",
+    "longDescription": "Agentic Factory adds executable infrastructure and public orchestration guidance for long-running agent-driven software builds. Its primary mode is Codex app orchestration with durable SQLite state, baton assignment and handoff commands, review and verification records, pause/resume checkpoints, doctor checks, markdown ledger rendering, agent packet generation, experimental adapter spawning, an optional local dashboard for agent-CLI factory-floor visibility, and explicit runtime-mode guidance for portable agent CLI approximations. It ships separate skills for CLI/state operations and orchestration, so it works without private skill dependencies.",
     "developerName": "Agentic Factory contributors",
     "category": "Developer Tools",
     "capabilities": [
@@ -32,6 +32,7 @@
       "Initialize a DB-backed factory ledger",
       "Generate a Builder agent packet for this baton",
       "Dry-run an experimental agent adapter spawn",
+      "Open the local Agentic Factory dashboard",
       "Record this baton handoff in the factory DB",
       "Render the current build ledger"
     ],

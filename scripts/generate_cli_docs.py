@@ -21,6 +21,9 @@ COMMANDS: tuple[tuple[str, ...], ...] = (
     ("config", "show"),
     ("init",),
     ("status",),
+    ("dashboard",),
+    ("dashboard", "snapshot"),
+    ("dashboard", "serve"),
     ("agent",),
     ("agent", "packet"),
     ("agent", "spawn"),
@@ -146,6 +149,50 @@ NOTES: dict[tuple[str, ...], str] = {
         Common failures:
 
         - No run exists: initialize first with `factory.py init`.
+    """,
+    ("dashboard", "snapshot"): """
+        Required arguments: none.
+
+        Example:
+
+        ```bash
+        python3 scripts/factory.py dashboard snapshot --recent 50
+        ```
+
+        Example output shape:
+
+        ```json
+        {"initialized": true, "metrics": {"active_batons": 1}, "sessions": []}
+        ```
+
+        Common failures:
+
+        - `--recent` is outside the allowed range.
+    """,
+    ("dashboard", "serve"): """
+        Required arguments: none.
+
+        The dashboard server is optional. It requires `requirements-dashboard.txt`
+        and prebuilt frontend assets under `dashboard/dist`.
+
+        Example:
+
+        ```bash
+        python3 scripts/factory.py dashboard serve --open
+        ```
+
+        Enable message-request controls explicitly:
+
+        ```bash
+        python3 scripts/factory.py dashboard serve --enable-control
+        ```
+
+        Common failures:
+
+        - Dashboard assets are missing: run `cd dashboard && npm install && npm run build`.
+        - Server dependencies are missing: install `requirements-dashboard.txt`.
+        - Non-loopback host without `--allow-remote`.
+        - `--port` is outside the allowed range.
     """,
     ("agent", "packet"): """
         Required arguments: `--role`.

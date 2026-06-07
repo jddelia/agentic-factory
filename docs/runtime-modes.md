@@ -63,7 +63,14 @@ python3 /path/to/agentic-factory/scripts/factory.py agent packet \
   --baton B-001
 ```
 
+Optional factory-floor view:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py dashboard serve --open
+```
+
 See [Agent Packets](agent-packets.md) for the full portable delegation flow.
+See [Dashboard](dashboard.md) for local UI visibility in non-Codex runtimes.
 
 ### `serial_single_agent`
 
@@ -97,6 +104,10 @@ unclear credential inheritance.
 Use `factory.py agent spawn --dry-run` before execution, and require
 `--experimental` for real adapter runs. See [Agent Adapters](agent-adapters.md)
 for the full safety contract.
+
+Real adapter executions also create `agent_sessions` rows. The optional
+dashboard reads those rows to provide a visible process/session registry for
+generic agent CLI workflows.
 
 ## Capability Preflight
 

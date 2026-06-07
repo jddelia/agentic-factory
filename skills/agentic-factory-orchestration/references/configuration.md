@@ -44,6 +44,7 @@ Common fields:
 
 ```text
 runtime_mode: codex_native | agent_cli_subagents | serial_single_agent | manual_protocol | adapter_spawn
+dashboard_policy: off | read_only | control_enabled
 work_mode:
 factory_topology: executive_as_ledger | separate_ledger | passive_fallback
 role_topology: lean_solo | standard | reviewed | managed | enterprise
@@ -81,6 +82,10 @@ confirming the host CLI's delegation, workspace, permission, and recovery
 semantics. Use `serial_single_agent` when delegation is unavailable or unclear.
 Treat `adapter_spawn` as experimental and explicitly configured; dry-run before
 execution.
+
+Use `dashboard_policy: read_only` when a generic agent CLI workflow needs
+human-visible factory-floor state. Use `control_enabled` only when the user
+explicitly wants dashboard message-request controls.
 
 ## User Involvement
 

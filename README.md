@@ -26,6 +26,7 @@ protocol execution for testing and debugging.
 - Direct inspection commands for batons, events, verification, and reviews
 - Agent packet generation for portable Builder, Reviewer, and Executive handoffs
 - Experimental adapter spawning for packet-based external agent CLI delegation
+- Optional local dashboard for agent-CLI factory-floor visibility
 - Project-local config through `.agentic-factory/config.json`
 - Review findings and verification records
 - Pause/resume checkpoints
@@ -39,6 +40,9 @@ protocol execution for testing and debugging.
 - Python 3.11 or newer
 - No runtime Python package dependencies
 - Git is optional, but enables richer `status` and `doctor` output
+
+Optional dashboard serving requires `requirements-dashboard.txt`. Dashboard
+frontend development requires Node.js 20 or newer.
 
 ## Installation Status
 
@@ -57,6 +61,7 @@ Detailed docs:
 - [Runtime modes](docs/runtime-modes.md)
 - [Agent packets](docs/agent-packets.md)
 - [Agent adapters](docs/agent-adapters.md)
+- [Dashboard](docs/dashboard.md)
 - [Project configuration](docs/configuration.md)
 - [CLI reference](docs/cli.md)
 - [Schema and event contract](docs/schema.md)
@@ -98,6 +103,12 @@ Inspect state:
 python3 /path/to/agentic-factory/scripts/factory.py status --compact
 ```
 
+Open the optional local dashboard for agent-CLI factory-floor visibility:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py dashboard serve --open
+```
+
 Render a human-readable ledger:
 
 ```bash
@@ -120,6 +131,9 @@ python3 /path/to/agentic-factory/scripts/factory.py render-ledger \
 7. Use `verify record` and `review record` for evidence.
 8. Use `baton accept` only after the work meets the selected acceptance tier.
 9. Use `render-ledger` when humans need a markdown snapshot.
+10. Use `dashboard serve` when a generic agent CLI workflow needs a visible
+    local factory floor. This is additive and does not replace Codex app
+    orchestration.
 
 The database is the source of truth. The markdown ledger is a rendered view.
 
@@ -151,8 +165,10 @@ skills/agentic-factory/       CLI/state skill
 skills/agentic-factory-orchestration/
                               Full software-factory orchestration skill
 scripts/factory.py            Stdlib-only SQLite CLI
+scripts/dashboard_server.py   Optional FastAPI dashboard server
 scripts/generate_cli_docs.py  CLI reference generator
 scripts/validate_plugin.py    Repo-local plugin hygiene validator
+dashboard/                    React/Vite dashboard source and built assets
 docs/                         Installation, usage, CLI, and schema docs
 examples/                     End-to-end example sessions
 migrations/                   SQLite schema migrations

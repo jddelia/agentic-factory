@@ -135,6 +135,37 @@ python3 /path/to/agentic-factory/scripts/factory.py agent spawn \
 
 Use [Agent Adapters](agent-adapters.md) for the full safety contract.
 
+## Open The Dashboard
+
+Use the optional local dashboard when an agent CLI workflow needs a visible
+factory floor:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py dashboard serve --open
+```
+
+The dashboard is most useful for `agent_cli_subagents` and `adapter_spawn`
+workflows where the Codex app is not the primary UI. It shows batons, sessions,
+events, verification, reviews, and a ledger preview from the same SQLite DB.
+
+Enable message-request controls explicitly:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py dashboard serve \
+  --enable-control \
+  --open
+```
+
+For process adapters, dashboard messages are recorded as
+`agent.message.requested` events. They are not live terminal input unless a
+future session-backed adapter provides a live transport.
+
+For automation without the web server:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py dashboard snapshot --recent 50
+```
+
 ## Record Verification
 
 ```bash

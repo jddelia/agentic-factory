@@ -1,6 +1,6 @@
 ---
 name: agentic-factory
-description: "Use when directly recording, querying, validating, rendering, generating portable packets, or dry-running/using experimental adapters from Agentic Factory SQLite state with scripts/factory.py: init, status, doctor, baton, agent packet, agent spawn, verification, review, pause/resume, lock, event, and render-ledger commands."
+description: "Use when directly recording, querying, validating, rendering, generating portable packets, opening the optional dashboard, or dry-running/using experimental adapters from Agentic Factory SQLite state with scripts/factory.py: init, status, doctor, dashboard, baton, agent packet, agent spawn, verification, review, pause/resume, lock, event, and render-ledger commands."
 ---
 
 # Agentic Factory
@@ -17,6 +17,8 @@ factory runs, the orchestration skill uses host delegation capabilities and this
 skill records the resulting state transitions. In other runtimes, the lead
 agent may use an agent CLI's own sub-agent mechanism, generated agent packets,
 experimental adapters, or serial role simulation while using the same records.
+The optional dashboard can provide local factory-floor visibility for those
+non-Codex or adapter-heavy workflows.
 
 ## Contract
 
@@ -149,9 +151,31 @@ python3 <plugin-root>/scripts/factory.py baton show B-001
 python3 <plugin-root>/scripts/factory.py events list --recent 20
 python3 <plugin-root>/scripts/factory.py verification list --baton B-001
 python3 <plugin-root>/scripts/factory.py review list --baton B-001
+python3 <plugin-root>/scripts/factory.py dashboard snapshot --recent 50
 ```
 
 Add `--json` when another tool needs structured output.
+
+## Optional Dashboard
+
+Use the dashboard when a generic agent CLI or adapter workflow needs a visible
+factory floor:
+
+```bash
+python3 <plugin-root>/scripts/factory.py dashboard serve --open
+```
+
+The dashboard server is optional and requires `requirements-dashboard.txt`.
+Start it with `--enable-control` only when dashboard message-request controls
+are desired:
+
+```bash
+python3 <plugin-root>/scripts/factory.py dashboard serve --enable-control --open
+```
+
+For process adapters, dashboard messages are recorded as
+`agent.message.requested` events. They are not live terminal input unless a
+session-backed adapter provides live delivery.
 
 ## Agent Packets
 
@@ -214,8 +238,8 @@ python3 <plugin-root>/scripts/factory.py agent spawn \
 
 Adapters write packet files under `.agentic-factory/packets/`, run without
 `shell=True`, enforce timeouts, capture bounded output, and record
-`agent.spawn.started` / `agent.spawn.completed` events for real executions
-unless `--no-event` is supplied.
+`agent_sessions` rows plus `agent.spawn.started` / `agent.spawn.completed`
+events for real executions unless `--no-event` is supplied.
 
 ## Pause, Resume, And Ledger
 

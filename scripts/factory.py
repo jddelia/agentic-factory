@@ -12,12 +12,14 @@ import copy
 import json
 import os
 import re
+import secrets
 import shlex
 from pathlib import PurePosixPath
 import sqlite3
 import subprocess
 import sys
 import time
+import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -42,6 +44,7 @@ AGENT_PACKET_WRITE_POLICIES = {"auto", "read-only", "write"}
 AGENT_SPAWN_ADAPTERS = {"codex-cli", "custom"}
 CODEX_SPAWN_SANDBOXES = {"auto", "read-only", "workspace-write"}
 CODEX_APPROVAL_POLICIES = {"never", "on-request", "untrusted", "on-failure"}
+SESSION_ACTIVE_STATUSES = {"planned", "running", "waiting", "blocked"}
 DEFAULT_LIST_LIMIT = 20
 MAX_LIST_LIMIT = 500
 DEFAULT_SPAWN_TIMEOUT_SECONDS = 1800
@@ -232,7 +235,12 @@ def connect(root: Path, db: str | None = None) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 5000")
     conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+    except sqlite3.Error:
+        pass
     ensure_schema(conn)
     return conn
 
@@ -1662,8 +1670,108 @@ def run_spawn_command(
         }
 
 
+def make_agent_session_id(*, role: str, baton_id: str | None) -> str:
+    stamp = utc_now().replace(":", "").replace("-", "").replace("Z", "")
+    nonce = secrets.token_hex(4)
+    return "-".join(
+        [
+            "session",
+            stamp,
+            safe_slug(role, fallback="role"),
+            safe_slug(baton_id or "no-baton", fallback="no-baton"),
+            nonce,
+        ]
+    )
+
+
+def session_label(*, role: str, baton_id: str | None, adapter: str) -> str:
+    target = baton_id or "factory"
+    return f"{role}:{target} via {adapter}"
+
+
+def create_agent_session_record(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    run_id: str,
+    baton_id: str | None,
+    role: str,
+    adapter: str,
+    packet_path: Path,
+    command: list[str],
+    timeout_seconds: int,
+) -> None:
+    now = utc_now()
+    conn.execute(
+        """
+        INSERT INTO agent_sessions
+          (id, run_id, baton_id, role, adapter, label, status, control_mode, control_ref,
+           packet_path, command_json, started_at, last_seen_at, summary, metadata_json)
+        VALUES (?, ?, ?, ?, ?, ?, 'running', 'process', '', ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            session_id,
+            run_id,
+            baton_id,
+            role,
+            adapter,
+            session_label(role=role, baton_id=baton_id, adapter=adapter),
+            str(packet_path),
+            json_dump(command),
+            now,
+            now,
+            f"{adapter} spawn running for {role}",
+            json_dump(
+                {
+                    "timeout_seconds": timeout_seconds,
+                    "control_note": (
+                        "This session records process state and output. Live steering requires a "
+                        "session-backed adapter such as tmux, Zellij, PTY, or a Codex-native thread."
+                    ),
+                }
+            ),
+        ),
+    )
+
+
+def update_agent_session_record(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    execution: dict[str, Any],
+    output_limit: int,
+) -> None:
+    status = str(execution["status"])
+    ended = utc_now()
+    metadata = {
+        "duration_ms": execution["duration_ms"],
+        "stdout": execution["stdout"],
+        "stderr": execution["stderr"],
+        "stdout_truncated": execution["stdout_truncated"],
+        "stderr_truncated": execution["stderr_truncated"],
+        "output_limit": output_limit,
+    }
+    conn.execute(
+        """
+        UPDATE agent_sessions
+        SET status = ?, last_seen_at = ?, ended_at = ?, exit_code = ?, summary = ?, metadata_json = ?
+        WHERE id = ?
+        """,
+        (
+            status,
+            ended,
+            ended,
+            execution["returncode"],
+            f"Spawn {status} with exit code {execution['returncode']}",
+            json_dump(metadata),
+            session_id,
+        ),
+    )
+
+
 def spawn_event_payload(
     *,
+    session_id: str | None,
     adapter: str,
     role: str,
     baton_id: str | None,
@@ -1675,6 +1783,7 @@ def spawn_event_payload(
     duration_ms: int | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
+        "session_id": session_id or "",
         "adapter": adapter,
         "role": role,
         "baton_id": baton_id or "",
@@ -1709,10 +1818,12 @@ def cmd_agent_spawn(args: argparse.Namespace) -> int:
             raise FactoryError("Write-capable spawn requires a held lock for --baton, or pass --allow-unlocked.")
     packet_path = write_agent_packet_file(root, packet, args.packet_format, args.packet_dir)
     command, stdin = build_spawn_command(root, packet, packet_path, args)
+    session_id = "" if args.dry_run else make_agent_session_id(role=args.role, baton_id=args.baton)
     result: dict[str, Any] = {
         "adapter": args.adapter,
         "role": args.role,
         "baton": args.baton,
+        "session_id": session_id,
         "packet_path": str(packet_path),
         "command": command,
         "command_preview": shell_join(command),
@@ -1726,6 +1837,19 @@ def cmd_agent_spawn(args: argparse.Namespace) -> int:
         print_json(result)
         return 0
 
+    create_agent_session_record(
+        conn,
+        session_id=session_id,
+        run_id=run["id"],
+        baton_id=args.baton,
+        role=args.role,
+        adapter=args.adapter,
+        packet_path=packet_path,
+        command=command,
+        timeout_seconds=timeout_seconds,
+    )
+    conn.commit()
+
     if not args.no_event:
         emit_event(
             conn,
@@ -1735,6 +1859,7 @@ def cmd_agent_spawn(args: argparse.Namespace) -> int:
             baton_id=args.baton,
             summary=f"{args.adapter} spawn started for {args.role}",
             payload=spawn_event_payload(
+                session_id=session_id,
                 adapter=args.adapter,
                 role=args.role,
                 baton_id=args.baton,
@@ -1754,6 +1879,8 @@ def cmd_agent_spawn(args: argparse.Namespace) -> int:
         output_limit=output_limit,
     )
     result.update(execution)
+    update_agent_session_record(conn, session_id=session_id, execution=execution, output_limit=output_limit)
+    conn.commit()
 
     if not args.no_event:
         emit_event(
@@ -1764,6 +1891,7 @@ def cmd_agent_spawn(args: argparse.Namespace) -> int:
             baton_id=args.baton,
             summary=f"{args.adapter} spawn {execution['status']} for {args.role}",
             payload=spawn_event_payload(
+                session_id=session_id,
                 adapter=args.adapter,
                 role=args.role,
                 baton_id=args.baton,
@@ -2410,6 +2538,277 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return exit_code
 
 
+def collect_agent_sessions(conn: sqlite3.Connection, run_id: str, recent: int) -> list[dict[str, Any]]:
+    rows = list(
+        conn.execute(
+            """
+            SELECT *
+            FROM agent_sessions
+            WHERE run_id = ?
+            ORDER BY COALESCE(last_seen_at, started_at, '') DESC, id DESC
+            LIMIT ?
+            """,
+            (run_id, recent),
+        )
+    )
+    sessions: list[dict[str, Any]] = []
+    for row in rows:
+        payload = row_to_public_dict(row) or {}
+        control_mode = payload.get("control_mode") or "none"
+        payload["control_capabilities"] = {
+            "can_record_message": True,
+            "can_deliver_live_message": control_mode in {"tmux", "zellij", "pty", "codex_thread"},
+            "mode": control_mode,
+        }
+        sessions.append(payload)
+    return sessions
+
+
+def collect_recent_verification(conn: sqlite3.Connection, run_id: str, recent: int) -> list[dict[str, Any]]:
+    rows = list(
+        conn.execute(
+            """
+            SELECT v.*
+            FROM verification_runs v
+            LEFT JOIN batons b ON b.id = v.baton_id
+            WHERE v.baton_id IS NULL OR b.run_id = ?
+            ORDER BY v.created_at DESC, v.id DESC
+            LIMIT ?
+            """,
+            (run_id, recent),
+        )
+    )
+    return [row for row in (row_to_public_dict(row) for row in rows) if row is not None]
+
+
+def collect_recent_reviews(conn: sqlite3.Connection, run_id: str, recent: int) -> list[dict[str, Any]]:
+    rows = list(
+        conn.execute(
+            """
+            SELECT r.*
+            FROM reviews r
+            JOIN batons b ON b.id = r.baton_id
+            WHERE b.run_id = ?
+            ORDER BY r.created_at DESC, r.id DESC
+            LIMIT ?
+            """,
+            (run_id, recent),
+        )
+    )
+    return [review_with_findings(conn, row) for row in rows]
+
+
+def collect_dashboard_metrics(
+    *,
+    batons: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    verification: list[dict[str, Any]],
+    reviews: list[dict[str, Any]],
+    sessions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    failed_checks = sum(1 for row in verification if row.get("result") == "fail")
+    blocked_checks = sum(1 for row in verification if row.get("result") == "blocked")
+    pending_reviews = sum(1 for row in batons if row.get("status") in {"handed_off", "review"})
+    patch_required = sum(1 for row in reviews if row.get("status") == "patch_required")
+    active_sessions = sum(1 for row in sessions if row.get("status") in SESSION_ACTIVE_STATUSES)
+    active_batons_count = sum(1 for row in batons if row.get("status") in ACTIVE_BATON_STATUSES)
+    return {
+        "active_batons": active_batons_count,
+        "active_sessions": active_sessions,
+        "pending_reviews": pending_reviews,
+        "patch_required_reviews": patch_required,
+        "failed_verification": failed_checks,
+        "blocked_verification": blocked_checks,
+        "recent_events": len(events),
+    }
+
+
+def collect_dashboard_snapshot(conn: sqlite3.Connection, root: Path, db: str | None, recent: int) -> dict[str, Any]:
+    recent = require_limit(recent, field="recent")
+    try:
+        status = collect_status(conn, root, db)
+    except FactoryError as exc:
+        return {
+            "initialized": False,
+            "generated_at": utc_now(),
+            "root": str(root),
+            "db": str(db_path_for(root, db)),
+            "error": str(exc),
+            "status": None,
+            "metrics": {},
+            "batons": [],
+            "events": [],
+            "verification": [],
+            "reviews": [],
+            "sessions": [],
+        }
+
+    run = status["run"]
+    run_id = run["id"]
+    batons = [
+        row
+        for row in (
+            row_to_public_dict(row)
+            for row in conn.execute(
+                "SELECT * FROM batons WHERE run_id = ? ORDER BY assigned_at DESC LIMIT ?",
+                (run_id, recent),
+            )
+        )
+        if row is not None
+    ]
+    events = [
+        row
+        for row in (
+            row_to_public_dict(row)
+            for row in conn.execute(
+                """
+                SELECT *
+                FROM events
+                WHERE run_id = ?
+                ORDER BY occurred_at DESC, id DESC
+                LIMIT ?
+                """,
+                (run_id, recent),
+            )
+        )
+        if row is not None
+    ]
+    verification = collect_recent_verification(conn, run_id, recent)
+    reviews = collect_recent_reviews(conn, run_id, recent)
+    sessions = collect_agent_sessions(conn, run_id, recent)
+    metrics = collect_dashboard_metrics(
+        batons=batons,
+        events=events,
+        verification=verification,
+        reviews=reviews,
+        sessions=sessions,
+    )
+    return {
+        "initialized": True,
+        "generated_at": utc_now(),
+        "root": str(root),
+        "db": str(db_path_for(root, db)),
+        "status": status,
+        "metrics": metrics,
+        "batons": batons,
+        "events": events,
+        "verification": verification,
+        "reviews": reviews,
+        "sessions": sessions,
+    }
+
+
+def require_agent_session(conn: sqlite3.Connection, run_id: str, session_id: str) -> sqlite3.Row:
+    session = conn.execute(
+        "SELECT * FROM agent_sessions WHERE id = ? AND run_id = ?",
+        (session_id, run_id),
+    ).fetchone()
+    if session is None:
+        raise FactoryError(f"Unknown agent session: {session_id}")
+    return session
+
+
+def record_agent_session_message(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    session_id: str,
+    actor: str,
+    message: str,
+) -> dict[str, Any]:
+    text = message.strip()
+    if not text:
+        raise FactoryError("Message must not be empty.")
+    if len(text) > 8000:
+        raise FactoryError("Message must be 8000 characters or fewer.")
+    session = require_agent_session(conn, run_id, session_id)
+    payload = {
+        "session_id": session_id,
+        "message": text,
+        "delivery": "recorded_only",
+        "control_mode": session["control_mode"],
+        "control_ref": session["control_ref"],
+    }
+    now = utc_now()
+    emit_event(
+        conn,
+        event_type="agent.message.requested",
+        actor=actor or "Dashboard",
+        run_id=run_id,
+        baton_id=session["baton_id"],
+        summary=shorten(text, 120),
+        payload=payload,
+    )
+    conn.execute(
+        """
+        UPDATE agent_sessions
+        SET last_seen_at = ?, summary = ?
+        WHERE id = ?
+        """,
+        (now, "Dashboard message requested", session_id),
+    )
+    return payload
+
+
+def cmd_dashboard_snapshot(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    conn = connect(root, args.db)
+    snapshot = collect_dashboard_snapshot(conn, root, args.db, args.recent)
+    print_json(snapshot)
+    return 0
+
+
+def is_loopback_host(host: str) -> bool:
+    return host in {"127.0.0.1", "localhost", "::1"}
+
+
+def require_port(port: int) -> int:
+    if port < 1 or port > 65535:
+        raise FactoryError("--port must be between 1 and 65535")
+    return port
+
+
+def cmd_dashboard_serve(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    require_limit(args.recent, field="recent")
+    port = require_port(args.port)
+    if not is_loopback_host(args.host) and not args.allow_remote:
+        raise FactoryError("dashboard serve binds to loopback by default; pass --allow-remote for non-loopback hosts.")
+
+    dist_dir = PLUGIN_ROOT / "dashboard" / "dist"
+    if not (dist_dir / "index.html").is_file():
+        raise FactoryError("Dashboard assets are missing. Run `cd dashboard && npm install && npm run build`.")
+
+    try:
+        import dashboard_server
+        dashboard_server.ensure_dependencies()
+    except ImportError as exc:
+        raise FactoryError(
+            "Dashboard server dependencies are missing. Install them with "
+            "`python3 -m pip install -r requirements-dashboard.txt`."
+        ) from exc
+
+    token = args.token or secrets.token_urlsafe(24)
+    url = f"http://{args.host}:{port}/?token={token}"
+    print(f"Agentic Factory dashboard: {url}")
+    print(f"Project root: {root}")
+    print(f"Control actions: {'enabled' if args.enable_control else 'read-only'}")
+    if args.open:
+        webbrowser.open(url)
+    return int(
+        dashboard_server.serve(
+            factory=sys.modules[__name__],
+            root=root,
+            db=args.db,
+            host=args.host,
+            port=port,
+            token=token,
+            enable_control=args.enable_control,
+            recent=args.recent,
+        )
+    )
+
+
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--root", default=None, help="Project root; defaults to current directory.")
     parser.add_argument("--db", default=None, help="Factory DB path; defaults to .agentic-factory/factory.db.")
@@ -2442,6 +2841,29 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--json", action="store_true")
     status.add_argument("--compact", action="store_true")
     status.set_defaults(func=cmd_status)
+
+    dashboard = subparsers.add_parser("dashboard", help="Inspect or serve the local factory dashboard.")
+    dashboard_sub = dashboard.add_subparsers(dest="dashboard_command", required=True)
+    dashboard_snapshot = dashboard_sub.add_parser("snapshot", help="Print the dashboard read model as JSON.")
+    dashboard_snapshot.add_argument("--recent", type=int, default=50)
+    dashboard_snapshot.set_defaults(func=cmd_dashboard_snapshot)
+    dashboard_serve = dashboard_sub.add_parser("serve", help="Serve the optional local dashboard UI.")
+    dashboard_serve.add_argument("--host", default="127.0.0.1")
+    dashboard_serve.add_argument("--port", type=int, default=8765)
+    dashboard_serve.add_argument("--recent", type=int, default=100)
+    dashboard_serve.add_argument("--token", default="", help="Access token; generated by default.")
+    dashboard_serve.add_argument("--open", action="store_true", help="Open the dashboard URL in the default browser.")
+    dashboard_serve.add_argument(
+        "--enable-control",
+        action="store_true",
+        help="Enable control endpoints such as dashboard message requests.",
+    )
+    dashboard_serve.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="Allow binding to a non-loopback host. A token is still required.",
+    )
+    dashboard_serve.set_defaults(func=cmd_dashboard_serve)
 
     agent = subparsers.add_parser("agent", help="Generate portable agent packets.")
     agent_sub = agent.add_subparsers(dest="agent_command", required=True)
