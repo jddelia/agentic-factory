@@ -17,9 +17,47 @@ ledgers.
 The primary runtime is the Codex app. Prefer Codex-native thread or sub-agent
 capabilities when they are available and safe for the selected work. Other
 agent CLIs may approximate the same factory model through their own delegation
-features, generated agent packets, or serial role simulation. The `factory.py`
-CLI records state and renders packets; it does not directly spawn arbitrary
-workers.
+features, generated agent packets, visible background sessions, or serial role
+simulation. The `factory.py` CLI records state, renders packets, can expose an
+optional dashboard, and can run explicitly authorized session/process adapter
+spawns.
+
+## Required Sequence
+
+This sequence is a contract, not a recommendation. Violating it is incorrect
+behavior regardless of task size, project clarity, or implementation urgency.
+
+For generic agent CLI runtimes, or whenever Codex-native visible worker threads
+are not available, follow these hard stops in order:
+
+1. Inspect only enough project and factory state to identify the repository,
+   existing `.agentic-factory` state, dirty worktree, obvious stack, likely
+   checks, and available runtime/delegation capabilities.
+2. Resolve the startup configuration: objective, hard constraints, work mode,
+   topology, runtime mode, verification policy, dashboard policy, and session
+   strategy. Inferring safe defaults is allowed; skipping presentation of those
+   defaults is not.
+3. Present the resolved startup brief to the user and ask for confirmation or
+   missing information in normal chat. Ask at most three questions. Do not use
+   a special user-input tool unless the runtime explicitly provides one.
+4. After confirmation, run `factory.py up --background` from the target
+   project root. In agent-CLI dashboard workflows, `up` is the first mutating
+   factory command, and `--background` is the non-blocking mode that still
+   starts the dashboard server.
+5. PAUSE. Present the dashboard URL, run ID, project root, topology, runtime
+   mode, control state, and top-level operator. Wait for the user to say that
+   factory operations may begin.
+6. Only after the user confirms readiness, run `status --compact`, `doctor`,
+   create the first baton, generate packets, spawn workers, or edit project
+   files.
+
+Before step 5 is complete, do not run `baton create`, `agent packet`,
+`agent spawn`, implementation commands, file edits, or acceptance commands.
+
+For Codex-native runtimes with visible native worker threads, use native
+thread orchestration as the primary UI. Durable state is still required, but
+`init` may replace `up` only when the Codex app already provides the visible
+factory floor and the user does not need the local dashboard.
 
 ## Outcome
 
@@ -35,6 +73,7 @@ Create a factory that matches the project's risk, maturity, and delivery target:
 - explicit baton lifecycle, handoff evidence, review policy, and acceptance tier;
 - explicit stop/resume controls with recoverable state;
 - explicit runtime mode and delegation capability preflight;
+- optional local dashboard visibility for agent-CLI factory floors;
 - explicit permission, model, approval, destructive-action, credential, and
   external-effect policy;
 - commits only for accepted work unless the user explicitly delegates otherwise.
@@ -52,11 +91,12 @@ user request, project docs, tests, risk surface, and local tool constraints.
    - `codex_native`: preferred when Codex-native worker delegation is available.
    - `agent_cli_subagents`: use another CLI's sub-agent mechanism after
      capability preflight.
-   - `serial_single_agent`: use when delegation is unavailable, ambiguous, or
-     unsafe.
+   - `adapter_spawn`: use a first-class session adapter when the host CLI's
+     best delegation path is a visible background session, especially
+     `claude-code`.
+   - `serial_single_agent`: use only when delegation is unavailable, ambiguous,
+     or unsafe.
    - `manual_protocol`: use for tests, demos, and human debugging.
-   - `adapter_spawn`: experimental process-level adapter; dry-run first and use
-     only when explicitly configured.
 3. Choose or confirm a compact configuration:
    - `work_mode`: default `balanced` unless the request clearly implies another
      mode.
@@ -67,14 +107,18 @@ user request, project docs, tests, risk surface, and local tool constraints.
      readiness.
    - `verification_level`: default `focused_plus_build` for normal feature work.
    - `concurrency_policy`: default `single_writer`.
-4. For DB-backed factories, initialize or inspect state with `agentic-factory`:
-   `init`, `status --compact`, then `doctor`.
-5. Define the next baton with objective, scope, non-goals, risk, acceptance tier,
+4. For agent-CLI dashboard workflows, call `agentic-factory` `up` after this
+   preflight, present the dashboard URL/run/topology/runtime/operator values,
+   and pause until the user confirms factory operations can begin.
+5. For Codex-native or state-only DB-backed factories, initialize or inspect
+   state with `agentic-factory`: `init`, `status --compact`, then `doctor`.
+6. Define the next baton with objective, scope, non-goals, risk, acceptance tier,
    verification level, escalation triggers, owner, and handoff requirements.
-6. Assign only the roles needed for the chosen topology and runtime mode.
+7. Assign only the roles needed for the chosen topology and runtime mode.
 
 Ask at most three short questions when required. If the user's request gives
-enough signal, infer and proceed.
+enough signal, infer defaults, present them for confirmation, then proceed only
+after the required startup sequence allows it.
 
 ## Runtime Modes
 
@@ -82,19 +126,72 @@ enough signal, infer and proceed.
   to delegate Builder, Reviewer, Manager/User Liaison, Watcher, or Ledger work
   when the host exposes those tools. Record baton state before delegation.
 - `agent_cli_subagents`: use when another agent CLI has a clear, safe
-  sub-agent mechanism. Let that CLI own spawning; pass scoped baton or review
-  packets from `factory.py agent packet` and record returned evidence through
-  `agentic-factory`.
+  sub-agent or background-session mechanism. Let that CLI own native spawning
+  when possible; pass scoped baton or review packets from `factory.py agent
+  packet` and record returned evidence through `agentic-factory`.
+- `adapter_spawn`: explicit adapters that launch external agent CLI sessions or
+  processes from generated packets. Prefer the `claude-code` adapter for Claude
+  Code CLI background sessions when Codex-native visible threads are not
+  available. Always dry-run custom or uncertain commands first. Do not execute
+  unless the user or project configuration explicitly authorizes external
+  spawns.
 - `serial_single_agent`: one agent runs Executive, Builder, Reviewer, and Ledger
   duties sequentially. Keep role boundaries explicit and record the same DB
-  evidence.
+  evidence. Do not choose this solely because workers do not inherit plugin
+  context; agent packets carry that context explicitly.
 - `manual_protocol`: human or test harness runs CLI commands directly to
   exercise the factory protocol.
-- `adapter_spawn`: explicit experimental adapters that launch external agent
-  CLI processes from generated packets. Always dry-run first. Do not execute
-  unless the user or project configuration explicitly authorizes them.
 
 Read `docs/runtime-modes.md` when explaining or changing runtime behavior.
+Read `docs/dashboard.md` before presenting the local dashboard as a control
+surface.
+
+## Agent-CLI Startup Flow
+
+When the user invokes the plugin from a generic agent CLI, do not ask the user
+to manually run setup commands. Use this sequence:
+
+1. Briefly infer or ask for the build objective and hard constraints.
+2. Choose the work mode, topology, runtime mode, verification policy, and
+   dashboard policy. Keep the prompt short; infer low-risk defaults.
+3. Run `factory.py up --background` from the target project root. Use
+   `--runtime-mode agent_cli_subagents` unless Codex-native mode is active or
+   preflight selected an explicit adapter/session strategy. Use `--read-only`
+   only if controls should be disabled. Do not use `--no-serve` for real
+   factory startup; it is for tests only and leaves the dashboard URL without a
+   running server.
+4. Present the dashboard URL, run ID, project root, topology, runtime mode,
+   control state, and top-level operator.
+5. Pause and wait for the user to confirm readiness.
+6. Begin factory operations only after confirmation, starting with status,
+   doctor, and the first baton.
+
+This startup flow is a compatibility layer for non-Codex environments. It does
+not replace Codex-native thread orchestration when native Codex delegation is
+available.
+
+## Dashboard Control Loop
+
+In agent-CLI dashboard workflows, dashboard messages are durable
+`control_messages`, not guaranteed live terminal input. The lead agent must
+actively consume and acknowledge them.
+
+Before creating a baton, after every worker handoff, before acceptance, and at
+least once per visible dashboard checkpoint:
+
+```bash
+python3 <plugin-root>/scripts/factory.py messages inbox --claim --actor "Lead Agent" --json
+```
+
+If a new dashboard message requests pause, scope change, status, review,
+handoff, or cancellation, respond in chat and record the appropriate factory
+event or baton transition before continuing. Acknowledge handled messages:
+
+```bash
+python3 <plugin-root>/scripts/factory.py messages ack M-0001 --status handled --summary "Handled"
+```
+
+Do not silently ignore dashboard control messages.
 
 ## Capability Preflight
 
@@ -112,10 +209,13 @@ running arbitrary external agent processes:
 - cancellation, timeout, pause, resume, and stale-worker recovery behavior;
 - prompt, file, context, tool-call, and long-command limits.
 
-If worker capability or ownership is ambiguous, use `serial_single_agent` until
-the ambiguity is resolved. Do not spawn external agent CLI processes directly
-unless operating in an explicitly configured adapter mode, after a dry-run
-inspection.
+If Claude Code CLI background sessions are available (`claude --bg`,
+`claude agents --json`, attach/log/stop), prefer separate `claude-code`
+sessions for substantial Builder/Reviewer work unless workspace or permission
+risk makes that unsafe. If worker capability or ownership is ambiguous, pause
+or use `serial_single_agent` until the ambiguity is resolved. Do not spawn
+external agent CLI processes directly unless operating in an explicitly
+configured adapter mode.
 
 ## Delegation Protocol
 
@@ -127,7 +227,8 @@ For every delegated worker:
    `factory.py agent packet` when the runtime needs a portable delegation
    prompt.
 3. State whether the worker may edit files, run commands, and record CLI
-   evidence directly.
+   evidence directly. Prefer a named permission profile such as `node-builder`
+   or `node-reviewer` when spawning external sessions.
 4. Require compact handoff output: files, behavior, contracts, commands,
    passing checks, failing checks, skipped checks, risks, and recommendation.
 5. If the worker cannot use the CLI safely, the Executive/Ledger records its
@@ -135,6 +236,40 @@ For every delegated worker:
 6. Do not assign a Reviewer to edit files unless explicitly authorized.
 7. Do not accept a baton until verification and review evidence meet the
    selected acceptance tier.
+
+For Claude Code CLI session-backed delegation, the lead may create visible
+background workers with:
+
+```bash
+python3 <plugin-root>/scripts/factory.py agent spawn \
+  --adapter claude-code \
+  --role builder \
+  --baton B-001 \
+  --permission-profile node-builder \
+  --experimental
+```
+
+Then inspect and refresh session state with:
+
+```bash
+python3 <plugin-root>/scripts/factory.py agent session list --sync --json
+python3 <plugin-root>/scripts/factory.py agent session logs <session-id>
+```
+
+Use `--claude-worktree` for isolated write-capable workers only when the merge
+plan is clear. Dashboard messages to Claude sessions are durable DB requests;
+attach to the Claude session for true live conversation.
+
+Run flow integrity checks before acceptance and after recovering from a stalled
+worker:
+
+```bash
+python3 <plugin-root>/scripts/factory.py flow doctor --json
+```
+
+Do not use raw `event append` for normal lifecycle transitions. Builder spawn,
+handoff, reviewer spawn, review record, and accept commands are guarded and
+emit required lifecycle events automatically.
 
 ## Work Modes
 
@@ -266,8 +401,15 @@ acceptance.
 - Keep hard invariants explicit in every baton.
 - Keep Codex-native orchestration first when available; use other runtimes as
   compatibility modes.
-- Treat `factory.py agent spawn` as experimental and opt-in. Prefer packets
-  without process spawning when runtime safety is unclear.
+- Treat `factory.py agent spawn` as explicit and opt-in. Prefer first-class
+  session-backed adapters such as `claude-code` when they are safer than a
+  single serial context; prefer packets without spawning when runtime safety is
+  unclear.
+- Treat `factory.py dashboard serve` as an optional visibility/control plane
+  for non-Codex or adapter-heavy workflows, not a replacement for Codex app
+  orchestration.
+- In agent-CLI dashboard workflows, prefer `factory.py up --background` over
+  making the user manually initialize state and start the dashboard.
 - If push/auth fails, keep local commits and record remote status.
 - If a design, browser, document, spreadsheet, GitHub, or other domain skill is
   explicitly named, use that skill for the relevant work.
@@ -282,4 +424,4 @@ acceptance.
   boundaries.
 - `../../docs/agent-packets.md`: portable packet generation and generic CLI
   delegation flow.
-- `../../docs/agent-adapters.md`: experimental process adapter safety contract.
+- `../../docs/agent-adapters.md`: session/process adapter safety contract.

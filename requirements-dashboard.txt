@@ -1,0 +1,2 @@
+# The default dashboard server is implemented with the Python standard library.
+# This file is intentionally empty for compatibility with earlier setup docs.

@@ -1,11 +1,14 @@
 .DS_Store
 __pycache__/
+node_modules/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
 .coverage
 htmlcov/
+*.tsbuildinfo
 .venv/
+.venv-dashboard/
 venv/
 env/
 .agentic-factory/
@@ -13,3 +16,4 @@ docs/build_ledger.md
 *.sqlite
 *.sqlite3
 *.db
+docs/vision.md

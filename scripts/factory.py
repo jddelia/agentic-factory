@@ -12,12 +12,16 @@ import copy
 import json
 import os
 import re
+import secrets
 import shlex
+import signal
+import socket
 from pathlib import PurePosixPath
 import sqlite3
 import subprocess
 import sys
 import time
+import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -27,8 +31,29 @@ PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DB_DIR = ".agentic-factory"
 DEFAULT_DB_NAME = "factory.db"
 DEFAULT_CONFIG_NAME = "config.json"
-ACTIVE_BATON_STATUSES = {"assigned", "active", "in_progress", "handed_off", "review"}
+ACTIVE_BATON_STATUSES = {
+    "assigned",
+    "active",
+    "in_progress",
+    "handed_off",
+    "review",
+    "patch_required",
+    "ready_for_acceptance",
+}
 VERIFICATION_RESULTS = {"pass", "fail", "not_run", "blocked"}
+REVIEW_ACCEPTED_STATUSES = {"accepted", "approved", "pass", "passed", "clean"}
+REVIEW_PATCH_REQUIRED_STATUSES = {"patch_required", "changes_requested", "failed", "blocked"}
+CONTROL_MESSAGE_STATUSES = {
+    "queued",
+    "delivered",
+    "read",
+    "handling",
+    "handled",
+    "failed",
+    "expired",
+    "cancelled",
+}
+CONTROL_MESSAGE_ACTIVE_STATUSES = {"queued", "delivered", "read", "handling"}
 AGENT_PACKET_ROLES = {"builder", "reviewer", "executive"}
 AGENT_PACKET_FORMATS = {"markdown", "json"}
 AGENT_PACKET_RUNTIME_MODES = {
@@ -39,9 +64,64 @@ AGENT_PACKET_RUNTIME_MODES = {
     "adapter_spawn",
 }
 AGENT_PACKET_WRITE_POLICIES = {"auto", "read-only", "write"}
-AGENT_SPAWN_ADAPTERS = {"codex-cli", "custom"}
+AGENT_SPAWN_ADAPTERS = {"claude-code", "codex-cli", "custom"}
 CODEX_SPAWN_SANDBOXES = {"auto", "read-only", "workspace-write"}
 CODEX_APPROVAL_POLICIES = {"never", "on-request", "untrusted", "on-failure"}
+PERMISSION_PROFILE_NAMES = {"read-only", "node-builder", "node-reviewer", "workspace-builder"}
+CLAUDE_PERMISSION_PROFILE_MODES = {
+    "read-only": "plan",
+    "node-builder": "acceptEdits",
+    "node-reviewer": "plan",
+    "workspace-builder": "acceptEdits",
+}
+PERMISSION_PROFILES: dict[str, dict[str, Any]] = {
+    "read-only": {
+        "name": "read-only",
+        "mode": "read_only",
+        "write_policy": "read-only",
+        "allow_commands": [],
+        "deny_commands": ["git push *", "rm -rf *"],
+        "allow_tools": ["read"],
+        "network": "default",
+    },
+    "node-builder": {
+        "name": "node-builder",
+        "mode": "workspace_write",
+        "write_policy": "baton_scope",
+        "allow_commands": ["node *", "npm *", "npx *"],
+        "deny_commands": ["git push *", "rm -rf *"],
+        "allow_tools": ["read", "edit", "bash"],
+        "network": "default",
+    },
+    "node-reviewer": {
+        "name": "node-reviewer",
+        "mode": "read_only",
+        "write_policy": "read-only",
+        "allow_commands": ["node *", "npm *", "npx *"],
+        "deny_commands": ["git push *", "rm -rf *"],
+        "allow_tools": ["read", "bash"],
+        "network": "default",
+    },
+    "workspace-builder": {
+        "name": "workspace-builder",
+        "mode": "workspace_write",
+        "write_policy": "baton_scope",
+        "allow_commands": [],
+        "deny_commands": ["git push *", "rm -rf *"],
+        "allow_tools": ["read", "edit", "bash"],
+        "network": "default",
+    },
+}
+SESSION_ACTIVE_STATUSES = {"planned", "running", "waiting", "blocked"}
+CLAUDE_CODE_TERMINAL_STATUSES = {"completed", "done", "failed", "stopped", "exited", "removed"}
+CLAUDE_CODE_BACKGROUND_ID_RE = re.compile(
+    r"(?:backgrounded\s*[^\w\s]\s*|claude\s+attach\s+)([A-Za-z0-9][A-Za-z0-9_-]{2,})"
+)
+CONTROL_MESSAGE_EVENT_TYPES = {
+    "operator.message.requested",
+    "agent.message.requested",
+    "baton.message.requested",
+}
 DEFAULT_LIST_LIMIT = 20
 MAX_LIST_LIMIT = 500
 DEFAULT_SPAWN_TIMEOUT_SECONDS = 1800
@@ -49,6 +129,7 @@ MAX_SPAWN_TIMEOUT_SECONDS = 86400
 DEFAULT_SPAWN_OUTPUT_LIMIT = 20000
 MAX_SPAWN_OUTPUT_LIMIT = 200000
 DEFAULT_PACKET_DIR = ".agentic-factory/packets"
+DEFAULT_DASHBOARD_PORT = 8765
 DEFAULT_PROJECT_CONFIG: dict[str, Any] = {
     "default_mode": "balanced",
     "default_topology": "executive_as_ledger",
@@ -232,7 +313,12 @@ def connect(root: Path, db: str | None = None) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 5000")
     conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+    except sqlite3.Error:
+        pass
     ensure_schema(conn)
     return conn
 
@@ -393,6 +479,19 @@ def current_run(conn: sqlite3.Connection) -> sqlite3.Row | None:
     ).fetchone()
 
 
+def run_metadata(run: sqlite3.Row) -> dict[str, Any]:
+    return json_loads_or_empty(run["metadata_json"], {})
+
+
+def merge_run_metadata(conn: sqlite3.Connection, run_id: str, values: dict[str, Any]) -> None:
+    row = conn.execute("SELECT metadata_json FROM factory_runs WHERE id = ?", (run_id,)).fetchone()
+    existing = json_loads_or_empty(row["metadata_json"] if row else "{}", {})
+    conn.execute(
+        "UPDATE factory_runs SET metadata_json = ?, updated_at = ? WHERE id = ?",
+        (json_dump({**existing, **values}), utc_now(), run_id),
+    )
+
+
 def require_run(conn: sqlite3.Connection) -> sqlite3.Row:
     run = current_run(conn)
     if run is None:
@@ -494,6 +593,285 @@ def require_current_baton(conn: sqlite3.Connection, run: sqlite3.Row, baton_id: 
     return baton
 
 
+def public_message_id(message_id: int | str) -> str:
+    text = str(message_id)
+    if text.upper().startswith("M-"):
+        return text.upper()
+    try:
+        return f"M-{int(text):04d}"
+    except ValueError:
+        return text
+
+
+def parse_message_id(message_id: str) -> int:
+    text = message_id.strip()
+    if text.upper().startswith("M-"):
+        text = text[2:]
+    try:
+        value = int(text)
+    except ValueError as exc:
+        raise FactoryError(f"Invalid message id: {message_id}") from exc
+    if value < 1:
+        raise FactoryError(f"Invalid message id: {message_id}")
+    return value
+
+
+def control_message_public(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    payload = row_to_public_dict(row)
+    if payload is None:
+        return None
+    payload["public_id"] = public_message_id(payload["id"])
+    payload["payload"] = payload.get("payload") or parse_json_field(str(payload.get("payload_json", "{}")))
+    return payload
+
+
+def record_control_message(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    baton_id: str | None,
+    target_type: str,
+    target_id: str,
+    target_label: str,
+    event_type: str,
+    actor: str,
+    message: str,
+    delivery: str,
+    control_mode: str,
+    control_ref: str = "",
+    payload: dict[str, Any] | None = None,
+    summary: str = "",
+) -> dict[str, Any]:
+    text = message.strip()
+    if not text:
+        raise FactoryError("Message must not be empty.")
+    if len(text) > 8000:
+        raise FactoryError("Message must be 8000 characters or fewer.")
+    now = utc_now()
+    cur = conn.execute(
+        """
+        INSERT INTO control_messages
+          (run_id, baton_id, target_type, target_id, target_label, event_type, actor,
+           message, status, delivery, control_mode, control_ref, created_at, updated_at,
+           summary, payload_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            baton_id,
+            target_type,
+            target_id,
+            target_label,
+            event_type,
+            actor or "Dashboard",
+            text,
+            delivery,
+            control_mode,
+            control_ref,
+            now,
+            now,
+            summary or shorten(text, 120),
+            json_dump(payload or {}),
+        ),
+    )
+    message_row = conn.execute(
+        "SELECT * FROM control_messages WHERE id = ?",
+        (int(cur.lastrowid),),
+    ).fetchone()
+    public = control_message_public(message_row) or {}
+    emit_payload = {**(payload or {}), "message": text, "message_id": public.get("public_id", ""), "delivery": delivery, "control_mode": control_mode}
+    if control_ref:
+        emit_payload["control_ref"] = control_ref
+    emit_event(
+        conn,
+        event_type=event_type,
+        actor=actor or "Dashboard",
+        run_id=run_id,
+        baton_id=baton_id,
+        summary=summary or shorten(text, 120),
+        payload=emit_payload,
+    )
+    return public
+
+
+def transition_baton_status(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    baton_id: str,
+    new_status: str,
+    actor: str,
+    event_type: str,
+    summary: str,
+    payload: dict[str, Any] | None = None,
+    allowed_from: set[str] | None = None,
+    force: bool = False,
+) -> bool:
+    baton = require_baton(conn, baton_id)
+    if baton["run_id"] != run_id:
+        raise FactoryError(f"Baton {baton_id} does not belong to current run {run_id}.")
+    current = str(baton["status"])
+    if current == new_status:
+        return False
+    if current == "accepted" and not force:
+        raise FactoryError(f"Baton {baton_id} is already accepted.")
+    if allowed_from is not None and current not in allowed_from and not force:
+        raise FactoryError(
+            f"Cannot transition baton {baton_id} from {current} to {new_status}; expected one of {', '.join(sorted(allowed_from))}."
+        )
+    metadata = json_loads_or_empty(baton["metadata_json"], {})
+    lifecycle = metadata.get("lifecycle")
+    if not isinstance(lifecycle, list):
+        lifecycle = []
+    now = utc_now()
+    lifecycle.append(
+        {
+            "from": current,
+            "to": new_status,
+            "at": now,
+            "actor": actor,
+            "event_type": event_type,
+        }
+    )
+    metadata["lifecycle"] = lifecycle[-50:]
+    conn.execute(
+        """
+        UPDATE batons
+        SET status = ?, summary = COALESCE(NULLIF(?, ''), summary), metadata_json = ?
+        WHERE id = ?
+        """,
+        (new_status, summary, json_dump(metadata), baton_id),
+    )
+    emit_event(
+        conn,
+        event_type=event_type,
+        actor=actor,
+        run_id=run_id,
+        baton_id=baton_id,
+        summary=summary,
+        payload={"from_status": current, "to_status": new_status, **(payload or {})},
+    )
+    return True
+
+
+def ensure_baton_in_progress(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    baton_id: str | None,
+    actor: str,
+    session_id: str | None = None,
+) -> bool:
+    if not baton_id:
+        return False
+    return transition_baton_status(
+        conn,
+        run_id=run_id,
+        baton_id=baton_id,
+        new_status="in_progress",
+        actor=actor,
+        event_type="baton.in_progress",
+        summary=f"{baton_id} moved to in_progress",
+        payload={"session_id": session_id or "", "source": "agent_spawn"},
+        allowed_from={"assigned", "active", "patch_required"},
+    )
+
+
+def ensure_baton_review_started(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    baton_id: str | None,
+    actor: str,
+    session_id: str | None = None,
+) -> bool:
+    if not baton_id:
+        return False
+    return transition_baton_status(
+        conn,
+        run_id=run_id,
+        baton_id=baton_id,
+        new_status="review",
+        actor=actor,
+        event_type="review.started",
+        summary=f"{baton_id} review started",
+        payload={"session_id": session_id or "", "source": "agent_spawn"},
+        allowed_from={"handed_off", "ready_for_acceptance"},
+    )
+
+
+def apply_spawn_lifecycle_transition(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    role: str,
+    baton_id: str | None,
+    actor: str,
+    session_id: str,
+) -> bool:
+    if role == "builder":
+        return ensure_baton_in_progress(
+            conn,
+            run_id=run_id,
+            baton_id=baton_id,
+            actor=actor,
+            session_id=session_id,
+        )
+    if role == "reviewer":
+        return ensure_baton_review_started(
+            conn,
+            run_id=run_id,
+            baton_id=baton_id,
+            actor=actor,
+            session_id=session_id,
+        )
+    return False
+
+
+def ensure_baton_ready_for_acceptance(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    baton_id: str,
+    actor: str,
+    review_id: int,
+    review_status: str,
+) -> bool:
+    return transition_baton_status(
+        conn,
+        run_id=run_id,
+        baton_id=baton_id,
+        new_status="ready_for_acceptance",
+        actor=actor,
+        event_type="baton.ready_for_acceptance",
+        summary=f"{baton_id} is ready for acceptance",
+        payload={"review_id": review_id, "review_status": review_status},
+        allowed_from={"review", "handed_off"},
+    )
+
+
+def ensure_baton_patch_required(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    baton_id: str,
+    actor: str,
+    review_id: int,
+    review_status: str,
+) -> bool:
+    return transition_baton_status(
+        conn,
+        run_id=run_id,
+        baton_id=baton_id,
+        new_status="patch_required",
+        actor=actor,
+        event_type="baton.patch_required",
+        summary=f"{baton_id} requires patching",
+        payload={"review_id": review_id, "review_status": review_status},
+        allowed_from={"review", "handed_off", "ready_for_acceptance"},
+    )
+
+
 def markdown_cell(value: Any) -> str:
     text = "" if value is None else str(value)
     return text.replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ")
@@ -515,10 +893,38 @@ def cmd_init(args: argparse.Namespace) -> int:
         )
         return 0
 
+    run_id = create_factory_run(
+        conn,
+        root=root,
+        config=config,
+        mode=args.mode,
+        objective=args.objective,
+        topology=args.topology,
+        run_id=args.run_id,
+        actor=args.actor,
+        metadata={"created_by": "agentic-factory"},
+    )
+    conn.commit()
+    print_json({"status": "initialized", "db": str(db_path_for(root, args.db)), "run_id": run_id})
+    return 0
+
+
+def create_factory_run(
+    conn: sqlite3.Connection,
+    *,
+    root: Path,
+    config: dict[str, Any],
+    mode: str | None,
+    objective: str,
+    topology: str | None,
+    run_id: str,
+    actor: str,
+    metadata: dict[str, Any],
+) -> str:
     now = utc_now()
-    run_id = args.run_id or f"factory-{now.replace(':', '').replace('-', '').replace('Z', '')}"
-    work_mode = args.mode or config["default_mode"]
-    topology = args.topology or config["default_topology"]
+    effective_run_id = run_id or f"factory-{now.replace(':', '').replace('-', '').replace('Z', '')}"
+    work_mode = mode or config["default_mode"]
+    effective_topology = topology or config["default_topology"]
     conn.execute(
         """
         INSERT INTO factory_runs
@@ -526,27 +932,25 @@ def cmd_init(args: argparse.Namespace) -> int:
         VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)
         """,
         (
-            run_id,
+            effective_run_id,
             str(root),
-            args.objective or "",
+            objective or "",
             work_mode,
-            topology,
+            effective_topology,
             now,
             now,
-            json_dump({"created_by": "agentic-factory"}),
+            json_dump(metadata),
         ),
     )
     emit_event(
         conn,
         event_type="factory.started",
-        actor=args.actor,
-        run_id=run_id,
-        summary=args.objective or f"Factory started in {work_mode} mode",
-        payload={"work_mode": work_mode, "topology": topology, "project_root": str(root)},
+        actor=actor,
+        run_id=effective_run_id,
+        summary=objective or f"Factory started in {work_mode} mode",
+        payload={"work_mode": work_mode, "topology": effective_topology, "project_root": str(root)},
     )
-    conn.commit()
-    print_json({"status": "initialized", "db": str(db_path_for(root, args.db)), "run_id": run_id})
-    return 0
+    return effective_run_id
 
 
 def collect_status(conn: sqlite3.Connection, root: Path, db: str | None = None) -> dict[str, Any]:
@@ -1349,6 +1753,7 @@ def build_agent_packet(
             "config": config["verification_policy"],
         },
         "worker_policy": worker_policy_for(role, args.write_policy),
+        "permission_profile": permission_profile(getattr(args, "permission_profile", "")),
         "handoff_schema": handoff_schema_for(role),
         "recording_commands": recording_commands_for(
             prefix=prefix,
@@ -1377,6 +1782,7 @@ def format_agent_packet_markdown(packet: dict[str, Any]) -> str:
     baton = packet.get("baton") or {}
     scope = packet["scope"]
     worker_policy = packet["worker_policy"]
+    permission = packet.get("permission_profile") or {}
     verification_policy = packet["verification_policy"]
     status = packet["current_status"]
     lines = [
@@ -1394,6 +1800,7 @@ def format_agent_packet_markdown(packet: dict[str, Any]) -> str:
         f"- File write policy: {worker_policy['write_policy']}",
         f"- May run commands: {worker_policy['may_run_commands']}",
         f"- May record CLI evidence: {worker_policy['may_record_cli_evidence']}",
+        f"- Permission profile: {permission.get('name') or 'none'}",
         "- If CLI access is unavailable, return the required evidence to the lead agent.",
         "",
         "## Current State",
@@ -1441,6 +1848,17 @@ def format_agent_packet_markdown(packet: dict[str, Any]) -> str:
             "",
             "Required checks:",
             *markdown_bullets(scope["required_checks"], empty="none specified"),
+            "",
+            "Permission profile:",
+            *markdown_bullets(
+                [
+                    f"mode: {permission.get('mode')}",
+                    f"write_policy: {permission.get('write_policy')}",
+                    *[f"allow command: {value}" for value in permission.get("allow_commands", [])],
+                    *[f"deny command: {value}" for value in permission.get("deny_commands", [])],
+                ] if permission else [],
+                empty="none selected",
+            ),
             "",
             "## Verification Policy",
             "",
@@ -1499,6 +1917,97 @@ def cmd_agent_packet(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_agent_adapter_list(args: argparse.Namespace) -> int:
+    adapters = [adapter_capabilities(adapter) for adapter in sorted(AGENT_SPAWN_ADAPTERS)]
+    if args.json:
+        print_json({"count": len(adapters), "adapters": adapters})
+    else:
+        print_table(
+            adapters,
+            [
+                ("adapter", "Adapter"),
+                ("background_sessions", "Background"),
+                ("status_sync", "Sync"),
+                ("attach", "Attach"),
+                ("permission_flags", "Permissions"),
+                ("live_send", "Live Send"),
+            ],
+            empty="No adapters available.",
+        )
+    return 0
+
+
+def cmd_agent_adapter_doctor(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    capabilities = adapter_capabilities(args.adapter)
+    findings: list[dict[str, Any]] = [{"level": "ok", "check": "capabilities", "message": "Adapter metadata loaded."}]
+    exit_code = 0
+
+    def add(level: str, check: str, message: str) -> None:
+        nonlocal exit_code
+        findings.append({"level": level, "check": check, "message": message})
+        if level == "fail":
+            exit_code = 1
+
+    if args.adapter == "claude-code":
+        version = run_spawn_command(
+            command=[args.claude_bin, "--version"],
+            stdin=None,
+            root=root,
+            timeout_seconds=5,
+            output_limit=4000,
+        )
+        if version["returncode"] == 0:
+            add("ok", "claude", shorten(version["stdout"] or "Claude Code CLI available", 200))
+        else:
+            add("fail", "claude", version["stderr"] or "Claude Code CLI is unavailable.")
+    elif args.adapter == "codex-cli":
+        version = run_spawn_command(
+            command=[args.codex_bin, "--version"],
+            stdin=None,
+            root=root,
+            timeout_seconds=5,
+            output_limit=4000,
+        )
+        if version["returncode"] == 0:
+            add("ok", "codex", shorten(version["stdout"] or "Codex CLI available", 200))
+        else:
+            add("fail", "codex", version["stderr"] or "Codex CLI is unavailable.")
+    else:
+        add("warn", "custom", "Custom adapters cannot be checked without a concrete --command dry-run.")
+
+    payload = {"adapter": args.adapter, "capabilities": capabilities, "findings": findings}
+    if args.json:
+        print_json(payload)
+    else:
+        print_table(findings, [("level", "Level"), ("check", "Check"), ("message", "Message")], empty="No findings.")
+    return exit_code
+
+
+def cmd_agent_permissions_list(args: argparse.Namespace) -> int:
+    profiles = [copy.deepcopy(PERMISSION_PROFILES[name]) for name in sorted(PERMISSION_PROFILES)]
+    if args.json:
+        print_json({"count": len(profiles), "profiles": profiles})
+    else:
+        print_table(
+            profiles,
+            [
+                ("name", "Profile"),
+                ("mode", "Mode"),
+                ("write_policy", "Write"),
+                ("network", "Network"),
+            ],
+            empty="No permission profiles configured.",
+        )
+    return 0
+
+
+def cmd_agent_permissions_plan(args: argparse.Namespace) -> int:
+    report = permission_translation_report(args.adapter, args.profile)
+    print_json(report)
+    return 0
+
+
 def agent_packet_text(packet: dict[str, Any], packet_format: str) -> str:
     if packet_format == "json":
         return json.dumps(packet, indent=2, sort_keys=True) + "\n"
@@ -1529,6 +2038,125 @@ def write_agent_packet_file(root: Path, packet: dict[str, Any], packet_format: s
     return path
 
 
+def adapter_capabilities(adapter: str) -> dict[str, Any]:
+    capabilities = {
+        "claude-code": {
+            "adapter": "claude-code",
+            "background_sessions": True,
+            "status_sync": True,
+            "logs": True,
+            "stop": True,
+            "attach": True,
+            "live_send": False,
+            "permission_flags": True,
+            "settings_file": True,
+            "isolated_worktree": True,
+        },
+        "codex-cli": {
+            "adapter": "codex-cli",
+            "background_sessions": False,
+            "status_sync": False,
+            "logs": "captured_output",
+            "stop": False,
+            "attach": False,
+            "live_send": False,
+            "permission_flags": True,
+            "settings_file": False,
+            "isolated_worktree": False,
+        },
+        "custom": {
+            "adapter": "custom",
+            "background_sessions": False,
+            "status_sync": False,
+            "logs": "captured_output",
+            "stop": False,
+            "attach": False,
+            "live_send": False,
+            "permission_flags": False,
+            "settings_file": False,
+            "isolated_worktree": "external",
+        },
+    }
+    if adapter not in capabilities:
+        raise FactoryError(f"--adapter must be one of {', '.join(sorted(AGENT_SPAWN_ADAPTERS))}")
+    return capabilities[adapter]
+
+
+def permission_profile(name: str) -> dict[str, Any]:
+    profile_name = name.strip() or ""
+    if not profile_name:
+        return {}
+    if profile_name not in PERMISSION_PROFILES:
+        raise FactoryError(f"Unknown permission profile: {profile_name}")
+    return copy.deepcopy(PERMISSION_PROFILES[profile_name])
+
+
+def claude_tool_name(tool: str) -> str:
+    normalized = tool.strip().lower()
+    mapping = {"read": "Read", "edit": "Edit", "write": "Write", "bash": "Bash"}
+    return mapping.get(normalized, tool.strip())
+
+
+def claude_tools_for_profile(profile: dict[str, Any]) -> tuple[list[str], list[str]]:
+    allowed: list[str] = []
+    denied: list[str] = []
+    for tool in profile.get("allow_tools", []):
+        if str(tool).strip().lower() == "bash":
+            continue
+        allowed.append(claude_tool_name(str(tool)))
+    for command in profile.get("allow_commands", []):
+        allowed.append(f"Bash({command})")
+    for command in profile.get("deny_commands", []):
+        denied.append(f"Bash({command})")
+    return unique_values(allowed), unique_values(denied)
+
+
+def permission_translation_report(adapter: str, profile_name: str) -> dict[str, Any]:
+    profile = permission_profile(profile_name)
+    if not profile:
+        return {
+            "profile": "",
+            "adapter": adapter,
+            "enforced": [],
+            "advisory": [],
+            "unsupported": [],
+            "translated": {},
+        }
+    capabilities = adapter_capabilities(adapter)
+    enforced: list[str] = []
+    advisory: list[str] = []
+    unsupported: list[str] = []
+    translated: dict[str, Any] = {}
+    if adapter == "claude-code":
+        allowed, denied = claude_tools_for_profile(profile)
+        translated = {
+            "permission_mode": CLAUDE_PERMISSION_PROFILE_MODES.get(profile_name, ""),
+            "allowed_tools": allowed,
+            "disallowed_tools": denied,
+        }
+        enforced.extend(["permission_mode", "allowed_tools", "disallowed_tools"])
+        advisory.extend(["write_policy", "network"])
+    elif adapter == "codex-cli":
+        sandbox = "read-only" if profile.get("mode") == "read_only" else "workspace-write"
+        translated = {"sandbox": sandbox, "approval": "never"}
+        enforced.extend(["sandbox", "approval"])
+        advisory.extend(["allow_commands", "deny_commands", "write_policy"])
+    else:
+        translated = {"packet_profile": profile}
+        advisory.extend(["allow_commands", "deny_commands", "allow_tools", "write_policy", "network"])
+        if not capabilities.get("permission_flags"):
+            unsupported.append("native_permission_flags")
+    return {
+        "profile": profile_name,
+        "adapter": adapter,
+        "enforced": enforced,
+        "advisory": advisory,
+        "unsupported": unsupported,
+        "translated": translated,
+        "profile_detail": profile,
+    }
+
+
 def has_held_baton_lock(conn: sqlite3.Connection, run_id: str, baton_id: str | None) -> bool:
     if not baton_id:
         return False
@@ -1545,6 +2173,9 @@ def has_held_baton_lock(conn: sqlite3.Connection, run_id: str, baton_id: str | N
 
 def build_codex_spawn_command(root: Path, packet: dict[str, Any], args: argparse.Namespace) -> list[str]:
     sandbox = args.codex_sandbox
+    profile_report = permission_translation_report("codex-cli", getattr(args, "permission_profile", ""))
+    if sandbox == "auto" and profile_report["translated"].get("sandbox"):
+        sandbox = str(profile_report["translated"]["sandbox"])
     if sandbox == "auto":
         sandbox = "workspace-write" if packet["worker_policy"]["may_edit_files"] else "read-only"
     command = [
@@ -1565,6 +2196,69 @@ def build_codex_spawn_command(root: Path, packet: dict[str, Any], args: argparse
     if args.codex_skip_git_repo_check:
         command.append("--skip-git-repo-check")
     command.append("-")
+    return command
+
+
+def claude_session_name(packet: dict[str, Any], args: argparse.Namespace) -> str:
+    baton = packet.get("baton") or {}
+    pieces = [
+        "factory",
+        str(packet.get("role") or args.role),
+        str(baton.get("id") or args.baton or "run"),
+    ]
+    return safe_slug("-".join(pieces), fallback="factory-session")
+
+
+def claude_background_prompt(packet_path: Path, packet: dict[str, Any]) -> str:
+    role = str(packet.get("role") or "worker")
+    baton = packet.get("baton") or {}
+    baton_id = str(baton.get("id") or "factory")
+    return (
+        "You are an Agentic Factory worker session. Read the packet file at "
+        f"{packet_path} and follow it exactly. Role: {role}. Baton: {baton_id}. "
+        "Use the packet's recording commands to write durable factory evidence "
+        "when safe. If this session is running in an isolated worktree, edit the "
+        "current working directory but record factory state through the packet's "
+        "absolute CLI commands. Stop after the packet completion contract is met "
+        "or when you need lead/user input."
+    )
+
+
+def build_claude_spawn_command(root: Path, packet: dict[str, Any], packet_path: Path, args: argparse.Namespace) -> list[str]:
+    command = [args.claude_bin]
+    profile_report = permission_translation_report("claude-code", getattr(args, "permission_profile", ""))
+    translated = profile_report["translated"]
+    if args.claude_model:
+        command.extend(["--model", args.claude_model])
+    permission_mode = args.claude_permission_mode or str(translated.get("permission_mode") or "")
+    if permission_mode:
+        command.extend(["--permission-mode", permission_mode])
+    allowed_tools = unique_values([*translated.get("allowed_tools", []), *(args.claude_allowed_tool or [])])
+    disallowed_tools = unique_values([*translated.get("disallowed_tools", []), *(args.claude_disallowed_tool or [])])
+    if allowed_tools:
+        command.extend(["--allowedTools", ",".join(allowed_tools)])
+    if disallowed_tools:
+        command.extend(["--disallowedTools", ",".join(disallowed_tools)])
+    if args.claude_agent:
+        command.extend(["--agent", args.claude_agent])
+    if args.claude_worktree:
+        command.append("--worktree")
+        if args.claude_worktree != "auto":
+            command.append(args.claude_worktree)
+    if not args.claude_no_plugin_dir:
+        command.extend(["--plugin-dir", str(PLUGIN_ROOT)])
+    for plugin_dir in args.claude_plugin_dir or []:
+        command.extend(["--plugin-dir", plugin_dir])
+    for add_dir in args.claude_add_dir or []:
+        command.extend(["--add-dir", add_dir])
+    command.extend(
+        [
+            "--bg",
+            "--name",
+            claude_session_name(packet, args),
+            claude_background_prompt(packet_path, packet),
+        ]
+    )
     return command
 
 
@@ -1600,6 +2294,8 @@ def build_custom_spawn_command(root: Path, packet_path: Path, args: argparse.Nam
 
 
 def build_spawn_command(root: Path, packet: dict[str, Any], packet_path: Path, args: argparse.Namespace) -> tuple[list[str], str | None]:
+    if args.adapter == "claude-code":
+        return build_claude_spawn_command(root, packet, packet_path, args), None
     if args.adapter == "codex-cli":
         return build_codex_spawn_command(root, packet, args), agent_packet_text(packet, args.packet_format)
     if args.adapter == "custom":
@@ -1662,8 +2358,331 @@ def run_spawn_command(
         }
 
 
+def parse_claude_background_session_id(stdout: str, stderr: str) -> str:
+    combined = "\n".join(part for part in (stdout, stderr) if part)
+    match = CLAUDE_CODE_BACKGROUND_ID_RE.search(combined)
+    return match.group(1) if match else ""
+
+
+def claude_session_id_for(control_ref: str, *, role: str, baton_id: str | None) -> str:
+    if control_ref:
+        return f"claude-{safe_slug(control_ref, fallback='session')}"
+    return make_agent_session_id(role=role, baton_id=baton_id)
+
+
+def run_claude_background_spawn(
+    *,
+    command: list[str],
+    root: Path,
+    timeout_seconds: int,
+    output_limit: int,
+) -> dict[str, Any]:
+    execution = run_spawn_command(
+        command=command,
+        stdin=None,
+        root=root,
+        timeout_seconds=timeout_seconds,
+        output_limit=output_limit,
+    )
+    control_ref = ""
+    if execution["returncode"] == 0:
+        control_ref = parse_claude_background_session_id(execution["stdout"], execution["stderr"])
+    status = "running" if execution["returncode"] == 0 else execution["status"]
+    return {
+        **execution,
+        "status": status,
+        "control_ref": control_ref,
+    }
+
+
+def make_agent_session_id(*, role: str, baton_id: str | None) -> str:
+    stamp = utc_now().replace(":", "").replace("-", "").replace("Z", "")
+    nonce = secrets.token_hex(4)
+    return "-".join(
+        [
+            "session",
+            stamp,
+            safe_slug(role, fallback="role"),
+            safe_slug(baton_id or "no-baton", fallback="no-baton"),
+            nonce,
+        ]
+    )
+
+
+def session_label(*, role: str, baton_id: str | None, adapter: str) -> str:
+    target = baton_id or "factory"
+    return f"{role}:{target} via {adapter}"
+
+
+def create_agent_session_record(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    run_id: str,
+    baton_id: str | None,
+    role: str,
+    adapter: str,
+    packet_path: Path,
+    command: list[str],
+    timeout_seconds: int,
+    status: str = "running",
+    control_mode: str = "process",
+    control_ref: str = "",
+    summary: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    now = utc_now()
+    base_metadata = {
+        "timeout_seconds": timeout_seconds,
+        "control_note": (
+            "This session records process state and output. Live steering requires a "
+            "session-backed adapter such as Claude Code background sessions, tmux, Zellij, "
+            "PTY, or a Codex-native thread."
+        ),
+    }
+    if metadata:
+        base_metadata.update(metadata)
+    conn.execute(
+        """
+        INSERT INTO agent_sessions
+          (id, run_id, baton_id, role, adapter, label, status, control_mode, control_ref,
+           packet_path, command_json, started_at, last_seen_at, summary, metadata_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            session_id,
+            run_id,
+            baton_id,
+            role,
+            adapter,
+            session_label(role=role, baton_id=baton_id, adapter=adapter),
+            status,
+            control_mode,
+            control_ref,
+            str(packet_path),
+            json_dump(command),
+            now,
+            now,
+            summary or f"{adapter} spawn {status} for {role}",
+            json_dump(base_metadata),
+        ),
+    )
+
+
+def update_agent_session_record(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    execution: dict[str, Any],
+    output_limit: int,
+) -> None:
+    status = str(execution["status"])
+    ended = utc_now()
+    metadata = {
+        "duration_ms": execution["duration_ms"],
+        "stdout": execution["stdout"],
+        "stderr": execution["stderr"],
+        "stdout_truncated": execution["stdout_truncated"],
+        "stderr_truncated": execution["stderr_truncated"],
+        "output_limit": output_limit,
+    }
+    conn.execute(
+        """
+        UPDATE agent_sessions
+        SET status = ?, last_seen_at = ?, ended_at = ?, exit_code = ?, summary = ?, metadata_json = ?
+        WHERE id = ?
+        """,
+        (
+            status,
+            ended,
+            ended,
+            execution["returncode"],
+            f"Spawn {status} with exit code {execution['returncode']}",
+            json_dump(metadata),
+            session_id,
+        ),
+    )
+
+
+def session_metadata(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    raw = row["metadata_json"] if isinstance(row, sqlite3.Row) else row.get("metadata_json")
+    parsed = json_loads_or_empty(str(raw or "{}"), {})
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def merge_agent_session_metadata(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    values: dict[str, Any],
+) -> None:
+    row = conn.execute("SELECT metadata_json FROM agent_sessions WHERE id = ?", (session_id,)).fetchone()
+    existing = session_metadata(row) if row else {}
+    conn.execute(
+        "UPDATE agent_sessions SET metadata_json = ? WHERE id = ?",
+        (json_dump({**existing, **values}), session_id),
+    )
+
+
+def claude_status_to_factory_status(entry: dict[str, Any]) -> str:
+    raw = str(entry.get("status") or "").strip().lower()
+    if raw in {"waiting", "needs_input", "needs-input", "input_needed"}:
+        return "waiting"
+    if raw in {"blocked"}:
+        return "blocked"
+    if raw in {"failed", "error"}:
+        return "failed"
+    if raw in {"done", "completed", "success", "succeeded"}:
+        return "completed"
+    if raw in {"stopped", "killed", "canceled", "cancelled"}:
+        return "stopped"
+    if raw in {"exited", "removed"}:
+        return raw
+    if entry.get("pid"):
+        return "running"
+    return raw or "running"
+
+
+def run_claude_agents_json(
+    *,
+    root: Path,
+    claude_bin: str,
+    timeout_seconds: int,
+    output_limit: int,
+) -> dict[str, Any]:
+    command = [claude_bin, "agents", "--json", "--cwd", str(root)]
+    execution = run_spawn_command(
+        command=command,
+        stdin=None,
+        root=root,
+        timeout_seconds=timeout_seconds,
+        output_limit=output_limit,
+    )
+    if execution["returncode"] != 0:
+        fallback = [claude_bin, "agents", "--json"]
+        execution = run_spawn_command(
+            command=fallback,
+            stdin=None,
+            root=root,
+            timeout_seconds=timeout_seconds,
+            output_limit=output_limit,
+        )
+        execution["command"] = fallback
+    else:
+        execution["command"] = command
+    if execution["returncode"] != 0:
+        return {"ok": False, "entries": [], "execution": execution}
+    try:
+        entries = json.loads(execution["stdout"] or "[]")
+    except json.JSONDecodeError as exc:
+        execution["stderr"] = (execution["stderr"] + f"\nInvalid JSON from claude agents: {exc}").strip()
+        return {"ok": False, "entries": [], "execution": execution}
+    if not isinstance(entries, list):
+        execution["stderr"] = (execution["stderr"] + "\nclaude agents --json did not return an array.").strip()
+        return {"ok": False, "entries": [], "execution": execution}
+    normalized = [entry for entry in entries if isinstance(entry, dict)]
+    return {"ok": True, "entries": normalized, "execution": execution}
+
+
+def claude_bin_for_session(row: sqlite3.Row) -> str:
+    command = json_loads_or_empty(row["command_json"], [])
+    if isinstance(command, list) and command:
+        first = command[0]
+        if isinstance(first, str) and first.strip():
+            return first
+    return "claude"
+
+
+def sync_claude_code_sessions(
+    conn: sqlite3.Connection,
+    *,
+    root: Path,
+    run_id: str,
+    timeout_seconds: int = 5,
+    output_limit: int = 20000,
+    actor: str = "Agentic Factory",
+    emit: bool = False,
+) -> dict[str, Any]:
+    rows = list(
+        conn.execute(
+            """
+            SELECT *
+            FROM agent_sessions
+            WHERE run_id = ? AND adapter = 'claude-code'
+            ORDER BY COALESCE(last_seen_at, started_at, '') DESC, id DESC
+            """,
+            (run_id,),
+        )
+    )
+    if not rows:
+        return {"status": "no_sessions", "checked": 0, "updated": 0, "errors": []}
+
+    rows_by_ref = {row["control_ref"]: row for row in rows if row["control_ref"]}
+    claude_bins = sorted({claude_bin_for_session(row) for row in rows if row["status"] in SESSION_ACTIVE_STATUSES})
+    if not claude_bins:
+        return {"status": "no_active_sessions", "checked": len(rows), "updated": 0, "errors": []}
+
+    now = utc_now()
+    updated = 0
+    errors: list[dict[str, Any]] = []
+    for claude_bin in claude_bins:
+        result = run_claude_agents_json(
+            root=root,
+            claude_bin=claude_bin,
+            timeout_seconds=timeout_seconds,
+            output_limit=output_limit,
+        )
+        execution = result["execution"]
+        if not result["ok"]:
+            errors.append(
+                {
+                    "claude_bin": claude_bin,
+                    "returncode": execution["returncode"],
+                    "stderr": execution["stderr"],
+                }
+            )
+            continue
+        for entry in result["entries"]:
+            control_ref = str(entry.get("sessionId") or entry.get("id") or "").strip()
+            if not control_ref or control_ref not in rows_by_ref:
+                continue
+            row = rows_by_ref[control_ref]
+            status = claude_status_to_factory_status(entry)
+            ended_at = now if status in CLAUDE_CODE_TERMINAL_STATUSES else row["ended_at"]
+            summary = str(entry.get("name") or entry.get("currentActivity") or row["summary"] or "")
+            metadata = session_metadata(row)
+            metadata.update(
+                {
+                    "last_sync_at": now,
+                    "claude": entry,
+                    "claude_sync_command": shell_join(execution["command"]),
+                }
+            )
+            conn.execute(
+                """
+                UPDATE agent_sessions
+                SET status = ?, last_seen_at = ?, ended_at = ?, summary = ?, metadata_json = ?
+                WHERE id = ?
+                """,
+                (status, now, ended_at, summary, json_dump(metadata), row["id"]),
+            )
+            updated += 1
+            if emit:
+                emit_event(
+                    conn,
+                    event_type="agent.session.synced",
+                    actor=actor,
+                    run_id=run_id,
+                    baton_id=row["baton_id"],
+                    summary=f"Claude Code session {control_ref} synced as {status}",
+                    payload={"session_id": row["id"], "control_ref": control_ref, "status": status},
+                )
+    return {"status": "synced" if not errors else "partial", "checked": len(rows), "updated": updated, "errors": errors}
+
+
 def spawn_event_payload(
     *,
+    session_id: str | None,
     adapter: str,
     role: str,
     baton_id: str | None,
@@ -1675,6 +2694,7 @@ def spawn_event_payload(
     duration_ms: int | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
+        "session_id": session_id or "",
         "adapter": adapter,
         "role": role,
         "baton_id": baton_id or "",
@@ -1709,10 +2729,13 @@ def cmd_agent_spawn(args: argparse.Namespace) -> int:
             raise FactoryError("Write-capable spawn requires a held lock for --baton, or pass --allow-unlocked.")
     packet_path = write_agent_packet_file(root, packet, args.packet_format, args.packet_dir)
     command, stdin = build_spawn_command(root, packet, packet_path, args)
+    permission_report = permission_translation_report(args.adapter, getattr(args, "permission_profile", ""))
+    session_id = "" if args.dry_run else make_agent_session_id(role=args.role, baton_id=args.baton)
     result: dict[str, Any] = {
         "adapter": args.adapter,
         "role": args.role,
         "baton": args.baton,
+        "session_id": session_id,
         "packet_path": str(packet_path),
         "command": command,
         "command_preview": shell_join(command),
@@ -1720,11 +2743,148 @@ def cmd_agent_spawn(args: argparse.Namespace) -> int:
         "experimental": args.experimental,
         "dry_run": args.dry_run,
         "events_recorded": False,
+        "permission_profile": permission_report,
     }
     if args.dry_run:
         result.update({"status": "dry_run", "returncode": 0})
         print_json(result)
         return 0
+
+    if args.adapter == "claude-code":
+        launch = run_claude_background_spawn(
+            command=command,
+            root=root,
+            timeout_seconds=min(timeout_seconds, 120),
+            output_limit=output_limit,
+        )
+        control_ref = launch["control_ref"]
+        if control_ref:
+            session_id = claude_session_id_for(control_ref, role=args.role, baton_id=args.baton)
+            result["session_id"] = session_id
+        metadata = {
+            "duration_ms": launch["duration_ms"],
+            "stdout": launch["stdout"],
+            "stderr": launch["stderr"],
+            "stdout_truncated": launch["stdout_truncated"],
+            "stderr_truncated": launch["stderr_truncated"],
+            "output_limit": output_limit,
+            "control_ref": control_ref,
+            "attach_command": f"{args.claude_bin} attach {control_ref}" if control_ref else "",
+            "logs_command": f"{args.claude_bin} logs {control_ref}" if control_ref else "",
+            "stop_command": f"{args.claude_bin} stop {control_ref}" if control_ref else "",
+            "control_note": (
+                "Claude Code owns this background session. Use `claude agents`, "
+                "`claude attach <id>`, `claude logs <id>`, or `claude stop <id>` "
+                "for live control."
+            ),
+            "permission_profile": permission_report,
+        }
+        create_agent_session_record(
+            conn,
+            session_id=session_id,
+            run_id=run["id"],
+            baton_id=args.baton,
+            role=args.role,
+            adapter=args.adapter,
+            packet_path=packet_path,
+            command=command,
+            timeout_seconds=timeout_seconds,
+            status=launch["status"],
+            control_mode="claude_bg",
+            control_ref=control_ref,
+            summary=(
+                f"Claude Code background session {control_ref or 'launch failed'} "
+                f"{launch['status']} for {args.role}"
+            ),
+            metadata=metadata,
+        )
+        lifecycle_transition = False
+        if launch["returncode"] == 0:
+            lifecycle_transition = apply_spawn_lifecycle_transition(
+                conn,
+                run_id=run["id"],
+                role=args.role,
+                baton_id=args.baton,
+                actor=args.actor,
+                session_id=session_id,
+            )
+        conn.commit()
+        if not args.no_event:
+            emit_event(
+                conn,
+                event_type="agent.spawn.started",
+                actor=args.actor,
+                run_id=run["id"],
+                baton_id=args.baton,
+                summary=f"Claude Code spawn {launch['status']} for {args.role}",
+                payload={
+                    **spawn_event_payload(
+                        session_id=session_id,
+                        adapter=args.adapter,
+                        role=args.role,
+                        baton_id=args.baton,
+                        packet_path=packet_path,
+                        command=command,
+                        timeout_seconds=timeout_seconds,
+                        status=launch["status"],
+                        returncode=launch["returncode"],
+                        duration_ms=launch["duration_ms"],
+                    ),
+                    "control_mode": "claude_bg",
+                    "control_ref": control_ref,
+                },
+            )
+            if launch["returncode"] != 0:
+                emit_event(
+                    conn,
+                    event_type="agent.spawn.completed",
+                    actor=args.actor,
+                    run_id=run["id"],
+                    baton_id=args.baton,
+                    summary=f"Claude Code spawn {launch['status']} for {args.role}",
+                    payload=spawn_event_payload(
+                        session_id=session_id,
+                        adapter=args.adapter,
+                        role=args.role,
+                        baton_id=args.baton,
+                        packet_path=packet_path,
+                        command=command,
+                        timeout_seconds=timeout_seconds,
+                        status=launch["status"],
+                        returncode=launch["returncode"],
+                        duration_ms=launch["duration_ms"],
+                    ),
+                )
+            conn.commit()
+            result["events_recorded"] = True
+        result.update(launch)
+        result["control_mode"] = "claude_bg"
+        result["control_ref"] = control_ref
+        result["lifecycle_transition_recorded"] = lifecycle_transition
+        print_json(result)
+        return int(launch["returncode"])
+
+    create_agent_session_record(
+        conn,
+        session_id=session_id,
+        run_id=run["id"],
+        baton_id=args.baton,
+        role=args.role,
+        adapter=args.adapter,
+        packet_path=packet_path,
+        command=command,
+        timeout_seconds=timeout_seconds,
+        metadata={"permission_profile": permission_report},
+    )
+    lifecycle_transition = apply_spawn_lifecycle_transition(
+        conn,
+        run_id=run["id"],
+        role=args.role,
+        baton_id=args.baton,
+        actor=args.actor,
+        session_id=session_id,
+    )
+    conn.commit()
 
     if not args.no_event:
         emit_event(
@@ -1735,6 +2895,7 @@ def cmd_agent_spawn(args: argparse.Namespace) -> int:
             baton_id=args.baton,
             summary=f"{args.adapter} spawn started for {args.role}",
             payload=spawn_event_payload(
+                session_id=session_id,
                 adapter=args.adapter,
                 role=args.role,
                 baton_id=args.baton,
@@ -1754,6 +2915,9 @@ def cmd_agent_spawn(args: argparse.Namespace) -> int:
         output_limit=output_limit,
     )
     result.update(execution)
+    result["lifecycle_transition_recorded"] = lifecycle_transition
+    update_agent_session_record(conn, session_id=session_id, execution=execution, output_limit=output_limit)
+    conn.commit()
 
     if not args.no_event:
         emit_event(
@@ -1764,6 +2928,7 @@ def cmd_agent_spawn(args: argparse.Namespace) -> int:
             baton_id=args.baton,
             summary=f"{args.adapter} spawn {execution['status']} for {args.role}",
             payload=spawn_event_payload(
+                session_id=session_id,
                 adapter=args.adapter,
                 role=args.role,
                 baton_id=args.baton,
@@ -1779,6 +2944,441 @@ def cmd_agent_spawn(args: argparse.Namespace) -> int:
 
     print_json(result)
     return int(execution["returncode"])
+
+
+def list_agent_session_rows(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    recent: int,
+    adapter: str = "",
+) -> list[sqlite3.Row]:
+    where = "WHERE run_id = ?"
+    params: list[Any] = [run_id]
+    if adapter:
+        where += " AND adapter = ?"
+        params.append(adapter)
+    params.append(require_limit(recent, field="recent"))
+    return list(
+        conn.execute(
+            f"""
+            SELECT *
+            FROM agent_sessions
+            {where}
+            ORDER BY COALESCE(last_seen_at, started_at, '') DESC, id DESC
+            LIMIT ?
+            """,
+            params,
+        )
+    )
+
+
+def agent_session_public(row: sqlite3.Row) -> dict[str, Any]:
+    payload = row_to_public_dict(row) or {}
+    if payload.get("adapter") == "claude-code" and payload.get("control_ref"):
+        claude_bin = claude_bin_for_session(row)
+        payload["commands"] = {
+            "agents": f"{claude_bin} agents",
+            "attach": f"{claude_bin} attach {payload['control_ref']}",
+            "logs": f"{claude_bin} logs {payload['control_ref']}",
+            "stop": f"{claude_bin} stop {payload['control_ref']}",
+        }
+    return payload
+
+
+def cmd_agent_session_list(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    conn = connect(root, args.db)
+    run = require_run(conn)
+    if args.sync:
+        sync_claude_code_sessions(
+            conn,
+            root=root,
+            run_id=run["id"],
+            timeout_seconds=require_timeout(args.sync_timeout_seconds),
+            output_limit=require_output_limit(args.output_limit),
+            actor=args.actor,
+            emit=True,
+        )
+        conn.commit()
+    rows = list_agent_session_rows(conn, run_id=run["id"], recent=args.recent, adapter=args.adapter)
+    sessions = [agent_session_public(row) for row in rows]
+    if args.json:
+        print_json({"count": len(sessions), "sessions": sessions})
+    else:
+        print_table(
+            sessions,
+            [
+                ("id", "ID"),
+                ("role", "Role"),
+                ("baton_id", "Baton"),
+                ("adapter", "Adapter"),
+                ("status", "Status"),
+                ("control_ref", "Ref"),
+                ("last_seen_at", "Last Seen"),
+            ],
+            empty="No agent sessions recorded.",
+        )
+    return 0
+
+
+def cmd_agent_session_show(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    conn = connect(root, args.db)
+    run = require_run(conn)
+    if args.sync:
+        sync_claude_code_sessions(
+            conn,
+            root=root,
+            run_id=run["id"],
+            timeout_seconds=require_timeout(args.sync_timeout_seconds),
+            output_limit=require_output_limit(args.output_limit),
+            actor=args.actor,
+            emit=True,
+        )
+        conn.commit()
+    row = require_agent_session(conn, run["id"], args.session_id)
+    payload = agent_session_public(row)
+    if args.json:
+        print_json(payload)
+    else:
+        print_json(payload)
+    return 0
+
+
+def cmd_agent_session_sync(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    conn = connect(root, args.db)
+    run = require_run(conn)
+    if args.adapter not in {"claude-code", "all"}:
+        raise FactoryError("Only the claude-code adapter currently supports live sync.")
+    result = sync_claude_code_sessions(
+        conn,
+        root=root,
+        run_id=run["id"],
+        timeout_seconds=require_timeout(args.timeout_seconds),
+        output_limit=require_output_limit(args.output_limit),
+        actor=args.actor,
+        emit=not args.no_event,
+    )
+    conn.commit()
+    print_json(result)
+    return 0 if not result.get("errors") else 1
+
+
+def run_claude_session_command(
+    *,
+    row: sqlite3.Row,
+    action: str,
+    root: Path,
+    timeout_seconds: int,
+    output_limit: int,
+) -> dict[str, Any]:
+    if row["adapter"] != "claude-code" or not row["control_ref"]:
+        raise FactoryError("This session is not controlled by a Claude Code background-session adapter.")
+    claude_bin = claude_bin_for_session(row)
+    command = [claude_bin, action, row["control_ref"]]
+    execution = run_spawn_command(
+        command=command,
+        stdin=None,
+        root=root,
+        timeout_seconds=timeout_seconds,
+        output_limit=output_limit,
+    )
+    execution["command"] = command
+    return execution
+
+
+def cmd_agent_session_logs(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    conn = connect(root, args.db)
+    run = require_run(conn)
+    row = require_agent_session(conn, run["id"], args.session_id)
+    if row["adapter"] == "claude-code":
+        execution = run_claude_session_command(
+            row=row,
+            action="logs",
+            root=root,
+            timeout_seconds=require_timeout(args.timeout_seconds),
+            output_limit=require_output_limit(args.output_limit),
+        )
+        merge_agent_session_metadata(
+            conn,
+            session_id=row["id"],
+            values={
+                "last_logs_at": utc_now(),
+                "last_logs_stdout": execution["stdout"],
+                "last_logs_stderr": execution["stderr"],
+                "last_logs_returncode": execution["returncode"],
+            },
+        )
+        conn.commit()
+        if args.json:
+            print_json(execution)
+        else:
+            if execution["stdout"]:
+                print(execution["stdout"], end="" if execution["stdout"].endswith("\n") else "\n")
+            if execution["stderr"]:
+                print(execution["stderr"], file=sys.stderr, end="" if execution["stderr"].endswith("\n") else "\n")
+        return int(execution["returncode"])
+
+    metadata = session_metadata(row)
+    if args.json:
+        print_json(
+            {
+                "status": "recorded_output",
+                "stdout": metadata.get("stdout", ""),
+                "stderr": metadata.get("stderr", ""),
+            }
+        )
+    else:
+        stdout = str(metadata.get("stdout", ""))
+        stderr = str(metadata.get("stderr", ""))
+        if stdout:
+            print(stdout, end="" if stdout.endswith("\n") else "\n")
+        if stderr:
+            print(stderr, file=sys.stderr, end="" if stderr.endswith("\n") else "\n")
+    return 0
+
+
+def cmd_agent_session_stop(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    conn = connect(root, args.db)
+    run = require_run(conn)
+    row = require_agent_session(conn, run["id"], args.session_id)
+    execution = run_claude_session_command(
+        row=row,
+        action="stop",
+        root=root,
+        timeout_seconds=require_timeout(args.timeout_seconds),
+        output_limit=require_output_limit(args.output_limit),
+    )
+    now = utc_now()
+    status = "stopped" if execution["returncode"] == 0 else row["status"]
+    conn.execute(
+        """
+        UPDATE agent_sessions
+        SET status = ?, last_seen_at = ?, ended_at = ?, summary = ?
+        WHERE id = ?
+        """,
+        (
+            status,
+            now,
+            now if status == "stopped" else row["ended_at"],
+            "Claude Code background session stopped" if status == "stopped" else row["summary"],
+            row["id"],
+        ),
+    )
+    merge_agent_session_metadata(
+        conn,
+        session_id=row["id"],
+        values={
+            "last_stop_at": now,
+            "last_stop_stdout": execution["stdout"],
+            "last_stop_stderr": execution["stderr"],
+            "last_stop_returncode": execution["returncode"],
+        },
+    )
+    emit_event(
+        conn,
+        event_type="agent.session.stopped",
+        actor=args.actor,
+        run_id=run["id"],
+        baton_id=row["baton_id"],
+        summary=f"Claude Code session {row['control_ref']} stop returned {execution['returncode']}",
+        payload={
+            "session_id": row["id"],
+            "control_ref": row["control_ref"],
+            "returncode": execution["returncode"],
+            "status": status,
+        },
+    )
+    conn.commit()
+    print_json({"status": status, "returncode": execution["returncode"], "stdout": execution["stdout"], "stderr": execution["stderr"]})
+    return int(execution["returncode"])
+
+
+def message_where_clauses(args: argparse.Namespace, run_id: str) -> tuple[list[str], list[Any]]:
+    where = ["run_id = ?"]
+    params: list[Any] = [run_id]
+    if getattr(args, "target_type", ""):
+        where.append("target_type = ?")
+        params.append(args.target_type)
+    if getattr(args, "target_id", ""):
+        where.append("target_id = ?")
+        params.append(args.target_id)
+    if getattr(args, "baton", None):
+        where.append("baton_id = ?")
+        params.append(args.baton)
+    statuses = csv_values(getattr(args, "status", []))
+    if statuses:
+        invalid = sorted(set(statuses) - CONTROL_MESSAGE_STATUSES)
+        if invalid:
+            raise FactoryError(f"Invalid message status: {', '.join(invalid)}")
+        where.append(f"status IN ({','.join('?' for _ in statuses)})")
+        params.extend(statuses)
+    return where, params
+
+
+def collect_message_rows(conn: sqlite3.Connection, args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
+    recent = require_limit(args.recent, field="recent")
+    where, params = message_where_clauses(args, run_id)
+    params.append(recent)
+    rows = list(
+        conn.execute(
+            f"""
+            SELECT *
+            FROM control_messages
+            WHERE {' AND '.join(where)}
+            ORDER BY created_at ASC, id ASC
+            LIMIT ?
+            """,
+            params,
+        )
+    )
+    return [row for row in (control_message_public(row) for row in rows) if row is not None]
+
+
+def claim_messages(
+    conn: sqlite3.Connection,
+    *,
+    messages: list[dict[str, Any]],
+    actor: str,
+    target_status: str,
+) -> int:
+    if target_status not in {"read", "handling"}:
+        raise FactoryError("--claim-status must be read or handling.")
+    now = utc_now()
+    updated = 0
+    for message in messages:
+        if message.get("status") not in CONTROL_MESSAGE_ACTIVE_STATUSES:
+            continue
+        conn.execute(
+            """
+            UPDATE control_messages
+            SET status = ?, updated_at = ?, claimed_at = COALESCE(claimed_at, ?), claimed_by = ?
+            WHERE id = ?
+            """,
+            (target_status, now, now, actor, message["id"]),
+        )
+        emit_event(
+            conn,
+            event_type="control_message.claimed",
+            actor=actor,
+            run_id=message["run_id"],
+            baton_id=message.get("baton_id"),
+            summary=f"{message['public_id']} claimed as {target_status}",
+            payload={
+                "message_id": message["public_id"],
+                "target_type": message["target_type"],
+                "target_id": message["target_id"],
+                "status": target_status,
+            },
+        )
+        updated += 1
+    return updated
+
+
+def cmd_messages_list(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    conn = connect(root, args.db)
+    run = require_run(conn)
+    messages = collect_message_rows(conn, args, run["id"])
+    if args.json:
+        print_json({"count": len(messages), "messages": messages})
+    else:
+        print_table(
+            messages,
+            [
+                ("public_id", "Message"),
+                ("status", "Status"),
+                ("target_type", "Target"),
+                ("target_label", "Label"),
+                ("created_at", "Created"),
+                ("message", "Message"),
+            ],
+            empty="No control messages found.",
+        )
+    return 0
+
+
+def cmd_messages_inbox(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    conn = connect(root, args.db)
+    run = require_run(conn)
+    if not args.status:
+        args.status = sorted(CONTROL_MESSAGE_ACTIVE_STATUSES)
+    messages = collect_message_rows(conn, args, run["id"])
+    claimed = 0
+    if args.claim:
+        claimed = claim_messages(
+            conn,
+            messages=messages,
+            actor=args.actor,
+            target_status=args.claim_status,
+        )
+        conn.commit()
+        messages = collect_message_rows(conn, args, run["id"])
+    payload = {"count": len(messages), "claimed": claimed, "messages": messages}
+    if args.json:
+        print_json(payload)
+    else:
+        if claimed:
+            print(f"Claimed {claimed} message(s).")
+        print_table(
+            messages,
+            [
+                ("public_id", "Message"),
+                ("status", "Status"),
+                ("target_type", "Target"),
+                ("target_label", "Label"),
+                ("message", "Message"),
+            ],
+            empty="No active messages found.",
+        )
+    return 0
+
+
+def cmd_messages_ack(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    conn = connect(root, args.db)
+    run = require_run(conn)
+    if args.status not in CONTROL_MESSAGE_STATUSES:
+        raise FactoryError(f"--status must be one of {', '.join(sorted(CONTROL_MESSAGE_STATUSES))}")
+    message_id = parse_message_id(args.message_id)
+    message = conn.execute(
+        "SELECT * FROM control_messages WHERE id = ? AND run_id = ?",
+        (message_id, run["id"]),
+    ).fetchone()
+    if message is None:
+        raise FactoryError(f"Unknown message: {args.message_id}")
+    now = utc_now()
+    handled_at = now if args.status in {"handled", "failed", "expired", "cancelled"} else message["handled_at"]
+    conn.execute(
+        """
+        UPDATE control_messages
+        SET status = ?, updated_at = ?, handled_at = ?, summary = COALESCE(NULLIF(?, ''), summary)
+        WHERE id = ?
+        """,
+        (args.status, now, handled_at, args.summary, message_id),
+    )
+    emit_event(
+        conn,
+        event_type="control_message.acknowledged",
+        actor=args.actor,
+        run_id=run["id"],
+        baton_id=message["baton_id"],
+        summary=f"{public_message_id(message_id)} marked {args.status}",
+        payload={
+            "message_id": public_message_id(message_id),
+            "status": args.status,
+            "summary": args.summary,
+        },
+    )
+    conn.commit()
+    updated = conn.execute("SELECT * FROM control_messages WHERE id = ?", (message_id,)).fetchone()
+    print_json({"status": "updated", "message": control_message_public(updated)})
+    return 0
 
 
 def cmd_event_append(args: argparse.Namespace) -> int:
@@ -1908,7 +3508,19 @@ def cmd_baton_handoff(args: argparse.Namespace) -> int:
     config = config_for_args(root, args)
     conn = connect(root, args.db)
     run = require_run(conn)
-    baton = require_baton(conn, args.baton_id)
+    baton = require_current_baton(conn, run, args.baton_id)
+    if baton["status"] in {"assigned", "active", "patch_required"}:
+        ensure_baton_in_progress(
+            conn,
+            run_id=run["id"],
+            baton_id=args.baton_id,
+            actor=args.owner or args.actor,
+        )
+        baton = require_current_baton(conn, run, args.baton_id)
+    if baton["status"] not in {"in_progress", "handed_off"}:
+        raise FactoryError(
+            f"Cannot hand off baton {args.baton_id} from status {baton['status']}; expected in_progress."
+        )
     lock_name = args.lock_name or config["default_lock_name"]
     files = csv_values(args.files)
     commands = csv_values(args.commands)
@@ -1968,7 +3580,11 @@ def cmd_baton_accept(args: argparse.Namespace) -> int:
     config = config_for_args(root, args)
     conn = connect(root, args.db)
     run = require_run(conn)
-    baton = require_baton(conn, args.baton_id)
+    baton = require_current_baton(conn, run, args.baton_id)
+    if baton["status"] != "ready_for_acceptance" and not args.override:
+        raise FactoryError(
+            f"Cannot accept baton {args.baton_id} from status {baton['status']}; expected ready_for_acceptance or pass --override."
+        )
     lock_name = args.lock_name or config["default_lock_name"]
     now = utc_now()
     conn.execute(
@@ -2082,7 +3698,23 @@ def cmd_review_record(args: argparse.Namespace) -> int:
     root = resolve_root(args.root)
     conn = connect(root, args.db)
     run = require_run(conn)
-    require_baton(conn, args.baton)
+    baton = require_current_baton(conn, run, args.baton)
+    if baton["status"] == "handed_off":
+        transition_baton_status(
+            conn,
+            run_id=run["id"],
+            baton_id=args.baton,
+            new_status="review",
+            actor=args.reviewer or args.actor,
+            event_type="review.started",
+            summary=f"{args.baton} review started",
+            payload={"source": "review_record"},
+            allowed_from={"handed_off"},
+        )
+    elif baton["status"] not in {"review", "ready_for_acceptance", "patch_required"}:
+        raise FactoryError(
+            f"Cannot record review for baton {args.baton} from status {baton['status']}; expected handed_off or review."
+        )
     now = utc_now()
     cur = conn.execute(
         """
@@ -2127,6 +3759,25 @@ def cmd_review_record(args: argparse.Namespace) -> int:
         summary=args.summary or f"Review {args.status}",
         payload={"review_id": review_id, "findings": findings},
     )
+    normalized_status = args.status.strip().lower()
+    if normalized_status in REVIEW_ACCEPTED_STATUSES:
+        ensure_baton_ready_for_acceptance(
+            conn,
+            run_id=run["id"],
+            baton_id=args.baton,
+            actor=args.reviewer or args.actor,
+            review_id=review_id,
+            review_status=args.status,
+        )
+    elif normalized_status in REVIEW_PATCH_REQUIRED_STATUSES:
+        ensure_baton_patch_required(
+            conn,
+            run_id=run["id"],
+            baton_id=args.baton,
+            actor=args.reviewer or args.actor,
+            review_id=review_id,
+            review_status=args.status,
+        )
     conn.commit()
     print_json({"status": "recorded", "review_id": review_id, "findings": len(findings)})
     return 0
@@ -2410,6 +4061,1275 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return exit_code
 
 
+def flow_doctor_check(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], int]:
+    run = require_run(conn)
+    findings: list[dict[str, Any]] = []
+    exit_code = 0
+
+    def add(level: str, check: str, message: str, repair: str = "") -> None:
+        nonlocal exit_code
+        findings.append({"level": level, "check": check, "message": message, "repair": repair})
+        if level == "fail":
+            exit_code = 1
+
+    rows = list(
+        conn.execute(
+            """
+            SELECT s.id AS session_id, s.role, s.status AS session_status, b.id AS baton_id, b.status AS baton_status
+            FROM agent_sessions s
+            JOIN batons b ON b.id = s.baton_id
+            WHERE s.run_id = ? AND s.role = 'builder' AND s.status IN ('planned', 'running', 'waiting', 'blocked')
+              AND b.status IN ('assigned', 'active')
+            """,
+            (run["id"],),
+        )
+    )
+    for row in rows:
+        add(
+            "fail",
+            "builder_without_in_progress",
+            f"Builder session {row['session_id']} is active while baton {row['baton_id']} is {row['baton_status']}.",
+            f"factory.py event append --type baton.in_progress --baton {row['baton_id']} --summary 'Recovered missing in_progress'",
+        )
+
+    rows = list(
+        conn.execute(
+            """
+            SELECT s.id AS session_id, b.id AS baton_id, b.status AS baton_status
+            FROM agent_sessions s
+            JOIN batons b ON b.id = s.baton_id
+            WHERE s.run_id = ? AND s.role = 'reviewer' AND s.status IN ('planned', 'running', 'waiting', 'blocked')
+              AND b.status = 'handed_off'
+            """,
+            (run["id"],),
+        )
+    )
+    for row in rows:
+        add(
+            "fail",
+            "reviewer_without_review_state",
+            f"Reviewer session {row['session_id']} is active while baton {row['baton_id']} is still handed_off.",
+            f"factory.py event append --type review.started --baton {row['baton_id']} --summary 'Recovered missing review state'",
+        )
+
+    rows = list(
+        conn.execute(
+            """
+            SELECT r.id AS review_id, r.baton_id, r.status AS review_status, b.status AS baton_status
+            FROM reviews r
+            JOIN batons b ON b.id = r.baton_id
+            WHERE b.run_id = ? AND lower(r.status) IN ('accepted', 'approved', 'pass', 'passed', 'clean')
+              AND b.status NOT IN ('ready_for_acceptance', 'accepted')
+            """,
+            (run["id"],),
+        )
+    )
+    for row in rows:
+        add(
+            "fail",
+            "accepted_review_not_ready",
+            f"Review {row['review_id']} accepted baton {row['baton_id']}, but baton status is {row['baton_status']}.",
+            f"factory.py baton accept {row['baton_id']} after moving to ready_for_acceptance",
+        )
+
+    queued = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM control_messages
+        WHERE run_id = ? AND status IN ('queued', 'delivered', 'read', 'handling')
+        """,
+        (run["id"],),
+    ).fetchone()["count"]
+    if queued:
+        add(
+            "warn",
+            "active_control_messages",
+            f"{queued} control message(s) are not handled.",
+            "factory.py messages inbox --claim --json",
+        )
+    else:
+        add("ok", "active_control_messages", "No active control messages.")
+
+    if not any(finding["level"] == "fail" for finding in findings):
+        add("ok", "lifecycle", "No lifecycle violations detected.")
+    return findings, exit_code
+
+
+def cmd_flow_doctor(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    conn = connect(root, args.db)
+    findings, exit_code = flow_doctor_check(conn)
+    if args.json:
+        print_json({"status": "fail" if exit_code else "ok", "findings": findings})
+    else:
+        for finding in findings:
+            repair = f" repair={finding['repair']}" if finding.get("repair") else ""
+            print(f"[{finding['level']}] {finding['check']}: {finding['message']}{repair}")
+    return exit_code
+
+
+def topology_operator_specs(run: sqlite3.Row) -> list[dict[str, Any]]:
+    metadata = run_metadata(run)
+    topology = str(run["topology"] or "").strip()
+    runtime_mode = str(metadata.get("runtime_mode") or "").strip()
+    if topology == "principal_partner":
+        return [
+            {
+                "role": "Principal Partner",
+                "name": "Principal Partner",
+                "status": "ready",
+                "priority": 0,
+                "authority": ["configure", "pause", "supersede ledger", "begin operations"],
+                "summary": "Top-level human-facing operator for factory setup and checkpoints.",
+            },
+            {
+                "role": "Executive",
+                "name": "Executive",
+                "status": "ready",
+                "priority": 10,
+                "authority": ["scope", "route", "accept", "commit"],
+                "summary": "Owns baton routing, acceptance, product judgment, and quality.",
+            },
+        ]
+    if topology == "separate_ledger":
+        return [
+            {
+                "role": "Executive",
+                "name": "Executive",
+                "status": "ready",
+                "priority": 0,
+                "authority": ["scope", "route", "accept", "commit"],
+                "summary": "Top-level operator for product, quality, and acceptance decisions.",
+            },
+            {
+                "role": "Ledger",
+                "name": "Ledger",
+                "status": "ready",
+                "priority": 10,
+                "authority": ["state", "evidence", "ledger", "recovery notes"],
+                "summary": "Maintains durable state, evidence, handoffs, and ledger snapshots.",
+            },
+        ]
+    if topology == "serial_single_agent" or runtime_mode == "serial_single_agent":
+        return [
+            {
+                "role": "Solo Operator",
+                "name": "Solo Operator",
+                "status": "ready",
+                "priority": 0,
+                "authority": ["execute serial roles", "record evidence", "pause for review"],
+                "summary": "Runs Executive, Builder, Reviewer, and Ledger duties serially.",
+            }
+        ]
+    if runtime_mode in {"agent_cli_subagents", "adapter_spawn"}:
+        return [
+            {
+                "role": "Lead Agent",
+                "name": "Lead Agent",
+                "status": "ready",
+                "priority": 0,
+                "authority": ["coordinate runtime", "route packets", "pause", "begin operations"],
+                "summary": "Top-level operator for agent CLI orchestration and dashboard control.",
+            },
+            {
+                "role": "Executive",
+                "name": "Executive",
+                "status": "ready",
+                "priority": 10,
+                "authority": ["scope", "accept", "review routing"],
+                "summary": "Owns acceptance decisions and keeps the factory disciplined.",
+            },
+        ]
+    return [
+        {
+            "role": "Executive",
+            "name": "Executive",
+            "status": "ready",
+            "priority": 0,
+            "authority": ["scope", "route", "accept", "commit", "ledger"],
+            "summary": "Top-level operator for Codex-native or executive-as-ledger factories.",
+        }
+    ]
+
+
+def ensure_operator_records(conn: sqlite3.Connection, run: sqlite3.Row, *, actor: str) -> None:
+    existing = conn.execute(
+        "SELECT COUNT(*) FROM actors WHERE run_id = ?",
+        (run["id"],),
+    ).fetchone()[0]
+    if existing:
+        return
+    now = utc_now()
+    for spec in topology_operator_specs(run):
+        conn.execute(
+            """
+            INSERT INTO actors
+              (run_id, role, name, thread_id, model, reasoning, status, created_at, updated_at, metadata_json)
+            VALUES (?, ?, ?, '', '', '', ?, ?, ?, ?)
+            """,
+            (
+                run["id"],
+                spec["role"],
+                spec["name"],
+                spec["status"],
+                now,
+                now,
+                json_dump(
+                    {
+                        "priority": spec["priority"],
+                        "authority": spec["authority"],
+                        "summary": spec["summary"],
+                        "created_by": actor,
+                    }
+                ),
+            ),
+        )
+
+
+def collect_operators(conn: sqlite3.Connection, run: sqlite3.Row) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    rows = list(
+        conn.execute(
+            """
+            SELECT *
+            FROM actors
+            WHERE run_id = ?
+            ORDER BY id ASC
+            """,
+            (run["id"],),
+        )
+    )
+    operators: list[dict[str, Any]] = []
+    source_rows: list[dict[str, Any]]
+    if rows:
+        source_rows = [row_to_public_dict(row) or {} for row in rows]
+    else:
+        source_rows = []
+        for index, spec in enumerate(topology_operator_specs(run), start=1):
+            source_rows.append(
+                {
+                    "id": f"derived-{index}",
+                    "run_id": run["id"],
+                    "role": spec["role"],
+                    "name": spec["name"],
+                    "thread_id": "",
+                    "model": "",
+                    "reasoning": "",
+                    "status": spec["status"],
+                    "created_at": run["started_at"],
+                    "updated_at": run["updated_at"],
+                    "metadata": {
+                        "priority": spec["priority"],
+                        "authority": spec["authority"],
+                        "summary": spec["summary"],
+                        "derived": True,
+                    },
+                }
+            )
+    for row in source_rows:
+        metadata = row.get("metadata") or parse_json_field(str(row.get("metadata_json", "{}")))
+        priority = metadata.get("priority", 999) if isinstance(metadata, dict) else 999
+        authority = metadata.get("authority", []) if isinstance(metadata, dict) else []
+        summary = metadata.get("summary", "") if isinstance(metadata, dict) else ""
+        operators.append(
+            {
+                **row,
+                "priority": priority,
+                "authority": authority if isinstance(authority, list) else [],
+                "operator_summary": summary,
+                "is_primary": priority == 0,
+                "control_capabilities": {
+                    "can_record_message": True,
+                    "can_deliver_live_message": False,
+                    "mode": "operator_event",
+                },
+            }
+        )
+    def operator_sort_key(operator: dict[str, Any]) -> tuple[int, int]:
+        raw_priority = operator.get("priority")
+        priority = int(raw_priority) if raw_priority is not None else 999
+        raw_id = str(operator.get("id", ""))
+        operator_id = int(raw_id) if raw_id.isdigit() else 0
+        return priority, operator_id
+
+    operators.sort(key=operator_sort_key)
+    return operators, operators[0] if operators else None
+
+
+def require_operator(conn: sqlite3.Connection, run_id: str, operator_id: str) -> sqlite3.Row:
+    if not operator_id.isdigit():
+        raise FactoryError(f"Unknown operator: {operator_id}")
+    operator = conn.execute(
+        "SELECT * FROM actors WHERE id = ? AND run_id = ?",
+        (int(operator_id), run_id),
+    ).fetchone()
+    if operator is None:
+        raise FactoryError(f"Unknown operator: {operator_id}")
+    return operator
+
+
+def record_operator_message(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    operator_id: str,
+    actor: str,
+    message: str,
+) -> dict[str, Any]:
+    text = message.strip()
+    if not text:
+        raise FactoryError("Message must not be empty.")
+    if len(text) > 8000:
+        raise FactoryError("Message must be 8000 characters or fewer.")
+    operator = require_operator(conn, run_id, operator_id)
+    payload = {
+        "operator_id": operator_id,
+        "role": operator["role"],
+        "name": operator["name"],
+    }
+    now = utc_now()
+    message_row = record_control_message(
+        conn,
+        run_id=run_id,
+        baton_id=None,
+        target_type="operator",
+        target_id=operator_id,
+        target_label=str(operator["role"] or operator["name"] or "Operator"),
+        event_type="operator.message.requested",
+        actor=actor or "Dashboard",
+        message=text,
+        delivery="recorded_only",
+        control_mode="operator_event",
+        payload=payload,
+        summary=f"{operator['role']}: {shorten(text, 100)}",
+    )
+    conn.execute(
+        "UPDATE actors SET updated_at = ?, status = ? WHERE id = ?",
+        (now, "messaged", int(operator_id)),
+    )
+    return message_row
+
+
+def record_baton_message(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    baton_id: str,
+    actor: str,
+    message: str,
+) -> dict[str, Any]:
+    text = message.strip()
+    if not text:
+        raise FactoryError("Message must not be empty.")
+    if len(text) > 8000:
+        raise FactoryError("Message must be 8000 characters or fewer.")
+    baton = require_baton(conn, baton_id)
+    if baton["run_id"] != run_id:
+        raise FactoryError(f"Baton {baton_id} does not belong to current run {run_id}.")
+    payload = {
+        "baton_id": baton_id,
+        "owner": baton["owner"],
+    }
+    return record_control_message(
+        conn,
+        run_id=run_id,
+        baton_id=baton_id,
+        target_type="baton",
+        target_id=baton_id,
+        target_label=f"{baton['owner'] or 'Baton owner'} · {baton_id}",
+        event_type="baton.message.requested",
+        actor=actor or "Dashboard",
+        message=text,
+        delivery="recorded_only",
+        control_mode="baton_event",
+        payload=payload,
+        summary=f"{baton_id}: {shorten(text, 100)}",
+    )
+
+
+def collect_agent_sessions(conn: sqlite3.Connection, run_id: str, recent: int) -> list[dict[str, Any]]:
+    rows = list(
+        conn.execute(
+            """
+            SELECT *
+            FROM agent_sessions
+            WHERE run_id = ?
+            ORDER BY COALESCE(last_seen_at, started_at, '') DESC, id DESC
+            LIMIT ?
+            """,
+            (run_id, recent),
+        )
+    )
+    sessions: list[dict[str, Any]] = []
+    for row in rows:
+        payload = row_to_public_dict(row) or {}
+        control_mode = payload.get("control_mode") or "none"
+        if payload.get("adapter") == "claude-code" and payload.get("control_ref"):
+            claude_bin = claude_bin_for_session(row)
+            payload["commands"] = {
+                "agents": f"{claude_bin} agents",
+                "attach": f"{claude_bin} attach {payload['control_ref']}",
+                "logs": f"{claude_bin} logs {payload['control_ref']}",
+                "stop": f"{claude_bin} stop {payload['control_ref']}",
+            }
+        payload["control_capabilities"] = {
+            "can_record_message": True,
+            "can_deliver_live_message": control_mode in {"tmux", "zellij", "pty", "codex_thread"},
+            "can_attach_live": control_mode in {"claude_bg", "tmux", "zellij", "pty", "codex_thread"},
+            "mode": control_mode,
+        }
+        sessions.append(payload)
+    return sessions
+
+
+def collect_baton_workers(batons: list[dict[str, Any]], sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    sessions_by_baton: dict[str, list[dict[str, Any]]] = {}
+    for session in sessions:
+        baton_id = session.get("baton_id")
+        if isinstance(baton_id, str) and baton_id:
+            sessions_by_baton.setdefault(baton_id, []).append(session)
+
+    workers: list[dict[str, Any]] = []
+    for baton in batons:
+        baton_id = str(baton.get("id") or "")
+        if not baton_id:
+            continue
+        related_sessions = sessions_by_baton.get(baton_id, [])
+        owner = str(baton.get("owner") or "Builder")
+        status = str(baton.get("status") or "assigned")
+        last_seen = baton.get("accepted_at") or baton.get("handed_off_at") or baton.get("assigned_at")
+        workers.append(
+            {
+                "id": f"baton:{baton_id}",
+                "kind": "baton",
+                "baton_id": baton_id,
+                "role": owner,
+                "label": f"{owner} · {baton_id}",
+                "status": status,
+                "summary": baton.get("summary") or baton.get("title") or "",
+                "last_seen_at": last_seen,
+                "source": "baton",
+                "session_count": len(related_sessions),
+                "control_capabilities": {
+                    "can_record_message": True,
+                    "can_deliver_live_message": False,
+                    "mode": "baton_event",
+                },
+            }
+        )
+
+    for session in sessions:
+        workers.append(
+            {
+                "id": f"session:{session.get('id')}",
+                "kind": "session",
+                "session_id": session.get("id"),
+                "baton_id": session.get("baton_id"),
+                "role": session.get("role"),
+                "label": session.get("label") or session.get("id"),
+                "status": session.get("status"),
+                "summary": session.get("summary"),
+                "last_seen_at": session.get("last_seen_at") or session.get("started_at"),
+                "source": session.get("adapter"),
+                "control_capabilities": session.get("control_capabilities"),
+            }
+        )
+
+    def worker_sort_key(worker: dict[str, Any]) -> tuple[str, str]:
+        return str(worker.get("last_seen_at") or ""), str(worker.get("id") or "")
+
+    workers.sort(key=worker_sort_key, reverse=True)
+    return workers
+
+
+def collect_control_messages(conn: sqlite3.Connection, run_id: str, recent: int) -> list[dict[str, Any]]:
+    rows = [
+        row
+        for row in (
+            row_to_public_dict(row)
+            for row in conn.execute(
+                """
+                SELECT *
+                FROM control_messages
+                WHERE run_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (run_id, recent),
+            )
+        )
+        if row is not None
+    ]
+    messages: list[dict[str, Any]] = []
+    for row in rows:
+        public = row
+        public["public_id"] = public_message_id(public["id"])
+        public["occurred_at"] = public.get("created_at")
+        messages.append(public)
+    return messages
+
+
+def collect_recent_verification(conn: sqlite3.Connection, run_id: str, recent: int) -> list[dict[str, Any]]:
+    rows = list(
+        conn.execute(
+            """
+            SELECT v.*
+            FROM verification_runs v
+            LEFT JOIN batons b ON b.id = v.baton_id
+            WHERE v.baton_id IS NULL OR b.run_id = ?
+            ORDER BY v.created_at DESC, v.id DESC
+            LIMIT ?
+            """,
+            (run_id, recent),
+        )
+    )
+    return [row for row in (row_to_public_dict(row) for row in rows) if row is not None]
+
+
+def collect_recent_reviews(conn: sqlite3.Connection, run_id: str, recent: int) -> list[dict[str, Any]]:
+    rows = list(
+        conn.execute(
+            """
+            SELECT r.*
+            FROM reviews r
+            JOIN batons b ON b.id = r.baton_id
+            WHERE b.run_id = ?
+            ORDER BY r.created_at DESC, r.id DESC
+            LIMIT ?
+            """,
+            (run_id, recent),
+        )
+    )
+    return [review_with_findings(conn, row) for row in rows]
+
+
+def collect_dashboard_metrics(
+    *,
+    batons: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    verification: list[dict[str, Any]],
+    reviews: list[dict[str, Any]],
+    sessions: list[dict[str, Any]],
+    workers: list[dict[str, Any]],
+    control_messages: list[dict[str, Any]],
+) -> dict[str, Any]:
+    failed_checks = sum(1 for row in verification if row.get("result") == "fail")
+    blocked_checks = sum(1 for row in verification if row.get("result") == "blocked")
+    pending_reviews = sum(1 for row in batons if row.get("status") in {"handed_off", "review"})
+    patch_required = sum(1 for row in reviews if row.get("status") == "patch_required")
+    active_sessions = sum(1 for row in sessions if row.get("status") in SESSION_ACTIVE_STATUSES)
+    active_batons_count = sum(1 for row in batons if row.get("status") in ACTIVE_BATON_STATUSES)
+    return {
+        "active_batons": active_batons_count,
+        "active_sessions": active_sessions,
+        "pending_reviews": pending_reviews,
+        "patch_required_reviews": patch_required,
+        "failed_verification": failed_checks,
+        "blocked_verification": blocked_checks,
+        "recent_events": len(events),
+        "workers": len(workers),
+        "control_messages": len(control_messages),
+        "active_control_messages": sum(1 for row in control_messages if row.get("status") in CONTROL_MESSAGE_ACTIVE_STATUSES),
+        "queued_control_messages": sum(1 for row in control_messages if row.get("status") == "queued"),
+    }
+
+
+def collect_dashboard_snapshot(conn: sqlite3.Connection, root: Path, db: str | None, recent: int) -> dict[str, Any]:
+    recent = require_limit(recent, field="recent")
+    try:
+        status = collect_status(conn, root, db)
+    except FactoryError as exc:
+        return {
+            "initialized": False,
+            "generated_at": utc_now(),
+            "root": str(root),
+            "db": str(db_path_for(root, db)),
+            "error": str(exc),
+            "status": None,
+            "metrics": {},
+            "batons": [],
+            "events": [],
+            "verification": [],
+            "reviews": [],
+            "sessions": [],
+            "workers": [],
+            "control_messages": [],
+            "operators": [],
+            "primary_operator": None,
+        }
+
+    run = status["run"]
+    run_id = run["id"]
+    operators, primary_operator = collect_operators(conn, run)
+    sync_claude_code_sessions(
+        conn,
+        root=root,
+        run_id=run_id,
+        timeout_seconds=3,
+        output_limit=DEFAULT_SPAWN_OUTPUT_LIMIT,
+    )
+    conn.commit()
+    batons = [
+        row
+        for row in (
+            row_to_public_dict(row)
+            for row in conn.execute(
+                "SELECT * FROM batons WHERE run_id = ? ORDER BY assigned_at DESC LIMIT ?",
+                (run_id, recent),
+            )
+        )
+        if row is not None
+    ]
+    events = [
+        row
+        for row in (
+            row_to_public_dict(row)
+            for row in conn.execute(
+                """
+                SELECT *
+                FROM events
+                WHERE run_id = ?
+                ORDER BY occurred_at DESC, id DESC
+                LIMIT ?
+                """,
+                (run_id, recent),
+            )
+        )
+        if row is not None
+    ]
+    verification = collect_recent_verification(conn, run_id, recent)
+    reviews = collect_recent_reviews(conn, run_id, recent)
+    sessions = collect_agent_sessions(conn, run_id, recent)
+    workers = collect_baton_workers(batons, sessions)
+    control_messages = collect_control_messages(conn, run_id, recent)
+    metrics = collect_dashboard_metrics(
+        batons=batons,
+        events=events,
+        verification=verification,
+        reviews=reviews,
+        sessions=sessions,
+        workers=workers,
+        control_messages=control_messages,
+    )
+    return {
+        "initialized": True,
+        "generated_at": utc_now(),
+        "root": str(root),
+        "db": str(db_path_for(root, db)),
+        "status": status,
+        "metrics": metrics,
+        "batons": batons,
+        "events": events,
+        "verification": verification,
+        "reviews": reviews,
+        "sessions": sessions,
+        "workers": workers,
+        "control_messages": control_messages,
+        "operators": operators,
+        "primary_operator": primary_operator,
+    }
+
+
+def require_agent_session(conn: sqlite3.Connection, run_id: str, session_id: str) -> sqlite3.Row:
+    session = conn.execute(
+        "SELECT * FROM agent_sessions WHERE id = ? AND run_id = ?",
+        (session_id, run_id),
+    ).fetchone()
+    if session is None:
+        raise FactoryError(f"Unknown agent session: {session_id}")
+    return session
+
+
+def record_agent_session_message(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    session_id: str,
+    actor: str,
+    message: str,
+) -> dict[str, Any]:
+    text = message.strip()
+    if not text:
+        raise FactoryError("Message must not be empty.")
+    if len(text) > 8000:
+        raise FactoryError("Message must be 8000 characters or fewer.")
+    session = require_agent_session(conn, run_id, session_id)
+    payload = {
+        "session_id": session_id,
+        "control_mode": session["control_mode"],
+        "control_ref": session["control_ref"],
+    }
+    now = utc_now()
+    message_row = record_control_message(
+        conn,
+        run_id=run_id,
+        baton_id=session["baton_id"],
+        target_type="session",
+        target_id=session_id,
+        target_label=session["label"] or session_id,
+        event_type="agent.message.requested",
+        actor=actor or "Dashboard",
+        message=text,
+        delivery="recorded_only",
+        control_mode=session["control_mode"],
+        control_ref=session["control_ref"],
+        payload=payload,
+        summary=shorten(text, 120),
+    )
+    conn.execute(
+        """
+        UPDATE agent_sessions
+        SET last_seen_at = ?, summary = ?
+        WHERE id = ?
+        """,
+        (now, "Dashboard message requested", session_id),
+    )
+    return message_row
+
+
+def cmd_dashboard_snapshot(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    conn = connect(root, args.db)
+    snapshot = collect_dashboard_snapshot(conn, root, args.db, args.recent)
+    print_json(snapshot)
+    return 0
+
+
+def dashboard_registry_status(root: Path) -> dict[str, Any]:
+    payload = read_dashboard_registry(root)
+    if not payload:
+        return {"registered": False, "running": False, "registry": str(dashboard_registry_path(root))}
+    pid = int(payload.get("pid") or 0)
+    running = process_is_running(pid)
+    return {"registered": True, "running": running, "registry": str(dashboard_registry_path(root)), **payload}
+
+
+def cmd_dashboard_status(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    payload = dashboard_registry_status(root)
+    if args.json:
+        print_json(payload)
+    else:
+        print(f"Registered: {payload['registered']}")
+        print(f"Running: {payload['running']}")
+        if payload.get("url"):
+            print(f"Dashboard: {payload['url']}")
+        if payload.get("pid"):
+            print(f"PID: {payload['pid']}")
+        print(f"Registry: {payload['registry']}")
+    return 0 if payload.get("running") or not args.require_running else 1
+
+
+def cmd_dashboard_stop(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    payload = dashboard_registry_status(root)
+    if not payload.get("registered"):
+        print_json({"status": "not_registered", "registry": payload["registry"]})
+        return 0
+    pid = int(payload.get("pid") or 0)
+    if payload.get("running"):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError as exc:
+            raise FactoryError(f"Unable to stop dashboard process {pid}: {exc}") from exc
+        stopped = True
+    else:
+        stopped = False
+    if args.clean:
+        try:
+            dashboard_registry_path(root).unlink()
+        except FileNotFoundError:
+            pass
+    print_json({"status": "stopped" if stopped else "not_running", "pid": pid, "cleaned": args.clean})
+    return 0
+
+
+def is_loopback_host(host: str) -> bool:
+    return host in {"127.0.0.1", "localhost", "::1"}
+
+
+def require_port(port: int | None) -> int:
+    if port is None:
+        return DEFAULT_DASHBOARD_PORT
+    if port < 1 or port > 65535:
+        raise FactoryError("--port must be between 1 and 65535")
+    return port
+
+
+def is_dashboard_port_available(host: str, port: int) -> bool:
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    try:
+        with socket.socket(family, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((host, port))
+            return True
+    except OSError:
+        return False
+
+
+def resolve_dashboard_port(host: str, requested_port: int | None) -> int:
+    if requested_port is not None:
+        port = require_port(requested_port)
+        if not is_dashboard_port_available(host, port):
+            raise FactoryError(f"Dashboard port {port} is already in use.")
+        return port
+    for port in range(DEFAULT_DASHBOARD_PORT, DEFAULT_DASHBOARD_PORT + 50):
+        if is_dashboard_port_available(host, port):
+            return port
+    raise FactoryError(
+        f"No dashboard port is available from {DEFAULT_DASHBOARD_PORT} to {DEFAULT_DASHBOARD_PORT + 49}."
+    )
+
+
+def dashboard_url(host: str, port: int, token: str) -> str:
+    display_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    return f"http://{display_host}:{port}/?token={token}"
+
+
+def dashboard_registry_path(root: Path) -> Path:
+    return root / DEFAULT_DB_DIR / "dashboard.json"
+
+
+def process_is_running(pid: int) -> bool:
+    if pid < 1:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def read_dashboard_registry(root: Path) -> dict[str, Any]:
+    path = dashboard_registry_path(root)
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def write_dashboard_registry(
+    *,
+    root: Path,
+    run_id: str | None,
+    db: str | None,
+    host: str,
+    port: int,
+    token: str,
+    url: str,
+    pid: int,
+    control_enabled: bool,
+) -> None:
+    path = dashboard_registry_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "pid": pid,
+        "host": host,
+        "port": port,
+        "token": token,
+        "url": url,
+        "root": str(root),
+        "db": str(db_path_for(root, db)),
+        "run_id": run_id or "",
+        "control_enabled": control_enabled,
+        "started_at": utc_now(),
+        "last_seen_at": utc_now(),
+    }
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def wait_for_dashboard_port(host: str, port: int, proc: subprocess.Popen[Any], timeout_seconds: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        returncode = proc.poll()
+        if returncode is not None:
+            raise FactoryError(f"Dashboard server exited early with status {returncode}.")
+        try:
+            with socket.create_connection((host, port), timeout=0.2):
+                return
+        except OSError:
+            time.sleep(0.1)
+    raise FactoryError(f"Dashboard server did not become ready on {host}:{port}.")
+
+
+def start_dashboard_background(
+    *,
+    root: Path,
+    db: str | None,
+    config: str | None,
+    host: str,
+    port: int,
+    token: str,
+    recent: int,
+    actor: str,
+    control_enabled: bool,
+    allow_remote: bool,
+    open_browser: bool,
+) -> subprocess.Popen[Any]:
+    command = [sys.executable, str(Path(__file__).resolve()), "--root", str(root)]
+    if db:
+        command.extend(["--db", db])
+    if config:
+        command.extend(["--config", config])
+    command.extend(
+        [
+            "dashboard",
+            "serve",
+            "--host",
+            host,
+            "--port",
+            str(port),
+            "--token",
+            token,
+            "--recent",
+            str(recent),
+            "--actor",
+            actor,
+        ]
+    )
+    if not control_enabled:
+        command.append("--read-only")
+    if allow_remote:
+        command.append("--allow-remote")
+    if open_browser:
+        command.append("--open")
+    proc = subprocess.Popen(
+        command,
+        cwd=root,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    wait_for_dashboard_port(host, port, proc)
+    return proc
+
+
+def record_dashboard_started(
+    conn: sqlite3.Connection,
+    *,
+    run: sqlite3.Row | None,
+    actor: str,
+    url: str,
+    control_enabled: bool,
+    source: str,
+) -> None:
+    if run is None:
+        return
+    emit_event(
+        conn,
+        event_type="factory.dashboard.started",
+        actor=actor,
+        run_id=run["id"],
+        summary=f"Dashboard started from {source}",
+        payload={
+            "url": url,
+            "control_enabled": control_enabled,
+            "source": source,
+        },
+    )
+
+
+def cmd_dashboard_serve(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    require_limit(args.recent, field="recent")
+    if args.read_only and args.enable_control:
+        raise FactoryError("Use either --read-only or --enable-control, not both.")
+    control_enabled = not args.read_only
+    if not is_loopback_host(args.host) and not args.allow_remote:
+        raise FactoryError("dashboard serve binds to loopback by default; pass --allow-remote for non-loopback hosts.")
+    port = resolve_dashboard_port(args.host, args.port)
+
+    dist_dir = PLUGIN_ROOT / "dashboard" / "dist"
+    if not (dist_dir / "index.html").is_file():
+        raise FactoryError("Dashboard assets are missing. Run `cd dashboard && npm install && npm run build`.")
+
+    import dashboard_server
+    dashboard_server.ensure_dependencies()
+
+    token = args.token or secrets.token_urlsafe(24)
+    url = dashboard_url(args.host, port, token)
+    conn = connect(root, args.db)
+    run = current_run(conn)
+    if run is not None:
+        ensure_operator_records(conn, run, actor=args.actor)
+        run = current_run(conn)
+    record_dashboard_started(
+        conn,
+        run=run,
+        actor=args.actor,
+        url=url,
+        control_enabled=control_enabled,
+        source="dashboard serve",
+    )
+    conn.commit()
+    write_dashboard_registry(
+        root=root,
+        run_id=run["id"] if run is not None else None,
+        db=args.db,
+        host=args.host,
+        port=port,
+        token=token,
+        url=url,
+        pid=os.getpid(),
+        control_enabled=control_enabled,
+    )
+    print(f"Agentic Factory dashboard: {url}")
+    print(f"Project root: {root}")
+    print(f"Control actions: {'enabled' if control_enabled else 'read-only'}")
+    if args.open:
+        webbrowser.open(url)
+    try:
+        return int(
+            dashboard_server.serve(
+                factory=sys.modules[__name__],
+                root=root,
+                db=args.db,
+                host=args.host,
+                port=port,
+                token=token,
+                enable_control=control_enabled,
+                recent=args.recent,
+            )
+        )
+    except OSError as exc:
+        raise FactoryError(f"Unable to start dashboard server on {args.host}:{port}: {exc}") from exc
+
+
+def cmd_up(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    config = config_for_args(root, args)
+    require_limit(args.recent, field="recent")
+    if getattr(args, "open", False) and args.no_open:
+        raise FactoryError("Use either --open or --no-open, not both.")
+    if args.background and args.no_serve:
+        raise FactoryError("Use either --background or --no-serve, not both.")
+    if not is_loopback_host(args.host) and not args.allow_remote:
+        raise FactoryError("up binds the dashboard to loopback by default; pass --allow-remote for non-loopback hosts.")
+    port = resolve_dashboard_port(args.host, args.port)
+
+    dist_dir = PLUGIN_ROOT / "dashboard" / "dist"
+    if not (dist_dir / "index.html").is_file():
+        raise FactoryError("Dashboard assets are missing. Run `cd dashboard && npm install && npm run build`.")
+
+    import dashboard_server
+    dashboard_server.ensure_dependencies()
+
+    conn = connect(root, args.db)
+    existing = current_run(conn)
+    created = False
+    if existing is None or args.force:
+        create_factory_run(
+            conn,
+            root=root,
+            config=config,
+            mode=args.mode,
+            objective=args.objective,
+            topology=args.topology,
+            run_id=args.run_id,
+            actor=args.actor,
+            metadata={
+                "created_by": "agentic-factory-up",
+                "runtime_mode": args.runtime_mode,
+                "dashboard_policy": "read_only" if args.read_only else "control_enabled",
+                "bootstrap_phase": "ready_for_user",
+            },
+        )
+        created = True
+        run = require_run(conn)
+    else:
+        run = existing
+        merge_run_metadata(
+            conn,
+            run["id"],
+            {
+                "runtime_mode": args.runtime_mode,
+                "dashboard_policy": "read_only" if args.read_only else "control_enabled",
+                "bootstrap_phase": "ready_for_user",
+            },
+        )
+        if args.objective and not run["objective"]:
+            conn.execute(
+                "UPDATE factory_runs SET objective = ?, updated_at = ? WHERE id = ?",
+                (args.objective, utc_now(), run["id"]),
+            )
+        run = require_run(conn)
+
+    ensure_operator_records(conn, run, actor=args.actor)
+    operators, primary_operator = collect_operators(conn, run)
+    token = args.token or secrets.token_urlsafe(24)
+    url = dashboard_url(args.host, port, token)
+    control_enabled = not args.read_only
+
+    payload = {
+        "status": "ready_for_user",
+        "run_id": run["id"],
+        "created_run": created,
+        "root": str(root),
+        "db": str(db_path_for(root, args.db)),
+        "dashboard_url": url,
+        "control_enabled": control_enabled,
+        "mode": run["work_mode"],
+        "topology": run["topology"],
+        "runtime_mode": args.runtime_mode,
+        "primary_operator": primary_operator,
+        "operators": operators,
+        "server_running": True,
+        "message": "Factory floor is ready. Present this URL to the user and wait for readiness before assigning work.",
+    }
+    if args.no_serve:
+        payload["status"] = "initialized_no_server"
+        payload["server_running"] = False
+        payload["warning"] = (
+            "--no-serve was supplied, so the dashboard HTTP server is not running. "
+            "Use --background for non-blocking agent startup with a live dashboard."
+        )
+        emit_event(
+            conn,
+            event_type="factory.bootstrap.no_server",
+            actor=args.actor,
+            run_id=run["id"],
+            summary="Factory bootstrap initialized without starting the dashboard server.",
+            payload={
+                "dashboard_url": url,
+                "url": url,
+                "control_enabled": control_enabled,
+                "runtime_mode": args.runtime_mode,
+                "topology": run["topology"],
+                "primary_operator": primary_operator,
+                "created_run": created,
+                "server_running": False,
+            },
+        )
+        conn.commit()
+        print_json(payload)
+        return 0
+
+    if args.background:
+        conn.commit()
+        conn.close()
+        proc = start_dashboard_background(
+            root=root,
+            db=args.db,
+            config=args.config,
+            host=args.host,
+            port=port,
+            token=token,
+            recent=args.recent,
+            actor=args.actor,
+            control_enabled=control_enabled,
+            allow_remote=args.allow_remote,
+            open_browser=not args.no_open,
+        )
+        conn = connect(root, args.db)
+        emit_event(
+            conn,
+            event_type="factory.ready_for_operations",
+            actor=args.actor,
+            run_id=run["id"],
+            summary="Factory floor is initialized and waiting for user readiness.",
+            payload={
+                "dashboard_url": url,
+                "url": url,
+                "control_enabled": control_enabled,
+                "runtime_mode": args.runtime_mode,
+                "topology": run["topology"],
+                "primary_operator": primary_operator,
+                "created_run": created,
+                "server_running": True,
+                "dashboard_pid": proc.pid,
+            },
+        )
+        conn.commit()
+        conn.close()
+        payload["dashboard_pid"] = proc.pid
+        write_dashboard_registry(
+            root=root,
+            run_id=run["id"],
+            db=args.db,
+            host=args.host,
+            port=port,
+            token=token,
+            url=url,
+            pid=proc.pid,
+            control_enabled=control_enabled,
+        )
+        payload["message"] = (
+            "Factory floor is ready and the dashboard server is running in the background. "
+            "Present this URL to the user and wait for readiness before assigning work."
+        )
+        print_json(payload)
+        return 0
+
+    record_dashboard_started(
+        conn,
+        run=run,
+        actor=args.actor,
+        url=url,
+        control_enabled=control_enabled,
+        source="up",
+    )
+    emit_event(
+        conn,
+        event_type="factory.ready_for_operations",
+        actor=args.actor,
+        run_id=run["id"],
+        summary="Factory floor is initialized and waiting for user readiness.",
+        payload={
+            "dashboard_url": url,
+            "url": url,
+            "control_enabled": control_enabled,
+            "runtime_mode": args.runtime_mode,
+            "topology": run["topology"],
+            "primary_operator": primary_operator,
+            "created_run": created,
+            "server_running": True,
+        },
+    )
+    conn.commit()
+
+    write_dashboard_registry(
+        root=root,
+        run_id=run["id"],
+        db=args.db,
+        host=args.host,
+        port=port,
+        token=token,
+        url=url,
+        pid=os.getpid(),
+        control_enabled=control_enabled,
+    )
+    print("Factory floor is ready.")
+    print(f"Dashboard: {url}")
+    print(f"Run ID: {run['id']}")
+    print(f"Project root: {root}")
+    print(f"Topology: {run['topology']}")
+    print(f"Runtime mode: {args.runtime_mode}")
+    print(f"Control actions: {'enabled' if control_enabled else 'read-only'}")
+    if primary_operator:
+        print(f"Top-level operator: {primary_operator.get('role', 'Operator')}")
+    print("Pause here: when the user is ready, begin factory operations.")
+    if not args.no_open:
+        webbrowser.open(url)
+    try:
+        return int(
+            dashboard_server.serve(
+                factory=sys.modules[__name__],
+                root=root,
+                db=args.db,
+                host=args.host,
+                port=port,
+                token=token,
+                enable_control=control_enabled,
+                recent=args.recent,
+            )
+        )
+    except OSError as exc:
+        raise FactoryError(f"Unable to start dashboard server on {args.host}:{port}: {exc}") from exc
+
+
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--root", default=None, help="Project root; defaults to current directory.")
     parser.add_argument("--db", default=None, help="Factory DB path; defaults to .agentic-factory/factory.db.")
@@ -2438,13 +5358,93 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--force", action="store_true")
     init.set_defaults(func=cmd_init)
 
+    up = subparsers.add_parser("up", help="Initialize the factory floor and serve the local dashboard.")
+    up.add_argument("--mode", default=None)
+    up.add_argument("--objective", default="")
+    up.add_argument("--topology", default=None)
+    up.add_argument(
+        "--runtime-mode",
+        choices=sorted(AGENT_PACKET_RUNTIME_MODES),
+        default="agent_cli_subagents",
+        help="Resolved runtime mode from the orchestration skill.",
+    )
+    up.add_argument("--actor", default="Agentic Factory")
+    up.add_argument("--run-id", default="")
+    up.add_argument("--force", action="store_true", help="Create a new run even if one already exists.")
+    up.add_argument("--host", default="127.0.0.1")
+    up.add_argument("--port", type=int, default=None, help=f"Dashboard port; defaults to first free port from {DEFAULT_DASHBOARD_PORT}.")
+    up.add_argument("--recent", type=int, default=100)
+    up.add_argument("--token", default="", help="Access token; generated by default.")
+    up.add_argument("--read-only", action="store_true", help="Disable dashboard control endpoints.")
+    up.add_argument("--allow-remote", action="store_true", help="Allow binding to a non-loopback host.")
+    up.add_argument("--open", action="store_true", help="Open the dashboard URL in the default browser. This is the default.")
+    up.add_argument("--no-open", action="store_true", help="Do not open the dashboard URL.")
+    up.add_argument("--background", action="store_true", help="Start the dashboard server in the background and print JSON.")
+    up.add_argument("--no-serve", action="store_true", help="Test-only bootstrap without starting the dashboard server.")
+    up.set_defaults(func=cmd_up)
+
     status = subparsers.add_parser("status", help="Show current factory state.")
     status.add_argument("--json", action="store_true")
     status.add_argument("--compact", action="store_true")
     status.set_defaults(func=cmd_status)
 
-    agent = subparsers.add_parser("agent", help="Generate portable agent packets.")
+    dashboard = subparsers.add_parser("dashboard", help="Inspect or serve the local factory dashboard.")
+    dashboard_sub = dashboard.add_subparsers(dest="dashboard_command", required=True)
+    dashboard_snapshot = dashboard_sub.add_parser("snapshot", help="Print the dashboard read model as JSON.")
+    dashboard_snapshot.add_argument("--recent", type=int, default=50)
+    dashboard_snapshot.set_defaults(func=cmd_dashboard_snapshot)
+    dashboard_status = dashboard_sub.add_parser("status", help="Show the registered dashboard process.")
+    dashboard_status.add_argument("--json", action="store_true")
+    dashboard_status.add_argument("--require-running", action="store_true")
+    dashboard_status.set_defaults(func=cmd_dashboard_status)
+    dashboard_stop = dashboard_sub.add_parser("stop", help="Stop the registered dashboard process.")
+    dashboard_stop.add_argument("--clean", action="store_true", default=True, help="Remove the dashboard registry after stopping.")
+    dashboard_stop.add_argument("--keep-registry", dest="clean", action="store_false")
+    dashboard_stop.set_defaults(func=cmd_dashboard_stop)
+    dashboard_serve = dashboard_sub.add_parser("serve", help="Serve the local dashboard UI.")
+    dashboard_serve.add_argument("--host", default="127.0.0.1")
+    dashboard_serve.add_argument("--port", type=int, default=None, help=f"Dashboard port; defaults to first free port from {DEFAULT_DASHBOARD_PORT}.")
+    dashboard_serve.add_argument("--recent", type=int, default=100)
+    dashboard_serve.add_argument("--token", default="", help="Access token; generated by default.")
+    dashboard_serve.add_argument("--open", action="store_true", help="Open the dashboard URL in the default browser.")
+    dashboard_serve.add_argument(
+        "--enable-control",
+        action="store_true",
+        help="Deprecated compatibility flag; controls are enabled by default.",
+    )
+    dashboard_serve.add_argument("--read-only", action="store_true", help="Disable dashboard control endpoints.")
+    dashboard_serve.add_argument("--actor", default="Dashboard")
+    dashboard_serve.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="Allow binding to a non-loopback host. A token is still required.",
+    )
+    dashboard_serve.set_defaults(func=cmd_dashboard_serve)
+
+    agent = subparsers.add_parser("agent", help="Generate packets and manage spawned agent sessions.")
     agent_sub = agent.add_subparsers(dest="agent_command", required=True)
+    agent_adapter = agent_sub.add_parser("adapter", help="Inspect adapter capabilities.")
+    agent_adapter_sub = agent_adapter.add_subparsers(dest="agent_adapter_command", required=True)
+    agent_adapter_list = agent_adapter_sub.add_parser("list", help="List supported adapters and capabilities.")
+    agent_adapter_list.add_argument("--json", action="store_true")
+    agent_adapter_list.set_defaults(func=cmd_agent_adapter_list)
+    agent_adapter_doctor = agent_adapter_sub.add_parser("doctor", help="Check whether an adapter is locally available.")
+    agent_adapter_doctor.add_argument("--adapter", required=True, choices=sorted(AGENT_SPAWN_ADAPTERS))
+    agent_adapter_doctor.add_argument("--claude-bin", default="claude")
+    agent_adapter_doctor.add_argument("--codex-bin", default="codex")
+    agent_adapter_doctor.add_argument("--json", action="store_true")
+    agent_adapter_doctor.set_defaults(func=cmd_agent_adapter_doctor)
+
+    agent_permissions = agent_sub.add_parser("permissions", help="Inspect adapter-neutral permission profiles.")
+    agent_permissions_sub = agent_permissions.add_subparsers(dest="agent_permissions_command", required=True)
+    agent_permissions_list = agent_permissions_sub.add_parser("list", help="List permission profiles.")
+    agent_permissions_list.add_argument("--json", action="store_true")
+    agent_permissions_list.set_defaults(func=cmd_agent_permissions_list)
+    agent_permissions_plan = agent_permissions_sub.add_parser("plan", help="Show how an adapter translates a permission profile.")
+    agent_permissions_plan.add_argument("--adapter", required=True, choices=sorted(AGENT_SPAWN_ADAPTERS))
+    agent_permissions_plan.add_argument("--profile", required=True, choices=sorted(PERMISSION_PROFILE_NAMES))
+    agent_permissions_plan.set_defaults(func=cmd_agent_permissions_plan)
+
     agent_packet = agent_sub.add_parser("packet", help="Generate a role packet for delegation.")
     agent_packet.add_argument("--role", required=True, choices=sorted(AGENT_PACKET_ROLES))
     agent_packet.add_argument("--baton", default=None)
@@ -2456,6 +5456,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="agent_cli_subagents",
     )
     agent_packet.add_argument("--write-policy", choices=sorted(AGENT_PACKET_WRITE_POLICIES), default="auto")
+    agent_packet.add_argument("--permission-profile", choices=sorted(PERMISSION_PROFILE_NAMES), default="")
     agent_packet.add_argument("--allowed", action="append", default=[], help="Allowed file or area; repeat or comma-separate.")
     agent_packet.add_argument(
         "--restricted",
@@ -2468,7 +5469,7 @@ def build_parser() -> argparse.ArgumentParser:
     agent_packet.add_argument("--non-goal", action="append", default=[], help="Non-goal to include.")
     agent_packet.set_defaults(func=cmd_agent_packet)
 
-    agent_spawn = agent_sub.add_parser("spawn", help="Experimentally spawn a packet through an adapter.")
+    agent_spawn = agent_sub.add_parser("spawn", help="Spawn a packet through a session or process adapter.")
     agent_spawn.add_argument("--adapter", required=True, choices=sorted(AGENT_SPAWN_ADAPTERS))
     agent_spawn.add_argument("--experimental", action="store_true", help="Required to execute the adapter.")
     agent_spawn.add_argument("--dry-run", action="store_true", help="Write packet and print argv without execution.")
@@ -2500,6 +5501,7 @@ def build_parser() -> argparse.ArgumentParser:
     agent_spawn.add_argument("--allow-unlocked", action="store_true", help="Allow write-capable spawn without a held baton lock.")
     agent_spawn.add_argument("--no-event", action="store_true", help="Do not record agent.spawn events.")
     agent_spawn.add_argument("--actor", default="Executive")
+    agent_spawn.add_argument("--permission-profile", choices=sorted(PERMISSION_PROFILE_NAMES), default="")
     agent_spawn.add_argument("--codex-bin", default="codex")
     agent_spawn.add_argument("--codex-model", default="")
     agent_spawn.add_argument("--codex-profile", default="")
@@ -2507,6 +5509,114 @@ def build_parser() -> argparse.ArgumentParser:
     agent_spawn.add_argument("--codex-approval", choices=sorted(CODEX_APPROVAL_POLICIES), default="never")
     agent_spawn.add_argument("--codex-skip-git-repo-check", action="store_true")
     agent_spawn.set_defaults(func=cmd_agent_spawn)
+
+    agent_spawn.add_argument("--claude-bin", default="claude")
+    agent_spawn.add_argument("--claude-model", default="")
+    agent_spawn.add_argument("--claude-agent", default="", help="Claude Code subagent name to run as the session's main agent.")
+    agent_spawn.add_argument("--claude-permission-mode", default="", help="Optional Claude Code permission mode.")
+    agent_spawn.add_argument("--claude-allowed-tool", action="append", default=[], help="Additional Claude Code allowedTools entry.")
+    agent_spawn.add_argument("--claude-disallowed-tool", action="append", default=[], help="Additional Claude Code disallowedTools entry.")
+    agent_spawn.add_argument(
+        "--claude-worktree",
+        nargs="?",
+        const="auto",
+        default="",
+        help="Start the Claude Code session in an isolated worktree; omit the value for an auto-generated name.",
+    )
+    agent_spawn.add_argument(
+        "--claude-plugin-dir",
+        action="append",
+        default=[],
+        help="Additional Claude Code plugin directory or zip to load for this session.",
+    )
+    agent_spawn.add_argument(
+        "--claude-no-plugin-dir",
+        action="store_true",
+        help="Do not automatically load this Agentic Factory plugin with Claude Code.",
+    )
+    agent_spawn.add_argument(
+        "--claude-add-dir",
+        action="append",
+        default=[],
+        help="Additional directory to expose to the Claude Code background session.",
+    )
+
+    agent_session = agent_sub.add_parser("session", help="Inspect and control spawned agent sessions.")
+    agent_session_sub = agent_session.add_subparsers(dest="agent_session_command", required=True)
+    agent_session_list = agent_session_sub.add_parser("list", help="List recorded agent sessions.")
+    agent_session_list.add_argument("--recent", type=int, default=DEFAULT_LIST_LIMIT)
+    agent_session_list.add_argument("--adapter", choices=sorted(AGENT_SPAWN_ADAPTERS), default="")
+    agent_session_list.add_argument("--sync", action="store_true", help="Refresh Claude Code session state before listing.")
+    agent_session_list.add_argument("--sync-timeout-seconds", type=int, default=5)
+    agent_session_list.add_argument("--output-limit", type=int, default=DEFAULT_SPAWN_OUTPUT_LIMIT)
+    agent_session_list.add_argument("--actor", default="Executive")
+    agent_session_list.add_argument("--json", action="store_true")
+    agent_session_list.set_defaults(func=cmd_agent_session_list)
+
+    agent_session_show = agent_session_sub.add_parser("show", help="Show one recorded agent session.")
+    agent_session_show.add_argument("session_id")
+    agent_session_show.add_argument("--sync", action="store_true", help="Refresh Claude Code session state before showing.")
+    agent_session_show.add_argument("--sync-timeout-seconds", type=int, default=5)
+    agent_session_show.add_argument("--output-limit", type=int, default=DEFAULT_SPAWN_OUTPUT_LIMIT)
+    agent_session_show.add_argument("--actor", default="Executive")
+    agent_session_show.add_argument("--json", action="store_true")
+    agent_session_show.set_defaults(func=cmd_agent_session_show)
+
+    agent_session_sync = agent_session_sub.add_parser("sync", help="Refresh live adapter session state into the DB.")
+    agent_session_sync.add_argument("--adapter", choices=["all", "claude-code"], default="claude-code")
+    agent_session_sync.add_argument("--timeout-seconds", type=int, default=5)
+    agent_session_sync.add_argument("--output-limit", type=int, default=DEFAULT_SPAWN_OUTPUT_LIMIT)
+    agent_session_sync.add_argument("--actor", default="Executive")
+    agent_session_sync.add_argument("--no-event", action="store_true")
+    agent_session_sync.set_defaults(func=cmd_agent_session_sync)
+
+    agent_session_logs = agent_session_sub.add_parser("logs", help="Show recent output for an agent session.")
+    agent_session_logs.add_argument("session_id")
+    agent_session_logs.add_argument("--timeout-seconds", type=int, default=10)
+    agent_session_logs.add_argument("--output-limit", type=int, default=DEFAULT_SPAWN_OUTPUT_LIMIT)
+    agent_session_logs.add_argument("--json", action="store_true")
+    agent_session_logs.set_defaults(func=cmd_agent_session_logs)
+
+    agent_session_stop = agent_session_sub.add_parser("stop", help="Stop a live agent session when the adapter supports it.")
+    agent_session_stop.add_argument("session_id")
+    agent_session_stop.add_argument("--timeout-seconds", type=int, default=10)
+    agent_session_stop.add_argument("--output-limit", type=int, default=DEFAULT_SPAWN_OUTPUT_LIMIT)
+    agent_session_stop.add_argument("--actor", default="Executive")
+    agent_session_stop.set_defaults(func=cmd_agent_session_stop)
+
+    messages = subparsers.add_parser("messages", help="Inspect and acknowledge dashboard/control messages.")
+    messages_sub = messages.add_subparsers(dest="messages_command", required=True)
+    messages_list = messages_sub.add_parser("list", help="List control messages.")
+    messages_list.add_argument("--recent", type=int, default=DEFAULT_LIST_LIMIT)
+    messages_list.add_argument("--target-type", choices=["operator", "session", "baton"], default="")
+    messages_list.add_argument("--target-id", default="")
+    messages_list.add_argument("--baton", default=None)
+    messages_list.add_argument("--status", action="append", default=[], help="Filter by status; repeat or comma-separate.")
+    messages_list.add_argument("--json", action="store_true")
+    messages_list.set_defaults(func=cmd_messages_list)
+    messages_inbox = messages_sub.add_parser("inbox", help="List active messages and optionally claim them.")
+    messages_inbox.add_argument("--recent", type=int, default=DEFAULT_LIST_LIMIT)
+    messages_inbox.add_argument("--target-type", choices=["operator", "session", "baton"], default="")
+    messages_inbox.add_argument("--target-id", default="")
+    messages_inbox.add_argument("--baton", default=None)
+    messages_inbox.add_argument("--status", action="append", default=[])
+    messages_inbox.add_argument("--claim", action="store_true", help="Mark returned active messages as read or handling.")
+    messages_inbox.add_argument("--claim-status", choices=["read", "handling"], default="handling")
+    messages_inbox.add_argument("--actor", default="Agent")
+    messages_inbox.add_argument("--json", action="store_true")
+    messages_inbox.set_defaults(func=cmd_messages_inbox)
+    messages_ack = messages_sub.add_parser("ack", help="Acknowledge one control message.")
+    messages_ack.add_argument("message_id")
+    messages_ack.add_argument("--status", required=True, choices=sorted(CONTROL_MESSAGE_STATUSES))
+    messages_ack.add_argument("--summary", default="")
+    messages_ack.add_argument("--actor", default="Agent")
+    messages_ack.set_defaults(func=cmd_messages_ack)
+
+    flow = subparsers.add_parser("flow", help="Inspect guarded factory lifecycle state.")
+    flow_sub = flow.add_subparsers(dest="flow_command", required=True)
+    flow_doctor = flow_sub.add_parser("doctor", help="Check baton/session/message lifecycle integrity.")
+    flow_doctor.add_argument("--json", action="store_true")
+    flow_doctor.set_defaults(func=cmd_flow_doctor)
 
     event = subparsers.add_parser("event", help="Record a raw event.")
     event_sub = event.add_subparsers(dest="event_command", required=True)
@@ -2573,6 +5683,7 @@ def build_parser() -> argparse.ArgumentParser:
     baton_accept.add_argument("--pushed-status", default="unknown")
     baton_accept.add_argument("--summary", default="")
     baton_accept.add_argument("--actor", default="Executive")
+    baton_accept.add_argument("--override", action="store_true", help="Accept even if the baton is not ready_for_acceptance.")
     baton_accept.add_argument("--release-lock", action="store_true", default=True)
     baton_accept.add_argument("--keep-lock", dest="release_lock", action="store_false")
     baton_accept.add_argument("--lock-name", default=None)

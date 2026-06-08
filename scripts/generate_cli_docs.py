@@ -20,7 +20,11 @@ COMMANDS: tuple[tuple[str, ...], ...] = (
     ("config", "init"),
     ("config", "show"),
     ("init",),
+    ("up",),
     ("status",),
+    ("dashboard",),
+    ("dashboard", "snapshot"),
+    ("dashboard", "serve"),
     ("agent",),
     ("agent", "packet"),
     ("agent", "spawn"),
@@ -146,6 +150,95 @@ NOTES: dict[tuple[str, ...], str] = {
         Common failures:
 
         - No run exists: initialize first with `factory.py init`.
+    """,
+    ("up",): """
+        Required arguments: none, but orchestration agents should pass a resolved
+        objective, mode, topology, and runtime mode after using
+        `agentic-factory-orchestration`.
+
+        `up` is the low-friction agent-facing bootstrap. It initializes the DB
+        if needed, ensures operator records, starts the local dashboard with
+        controls enabled by default, records readiness events, and prints the
+        URL. If the default port is occupied, it picks the next free port. It
+        does not assign the first baton.
+
+        For real agent CLI invocations, use `--background` so the dashboard
+        server keeps running while the agent receives JSON and can pause for
+        user readiness.
+
+        Example:
+
+        ```bash
+        python3 scripts/factory.py up --objective "Build the todo app" --topology executive_as_ledger --background
+        ```
+
+        Test-only setup without a running dashboard:
+
+        ```bash
+        python3 scripts/factory.py up --objective "Build the todo app" --no-serve --no-open
+        ```
+
+        Example output shape with `--background`:
+
+        ```json
+        {"status": "ready_for_user", "dashboard_url": "http://127.0.0.1:8765/?token=...", "server_running": true, "dashboard_pid": 12345}
+        ```
+
+        Common failures:
+
+        - Dashboard assets are missing: run `cd dashboard && npm install && npm run build`.
+        - Non-loopback host without `--allow-remote`.
+        - `--port` is outside the allowed range.
+        - Explicit `--port` is already in use.
+        - `--background` and `--no-serve` are used together.
+        - Existing run plus `--force` with a duplicate `--run-id`.
+    """,
+    ("dashboard", "snapshot"): """
+        Required arguments: none.
+
+        Example:
+
+        ```bash
+        python3 scripts/factory.py dashboard snapshot --recent 50
+        ```
+
+        Example output shape:
+
+        ```json
+        {"initialized": true, "metrics": {"active_batons": 1}, "sessions": []}
+        ```
+
+        Common failures:
+
+        - `--recent` is outside the allowed range.
+    """,
+    ("dashboard", "serve"): """
+        Required arguments: none.
+
+        The default dashboard server is dependency-free and uses the Python
+        standard library. It requires prebuilt frontend assets under
+        `dashboard/dist`. If the default port is occupied, it picks the next
+        free port unless `--port` is supplied explicitly.
+
+        Example:
+
+        ```bash
+        python3 scripts/factory.py dashboard serve --open
+        ```
+
+        Control endpoints are enabled by default. Use read-only mode when
+        observation is desired without dashboard message controls:
+
+        ```bash
+        python3 scripts/factory.py dashboard serve --read-only
+        ```
+
+        Common failures:
+
+        - Dashboard assets are missing: run `cd dashboard && npm install && npm run build`.
+        - Non-loopback host without `--allow-remote`.
+        - `--port` is outside the allowed range.
+        - Explicit `--port` is already in use.
     """,
     ("agent", "packet"): """
         Required arguments: `--role`.
@@ -634,7 +727,7 @@ def render_doc() -> str:
         "- `--db <path>`: SQLite DB path; relative paths resolve under `--root`.",
         "- `--config <path>`: project config path; relative paths resolve under `--root`.",
         "",
-        "The CLI is local-first and stdlib-only. It does not execute shell input from command arguments or spawn agent processes.",
+        "The CLI is local-first and stdlib-only. It does not execute shell input from command arguments. Process spawning is limited to explicit experimental `agent spawn` adapters.",
         "",
     ]
     for command in COMMANDS:

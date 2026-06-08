@@ -44,6 +44,7 @@ Common fields:
 
 ```text
 runtime_mode: codex_native | agent_cli_subagents | serial_single_agent | manual_protocol | adapter_spawn
+dashboard_policy: off | read_only | control_enabled
 work_mode:
 factory_topology: executive_as_ledger | separate_ledger | passive_fallback
 role_topology: lean_solo | standard | reviewed | managed | enterprise
@@ -76,11 +77,18 @@ it. If the environment still prompts, record the mismatch and use blocker policy
 instead of stalling silently.
 
 `codex_native` is the preferred runtime mode when Codex-native thread or
-sub-agent capabilities are available. Use `agent_cli_subagents` only after
+sub-agent capabilities are available. Use `agent_cli_subagents` after
 confirming the host CLI's delegation, workspace, permission, and recovery
-semantics. Use `serial_single_agent` when delegation is unavailable or unclear.
-Treat `adapter_spawn` as experimental and explicitly configured; dry-run before
-execution.
+semantics. Use `adapter_spawn` with a first-class session-backed adapter such
+as `claude-code` when the host CLI exposes visible background sessions through
+CLI commands. Use `serial_single_agent` only when delegation is unavailable,
+unsafe, or unclear. Treat custom process adapters as explicitly configured;
+dry-run before execution.
+
+Use `dashboard_policy: control_enabled` by default when a generic agent CLI
+workflow needs the local factory-floor UI. Use `read_only` when the dashboard
+should observe state without recording operator or session message requests.
+Use `off` when Codex-native threads already provide the needed visibility.
 
 ## User Involvement
 

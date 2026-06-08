@@ -10,14 +10,17 @@ The packet command does not spawn workers. It renders instructions and exact
 
 ## Basic Flow
 
-1. Lead agent creates or confirms a baton.
-2. Lead agent generates a packet for the next role.
-3. Lead agent gives the packet to a sub-agent through the host CLI's delegation
+1. Lead agent runs orchestration preflight and `factory.py up --background`
+   for generic agent CLI dashboard workflows.
+2. Lead agent waits for the user to confirm the ready factory floor.
+3. Lead agent creates or confirms a baton.
+4. Lead agent generates a packet for the next role.
+5. Lead agent gives the packet to a sub-agent through the host CLI's delegation
    mechanism.
-4. Worker performs scoped work.
-5. Worker records verification and handoff directly when CLI access is safe, or
+6. Worker performs scoped work.
+7. Worker records verification and handoff directly when CLI access is safe, or
    returns the handoff schema to the lead agent.
-6. Lead agent records review and acceptance after the configured tier is met.
+8. Lead agent records review and acceptance after the configured tier is met.
 
 ## Commands
 
@@ -133,9 +136,9 @@ Supported values match [Runtime Modes](runtime-modes.md):
 - `manual_protocol`
 - `adapter_spawn`
 
-`adapter_spawn` is experimental and opt-in. The packet command still only
-renders instructions; use [Agent Adapters](agent-adapters.md) for process-level
-execution.
+`adapter_spawn` is explicit and opt-in. The packet command still only renders
+instructions; use [Agent Adapters](agent-adapters.md) for session-backed or
+process-level execution, including Claude Code background sessions.
 
 ## Builder Packet Use
 

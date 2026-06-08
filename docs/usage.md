@@ -3,8 +3,8 @@
 This guide shows the durable Agentic Factory lifecycle. In the primary Codex
 app mode, the Executive, Builder, Reviewer, and Ledger roles emit these CLI
 commands as part of an orchestrated run. In other runtimes, a lead agent can use
-the same commands with that runtime's sub-agent mechanism or simulate the roles
-serially.
+the same commands with that runtime's sub-agent mechanism, visible background
+sessions, or serial role boundaries.
 
 Use `agentic-factory-orchestration` when deciding runtime mode, work mode,
 roles, review depth, and verification policy. Use `agentic-factory` when
@@ -19,12 +19,45 @@ Before assigning a baton, choose the safest available runtime mode:
   capabilities for role-specific workers.
 - `agent_cli_subagents`: use another agent CLI's delegation mechanism after
   capability preflight, usually with generated agent packets.
-- `serial_single_agent`: perform roles sequentially when delegation is not
+- `adapter_spawn`: use a first-class session-backed adapter, especially
+  `claude-code`, when the CLI exposes visible background sessions through shell
+  commands.
+- `serial_single_agent`: perform roles sequentially only when delegation is not
   available or not safe.
 - `manual_protocol`: run commands directly for tests, examples, and debugging.
 
-The CLI records state transitions. It does not directly spawn arbitrary worker
-processes.
+The CLI records state transitions and can launch explicitly selected
+session/process adapters. It does not spawn arbitrary worker processes.
+
+## Agent-CLI Factory Floor Startup
+
+In generic agent CLI environments, the human should invoke the plugin through
+the agent, not by manually running setup commands. The lead agent uses
+`agentic-factory-orchestration` to resolve the objective, work mode, topology,
+runtime mode, verification policy, and dashboard policy. After that setup is
+clear, the lead agent runs:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py up \
+  --objective "Ship the requested project outcome" \
+  --runtime-mode agent_cli_subagents \
+  --background
+```
+
+`up` initializes the DB if needed, creates topology-derived operator records,
+starts the local dashboard with controls enabled by default, records
+`factory.ready_for_operations`, prints the dashboard URL and run metadata, then
+returns so the lead agent can pause. The lead agent should wait for the user to
+confirm readiness before creating the first work baton.
+
+Use `--read-only` for observation-only dashboards. Use `--no-serve` only for
+tests that intentionally do not need a running dashboard server.
+
+This is a required gate for agent CLI dashboard workflows. Do not create a
+baton, generate packets, spawn workers, or edit project files before the agent
+has presented the resolved setup, run `factory.py up --background`, shown the
+dashboard URL and top-level operator, and received user confirmation to begin
+operations.
 
 ## Initialize
 
@@ -69,8 +102,9 @@ By default, baton creation acquires the `main-worktree` lock. Use
 In `codex_native` mode, the Executive normally records this baton before
 delegating the scoped prompt to a Builder worker. In `agent_cli_subagents`, the
 lead agent should pass the same baton scope through that CLI's delegation
-mechanism. In `serial_single_agent`, keep the Builder role boundary explicit
-before editing.
+mechanism. In Claude Code CLI workflows, prefer a visible background session
+for substantial Builder/Reviewer work. In `serial_single_agent`, keep the
+Builder role boundary explicit before editing.
 
 ## Generate Agent Packets
 
@@ -104,11 +138,42 @@ python3 /path/to/agentic-factory/scripts/factory.py agent packet \
 Use `--format json` when another tool needs structured packet data. See
 [Agent Packets](agent-packets.md) for packet fields and runtime guidance.
 
-## Spawn Through Experimental Adapters
+## Spawn Through Session Adapters
 
-Adapters are optional process-level bridges for runtimes that need to launch an
-external agent CLI with a packet file. Prefer Codex-native orchestration when
-available.
+Adapters are optional session/process bridges for runtimes that need to launch
+an external agent CLI with a packet file. Prefer Codex-native orchestration
+when available.
+
+Inspect adapter capabilities and permission translation before spawning:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py agent adapter list --json
+python3 /path/to/agentic-factory/scripts/factory.py agent permissions plan \
+  --adapter claude-code \
+  --profile node-builder
+```
+
+Claude Code background session:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py agent spawn \
+  --adapter claude-code \
+  --role builder \
+  --baton B-001 \
+  --permission-profile node-builder \
+  --experimental
+```
+
+Successful Builder spawns move the baton to `in_progress`. Successful Reviewer
+spawns move a handed-off baton to `review`. These lifecycle transitions are
+core factory state, not optional lead-agent bookkeeping.
+
+Refresh and inspect sessions:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py agent session list --sync --json
+python3 /path/to/agentic-factory/scripts/factory.py agent session logs claude-7c5dcf5d
+```
 
 Preview first:
 
@@ -134,6 +199,65 @@ python3 /path/to/agentic-factory/scripts/factory.py agent spawn \
 ```
 
 Use [Agent Adapters](agent-adapters.md) for the full safety contract.
+
+## Open The Dashboard
+
+Use the local dashboard when an agent CLI workflow needs a visible factory
+floor:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py dashboard serve --open
+```
+
+The dashboard is most useful for `agent_cli_subagents` and `adapter_spawn`
+workflows where the Codex app is not the primary UI. It shows batons, sessions,
+topology-derived operators, events, verification, reviews, and a ledger preview
+from the same SQLite DB.
+
+Control mode is enabled by default. Start read-only when the dashboard should
+not record operator or session message requests:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py dashboard serve \
+  --read-only \
+  --open
+```
+
+For process adapters and Claude Code background sessions, dashboard session
+messages are durable control-message rows. Compatibility events are also
+emitted, but the message state lives in the DB as `queued`, `read`,
+`handling`, `handled`, or another explicit status. Attach to a live Claude
+session when direct conversation is needed.
+
+In agent CLI workflows, the lead agent should inspect new dashboard control
+messages before creating batons, accepting work, or continuing after handoffs:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py messages inbox \
+  --claim \
+  --actor "Lead Agent" \
+  --json
+```
+
+After handling a message:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py messages ack M-0001 \
+  --status handled \
+  --summary "Handled during checkpoint"
+```
+
+Run lifecycle integrity checks:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py flow doctor --json
+```
+
+For automation without the web server:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py dashboard snapshot --recent 50
+```
 
 ## Record Verification
 

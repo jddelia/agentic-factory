@@ -8,6 +8,7 @@ DB records.
 
 ```text
 runtime_mode:
+dashboard_policy:
 work_mode/topology:
 target/tier:
 principal/user involvement:
@@ -42,6 +43,7 @@ worker_shell_capability:
 worker_skill_or_plugin_inheritance:
 credential_or_secret_inheritance:
 lead_visibility_into_worker_output:
+dashboard_available:
 cancellation_or_timeout_controls:
 git_write_allowed:
 git_push_auth_available:
@@ -54,6 +56,24 @@ required_secrets_present:
 generated_file_guards:
 dev_server_status:
 blocker_decision:
+```
+
+## Agent-CLI Bootstrap
+
+```text
+objective:
+runtime_mode:
+work_mode:
+topology:
+dashboard_policy:
+factory_command:
+dashboard_url:
+run_id:
+project_root:
+top_level_operator:
+control_state:
+readiness_checkpoint: waiting_for_user
+begin_operations_after_user_confirms:
 ```
 
 ## Baton
@@ -107,6 +127,7 @@ packet_path:
 workspace_lock_status:
 sandbox_or_permission_profile:
 expected_output_contract:
+dashboard_visibility:
 recovery_plan:
 ```
 

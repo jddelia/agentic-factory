@@ -13,6 +13,10 @@ Agentic Factory is a local-first Codex plugin package. It includes:
 - Git, optional but recommended
 - No runtime Python package dependencies
 
+The bundled dashboard server also has no Python package dependencies. It serves
+the checked-in production assets from `dashboard/dist`. Dashboard frontend
+development requires Node.js 20 or newer.
+
 ## Local Source Use
 
 Until the plugin is published through a plugin directory or marketplace, use the
@@ -60,11 +64,20 @@ remains the durable state layer in every mode.
 
 Other agent CLIs can still use the plugin by following the same baton,
 handoff, review, and verification protocol with their own delegation features.
-When delegation is unavailable or unsafe, one agent can run the roles serially.
+When visible background sessions are available, such as Claude Code background
+sessions, prefer separate worker sessions for substantial work. When delegation
+is unavailable or unsafe, one agent can run the roles serially.
 Use [Agent Packets](agent-packets.md) when a non-Codex runtime needs a concrete
 role prompt for Builder, Reviewer, or Executive work.
-Use [Agent Adapters](agent-adapters.md) only when an experimental process-level
-bridge to an external agent CLI is explicitly desired.
+Use [Agent Adapters](agent-adapters.md) when an explicit session/process bridge
+to an external agent CLI is desired.
+Use [Dashboard](dashboard.md) when a non-Codex or generic agent-CLI workflow
+needs a visible local factory floor.
+
+For the lowest-friction agent CLI path, the lead agent should perform
+orchestration preflight and then run `factory.py up --background`, which
+initializes state, starts the dashboard, returns setup JSON, and pauses for
+user confirmation before operations begin.
 
 See [Runtime Modes](runtime-modes.md) for the full mode contract.
 
