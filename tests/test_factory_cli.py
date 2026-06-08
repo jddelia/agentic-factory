@@ -447,7 +447,12 @@ class FactoryCliTest(unittest.TestCase):
             self.assertEqual(executed_payload["status"], "completed")
             self.assertEqual(executed_payload["returncode"], 0)
             self.assertTrue(executed_payload["session_id"])
+            self.assertTrue(executed_payload["lifecycle_transition_recorded"])
             self.assertIn("# Agent Packet: Builder", executed_payload["stdout"])
+            baton = json.loads(self.run_cli(root, "baton", "show", "B-001", "--json").stdout)
+            self.assertEqual(baton["baton"]["status"], "in_progress")
+            flow = json.loads(self.run_cli(root, "flow", "doctor", "--json").stdout)
+            self.assertEqual(flow["status"], "ok")
             events = json.loads(
                 self.run_cli(root, "events", "list", "--type", "agent.spawn.completed", "--json").stdout
             )
@@ -484,6 +489,22 @@ class FactoryCliTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             self.assertEqual(self.run_cli(root, "init", "--run-id", "codex-spawn").returncode, 0)
+            adapters = json.loads(self.run_cli(root, "agent", "adapter", "list", "--json").stdout)
+            self.assertIn("claude-code", [adapter["adapter"] for adapter in adapters["adapters"]])
+            plan = json.loads(
+                self.run_cli(
+                    root,
+                    "agent",
+                    "permissions",
+                    "plan",
+                    "--adapter",
+                    "custom",
+                    "--profile",
+                    "node-builder",
+                ).stdout
+            )
+            self.assertEqual(plan["profile"], "node-builder")
+            self.assertIn("native_permission_flags", plan["unsupported"])
             self.assertEqual(
                 self.run_cli(root, "baton", "create", "B-001", "--title", "Codex spawn").returncode,
                 0,
@@ -501,6 +522,8 @@ class FactoryCliTest(unittest.TestCase):
                 "--dry-run",
                 "--codex-bin",
                 "codex-test",
+                "--permission-profile",
+                "node-builder",
             )
             self.assertEqual(dry_run.returncode, 0, dry_run.stderr)
             payload = json.loads(dry_run.stdout)
@@ -508,6 +531,8 @@ class FactoryCliTest(unittest.TestCase):
             self.assertEqual(payload["command"][:2], ["codex-test", "exec"])
             self.assertIn("--sandbox", payload["command"])
             self.assertIn("workspace-write", payload["command"])
+            self.assertEqual(payload["permission_profile"]["profile"], "node-builder")
+            self.assertIn("sandbox", payload["permission_profile"]["enforced"])
 
             self.assertEqual(
                 self.run_cli(
@@ -602,6 +627,8 @@ sys.exit(2)
                 "--claude-bin",
                 str(fake_claude),
                 "--claude-worktree",
+                "--permission-profile",
+                "node-builder",
             )
             self.assertEqual(dry_run.returncode, 0, dry_run.stderr)
             dry_payload = json.loads(dry_run.stdout)
@@ -610,6 +637,8 @@ sys.exit(2)
             self.assertIn("--plugin-dir", dry_payload["command"])
             self.assertIn(str(PLUGIN_ROOT), dry_payload["command"])
             self.assertIn("--worktree", dry_payload["command"])
+            self.assertIn("--allowedTools", dry_payload["command"])
+            self.assertEqual(dry_payload["permission_profile"]["profile"], "node-builder")
 
             spawned = self.run_cli(
                 root,
@@ -814,6 +843,39 @@ sys.exit(2)
             baton_events = json.loads(self.run_cli(root, "events", "list", "--type", "baton.message.requested", "--json").stdout)
             self.assertEqual(baton_events["count"], 1)
             self.assertEqual(baton_events["events"][0]["payload"]["message"], "please hand off the baton")
+
+            inbox = self.run_cli(
+                root,
+                "messages",
+                "inbox",
+                "--target-type",
+                "operator",
+                "--target-id",
+                operator_id,
+                "--claim",
+                "--actor",
+                "Lead Agent",
+                "--json",
+            )
+            self.assertEqual(inbox.returncode, 0, inbox.stderr)
+            inbox_payload = json.loads(inbox.stdout)
+            self.assertEqual(inbox_payload["claimed"], 1)
+            self.assertEqual(inbox_payload["messages"][0]["status"], "handling")
+            ack = self.run_cli(
+                root,
+                "messages",
+                "ack",
+                inbox_payload["messages"][0]["public_id"],
+                "--status",
+                "handled",
+                "--summary",
+                "Handled in test",
+            )
+            self.assertEqual(ack.returncode, 0, ack.stderr)
+            final_messages = json.loads(self.run_cli(root, "messages", "list", "--json").stdout)
+            statuses = {message["message"]: message["status"] for message in final_messages["messages"]}
+            self.assertEqual(statuses["pause until I say begin"], "handled")
+            self.assertEqual(statuses["please hand off the baton"], "queued")
 
     def test_up_background_starts_dashboard_server(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

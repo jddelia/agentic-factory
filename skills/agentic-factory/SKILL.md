@@ -1,6 +1,6 @@
 ---
 name: agentic-factory
-description: "Use when directly bootstrapping, recording, querying, validating, rendering, generating portable packets, opening the local dashboard, or using session/process adapters from Agentic Factory SQLite state with scripts/factory.py: up, init, status, doctor, dashboard, baton, agent packet, agent spawn, agent session, verification, review, pause/resume, lock, event, and render-ledger commands."
+description: "Use when directly bootstrapping, recording, querying, validating, rendering, generating portable packets, opening the local dashboard, acknowledging control messages, checking flow integrity, or using session/process adapters from Agentic Factory SQLite state with scripts/factory.py: up, init, status, doctor, dashboard, messages, flow, baton, agent packet, agent adapter, agent permissions, agent spawn, agent session, verification, review, pause/resume, lock, event, and render-ledger commands."
 ---
 
 # Agentic Factory
@@ -272,6 +272,7 @@ python3 <plugin-root>/scripts/factory.py agent spawn \
   --adapter claude-code \
   --role builder \
   --baton B-001 \
+  --permission-profile node-builder \
   --experimental
 ```
 
@@ -286,6 +287,15 @@ python3 <plugin-root>/scripts/factory.py agent session stop claude-<id>
 
 Use `--claude-worktree` only when isolated write worktrees and merge handling
 are intentional.
+
+Inspect adapter capability and permission translation before spawning:
+
+```bash
+python3 <plugin-root>/scripts/factory.py agent adapter list --json
+python3 <plugin-root>/scripts/factory.py agent permissions plan \
+  --adapter claude-code \
+  --profile node-builder
+```
 
 For custom process commands, always dry-run first:
 
@@ -324,6 +334,26 @@ Adapters write packet files under `.agentic-factory/packets/`, run without
 `shell=True`, enforce bounded launch/process timeouts, capture bounded output,
 and record `agent_sessions` rows plus spawn/session events for real executions
 unless `--no-event` is supplied.
+
+Builder spawns move their baton to `in_progress`; reviewer spawns move a
+handed-off baton to `review`; accepted reviews move a baton to
+`ready_for_acceptance`; `baton accept` closes it as `accepted`.
+
+## Control Messages And Flow Checks
+
+Dashboard messages are durable control-message rows. Claim and acknowledge them
+instead of only reading raw events:
+
+```bash
+python3 <plugin-root>/scripts/factory.py messages inbox --claim --json
+python3 <plugin-root>/scripts/factory.py messages ack M-0001 --status handled
+```
+
+Check lifecycle integrity:
+
+```bash
+python3 <plugin-root>/scripts/factory.py flow doctor --json
+```
 
 ## Pause, Resume, And Ledger
 

@@ -26,7 +26,7 @@ attempts WAL mode for better dashboard/read concurrency.
 The database has three layers:
 
 - Run state: `factory_runs`, `batons`, `locks`, `actors`, `agent_sessions`,
-  `blockers`.
+  `control_messages`, `blockers`.
 - Evidence records: `handoffs`, `verification_runs`, `reviews`,
   `review_findings`, `commits`.
 - Append log: `events`.
@@ -40,6 +40,10 @@ state.
 
 Agent adapters record execution attempts through events and create
 `agent_sessions` rows for dashboard visibility.
+
+Dashboard and worker control messages are durable `control_messages` rows.
+Compatibility events are still emitted, but message status is read from
+`control_messages`, not inferred from events.
 
 ## Tables
 
@@ -124,6 +128,33 @@ inventing a parallel registry.
 | `summary` | TEXT NOT NULL DEFAULT '' | Latest session summary. |
 | `metadata_json` | TEXT NOT NULL DEFAULT '{}' | Extension data, including bounded stdout/stderr for process adapters and attach/log/stop references or synced Claude Code state for `claude-code`. |
 
+### `control_messages`
+
+Durable inbox for dashboard/operator/session/baton control requests.
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `id` | INTEGER PRIMARY KEY AUTOINCREMENT | Message row ID. The CLI also renders public IDs such as `M-0001`. |
+| `run_id` | TEXT NOT NULL | References `factory_runs(id)`. |
+| `baton_id` | TEXT | Optional baton reference. |
+| `target_type` | TEXT NOT NULL | `operator`, `session`, or `baton`. |
+| `target_id` | TEXT NOT NULL DEFAULT '' | Adapter/session/operator/baton target identifier. |
+| `target_label` | TEXT NOT NULL DEFAULT '' | Human-readable dashboard label. |
+| `event_type` | TEXT NOT NULL | Compatibility event emitted for this message. |
+| `actor` | TEXT NOT NULL DEFAULT '' | Sender, commonly `Dashboard`. |
+| `message` | TEXT NOT NULL | Message text, capped by runtime code. |
+| `status` | TEXT NOT NULL DEFAULT 'queued' | `queued`, `delivered`, `read`, `handling`, `handled`, `failed`, `expired`, or `cancelled`. |
+| `delivery` | TEXT NOT NULL DEFAULT 'recorded_only' | Delivery mode. Current dashboard messages are `recorded_only`. |
+| `control_mode` | TEXT NOT NULL DEFAULT 'event' | `operator_event`, `baton_event`, `claude_bg`, `process`, or future adapter modes. |
+| `control_ref` | TEXT NOT NULL DEFAULT '' | External adapter reference if any. |
+| `created_at` | TEXT NOT NULL | UTC timestamp. |
+| `updated_at` | TEXT NOT NULL | UTC timestamp. |
+| `claimed_at` | TEXT | Set by `messages inbox --claim`. |
+| `claimed_by` | TEXT NOT NULL DEFAULT '' | Claiming actor. |
+| `handled_at` | TEXT | Set for terminal message statuses. |
+| `summary` | TEXT NOT NULL DEFAULT '' | Handling summary. |
+| `payload_json` | TEXT NOT NULL DEFAULT '{}' | Extension data. |
+
 ### `batons`
 
 Current and historical work assignments.
@@ -135,7 +166,7 @@ Current and historical work assignments.
 | `title` | TEXT NOT NULL | Human-readable baton title. |
 | `owner` | TEXT NOT NULL DEFAULT '' | Current owner role/name. |
 | `owner_thread` | TEXT NOT NULL DEFAULT '' | External owner thread identifier. |
-| `status` | TEXT NOT NULL DEFAULT 'assigned' | Status such as `assigned`, `handed_off`, or `accepted`. |
+| `status` | TEXT NOT NULL DEFAULT 'assigned' | Status such as `assigned`, `in_progress`, `handed_off`, `review`, `ready_for_acceptance`, `patch_required`, or `accepted`. |
 | `scope` | TEXT NOT NULL DEFAULT '' | Baton scope. |
 | `acceptance_tier` | TEXT NOT NULL DEFAULT 'integration' | `prototype`, `integration`, or `release`. |
 | `verification_level` | TEXT NOT NULL DEFAULT 'focused' | Requested verification level. |
@@ -152,7 +183,7 @@ Current and historical work assignments.
 Active baton statuses are currently:
 
 ```text
-assigned, active, in_progress, handed_off, review
+assigned, active, in_progress, handed_off, review, patch_required, ready_for_acceptance
 ```
 
 ### `handoffs`
@@ -301,6 +332,9 @@ Append log for meaningful factory state changes.
 | `idx_agent_sessions_run_status` | `agent_sessions(run_id, status)` | Dashboard active-session lookup. |
 | `idx_agent_sessions_baton` | `agent_sessions(baton_id)` | Baton-scoped session lookup. |
 | `idx_agent_sessions_last_seen` | `agent_sessions(last_seen_at)` | Recent session ordering. |
+| `idx_control_messages_run_status` | `control_messages(run_id, status, created_at)` | Active message inbox lookup. |
+| `idx_control_messages_target_status` | `control_messages(run_id, target_type, target_id, status, created_at)` | Target-scoped message lookup. |
+| `idx_control_messages_baton` | `control_messages(baton_id, status, created_at)` | Baton-scoped message lookup. |
 
 ## Built-In Event Types
 
@@ -313,9 +347,13 @@ The CLI writes these event types directly:
 | `factory.ready_for_operations` | `up` | Factory floor is initialized with a running dashboard and waiting for user readiness. | `dashboard_url`, `runtime_mode`, `topology`, `control_enabled`, `primary_operator`, `server_running`, `dashboard_pid` when backgrounded. |
 | `factory.bootstrap.no_server` | `up --no-serve` | Factory state was initialized without starting the dashboard server. | `dashboard_url`, `runtime_mode`, `topology`, `control_enabled`, `primary_operator`, `server_running: false`. |
 | `baton.assigned` | `baton create` | Baton title. | `owner`, `scope`, `acceptance_tier`, `verification_level`, `lock_acquired`. |
+| `baton.in_progress` | `agent spawn`, `baton handoff` | Baton moved into active implementation. | `from_status`, `to_status`, `session_id`, `source`. |
 | `verification.completed` | `verify record` | `<result>: <command>`. | `result`, `command`, `package`. |
 | `baton.handed_off` | `baton handoff` | Handoff summary. | `owner`, `files_changed`, `commands_run`, `verification`. |
+| `review.started` | `agent spawn`, `review record` | Review began for a handed-off baton. | `from_status`, `to_status`, `session_id`, `source`. |
 | `review.recorded` | `review record` | Review summary or status. | `review_id`, `findings`. |
+| `baton.ready_for_acceptance` | `review record` | Accepted review made baton ready for Executive acceptance. | `from_status`, `to_status`, `review_id`, `review_status`. |
+| `baton.patch_required` | `review record` | Review requires builder patching. | `from_status`, `to_status`, `review_id`, `review_status`. |
 | `baton.accepted` | `baton accept` | Acceptance summary. | `commit`, `pushed_status`. |
 | `factory.paused` | `pause` | Pause reason or mode. | `mode`, `reason`. |
 | `factory.resumed` | `resume` | Resume reason. | `reason`. |
@@ -328,6 +366,8 @@ The CLI writes these event types directly:
 | `agent.message.requested` | Dashboard control API | Dashboard session message request. | `session_id`, `message`, `delivery`, `control_mode`, `control_ref`. |
 | `operator.message.requested` | Dashboard control API | Top-level operator message request. | `operator_id`, `role`, `name`, `message`, `delivery`, `control_mode`. |
 | `baton.message.requested` | Dashboard control API | Baton-owner message request. | `baton_id`, `owner`, `message`, `delivery`, `control_mode`. |
+| `control_message.claimed` | `messages inbox --claim` | A message was marked read or handling. | `message_id`, `target_type`, `target_id`, `status`. |
+| `control_message.acknowledged` | `messages ack` | A message was marked handled, failed, cancelled, or another explicit status. | `message_id`, `status`, `summary`. |
 
 `event append` can write custom event types. Custom event names should be
 namespaced with dot notation, for example:

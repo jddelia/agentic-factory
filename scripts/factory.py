@@ -14,6 +14,7 @@ import os
 import re
 import secrets
 import shlex
+import signal
 import socket
 from pathlib import PurePosixPath
 import sqlite3
@@ -30,8 +31,29 @@ PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DB_DIR = ".agentic-factory"
 DEFAULT_DB_NAME = "factory.db"
 DEFAULT_CONFIG_NAME = "config.json"
-ACTIVE_BATON_STATUSES = {"assigned", "active", "in_progress", "handed_off", "review"}
+ACTIVE_BATON_STATUSES = {
+    "assigned",
+    "active",
+    "in_progress",
+    "handed_off",
+    "review",
+    "patch_required",
+    "ready_for_acceptance",
+}
 VERIFICATION_RESULTS = {"pass", "fail", "not_run", "blocked"}
+REVIEW_ACCEPTED_STATUSES = {"accepted", "approved", "pass", "passed", "clean"}
+REVIEW_PATCH_REQUIRED_STATUSES = {"patch_required", "changes_requested", "failed", "blocked"}
+CONTROL_MESSAGE_STATUSES = {
+    "queued",
+    "delivered",
+    "read",
+    "handling",
+    "handled",
+    "failed",
+    "expired",
+    "cancelled",
+}
+CONTROL_MESSAGE_ACTIVE_STATUSES = {"queued", "delivered", "read", "handling"}
 AGENT_PACKET_ROLES = {"builder", "reviewer", "executive"}
 AGENT_PACKET_FORMATS = {"markdown", "json"}
 AGENT_PACKET_RUNTIME_MODES = {
@@ -45,6 +67,51 @@ AGENT_PACKET_WRITE_POLICIES = {"auto", "read-only", "write"}
 AGENT_SPAWN_ADAPTERS = {"claude-code", "codex-cli", "custom"}
 CODEX_SPAWN_SANDBOXES = {"auto", "read-only", "workspace-write"}
 CODEX_APPROVAL_POLICIES = {"never", "on-request", "untrusted", "on-failure"}
+PERMISSION_PROFILE_NAMES = {"read-only", "node-builder", "node-reviewer", "workspace-builder"}
+CLAUDE_PERMISSION_PROFILE_MODES = {
+    "read-only": "plan",
+    "node-builder": "acceptEdits",
+    "node-reviewer": "plan",
+    "workspace-builder": "acceptEdits",
+}
+PERMISSION_PROFILES: dict[str, dict[str, Any]] = {
+    "read-only": {
+        "name": "read-only",
+        "mode": "read_only",
+        "write_policy": "read-only",
+        "allow_commands": [],
+        "deny_commands": ["git push *", "rm -rf *"],
+        "allow_tools": ["read"],
+        "network": "default",
+    },
+    "node-builder": {
+        "name": "node-builder",
+        "mode": "workspace_write",
+        "write_policy": "baton_scope",
+        "allow_commands": ["node *", "npm *", "npx *"],
+        "deny_commands": ["git push *", "rm -rf *"],
+        "allow_tools": ["read", "edit", "bash"],
+        "network": "default",
+    },
+    "node-reviewer": {
+        "name": "node-reviewer",
+        "mode": "read_only",
+        "write_policy": "read-only",
+        "allow_commands": ["node *", "npm *", "npx *"],
+        "deny_commands": ["git push *", "rm -rf *"],
+        "allow_tools": ["read", "bash"],
+        "network": "default",
+    },
+    "workspace-builder": {
+        "name": "workspace-builder",
+        "mode": "workspace_write",
+        "write_policy": "baton_scope",
+        "allow_commands": [],
+        "deny_commands": ["git push *", "rm -rf *"],
+        "allow_tools": ["read", "edit", "bash"],
+        "network": "default",
+    },
+}
 SESSION_ACTIVE_STATUSES = {"planned", "running", "waiting", "blocked"}
 CLAUDE_CODE_TERMINAL_STATUSES = {"completed", "done", "failed", "stopped", "exited", "removed"}
 CLAUDE_CODE_BACKGROUND_ID_RE = re.compile(
@@ -524,6 +591,285 @@ def require_current_baton(conn: sqlite3.Connection, run: sqlite3.Row, baton_id: 
     if baton["run_id"] != run["id"]:
         raise FactoryError(f"Baton {baton_id} does not belong to current run {run['id']}.")
     return baton
+
+
+def public_message_id(message_id: int | str) -> str:
+    text = str(message_id)
+    if text.upper().startswith("M-"):
+        return text.upper()
+    try:
+        return f"M-{int(text):04d}"
+    except ValueError:
+        return text
+
+
+def parse_message_id(message_id: str) -> int:
+    text = message_id.strip()
+    if text.upper().startswith("M-"):
+        text = text[2:]
+    try:
+        value = int(text)
+    except ValueError as exc:
+        raise FactoryError(f"Invalid message id: {message_id}") from exc
+    if value < 1:
+        raise FactoryError(f"Invalid message id: {message_id}")
+    return value
+
+
+def control_message_public(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    payload = row_to_public_dict(row)
+    if payload is None:
+        return None
+    payload["public_id"] = public_message_id(payload["id"])
+    payload["payload"] = payload.get("payload") or parse_json_field(str(payload.get("payload_json", "{}")))
+    return payload
+
+
+def record_control_message(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    baton_id: str | None,
+    target_type: str,
+    target_id: str,
+    target_label: str,
+    event_type: str,
+    actor: str,
+    message: str,
+    delivery: str,
+    control_mode: str,
+    control_ref: str = "",
+    payload: dict[str, Any] | None = None,
+    summary: str = "",
+) -> dict[str, Any]:
+    text = message.strip()
+    if not text:
+        raise FactoryError("Message must not be empty.")
+    if len(text) > 8000:
+        raise FactoryError("Message must be 8000 characters or fewer.")
+    now = utc_now()
+    cur = conn.execute(
+        """
+        INSERT INTO control_messages
+          (run_id, baton_id, target_type, target_id, target_label, event_type, actor,
+           message, status, delivery, control_mode, control_ref, created_at, updated_at,
+           summary, payload_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            baton_id,
+            target_type,
+            target_id,
+            target_label,
+            event_type,
+            actor or "Dashboard",
+            text,
+            delivery,
+            control_mode,
+            control_ref,
+            now,
+            now,
+            summary or shorten(text, 120),
+            json_dump(payload or {}),
+        ),
+    )
+    message_row = conn.execute(
+        "SELECT * FROM control_messages WHERE id = ?",
+        (int(cur.lastrowid),),
+    ).fetchone()
+    public = control_message_public(message_row) or {}
+    emit_payload = {**(payload or {}), "message": text, "message_id": public.get("public_id", ""), "delivery": delivery, "control_mode": control_mode}
+    if control_ref:
+        emit_payload["control_ref"] = control_ref
+    emit_event(
+        conn,
+        event_type=event_type,
+        actor=actor or "Dashboard",
+        run_id=run_id,
+        baton_id=baton_id,
+        summary=summary or shorten(text, 120),
+        payload=emit_payload,
+    )
+    return public
+
+
+def transition_baton_status(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    baton_id: str,
+    new_status: str,
+    actor: str,
+    event_type: str,
+    summary: str,
+    payload: dict[str, Any] | None = None,
+    allowed_from: set[str] | None = None,
+    force: bool = False,
+) -> bool:
+    baton = require_baton(conn, baton_id)
+    if baton["run_id"] != run_id:
+        raise FactoryError(f"Baton {baton_id} does not belong to current run {run_id}.")
+    current = str(baton["status"])
+    if current == new_status:
+        return False
+    if current == "accepted" and not force:
+        raise FactoryError(f"Baton {baton_id} is already accepted.")
+    if allowed_from is not None and current not in allowed_from and not force:
+        raise FactoryError(
+            f"Cannot transition baton {baton_id} from {current} to {new_status}; expected one of {', '.join(sorted(allowed_from))}."
+        )
+    metadata = json_loads_or_empty(baton["metadata_json"], {})
+    lifecycle = metadata.get("lifecycle")
+    if not isinstance(lifecycle, list):
+        lifecycle = []
+    now = utc_now()
+    lifecycle.append(
+        {
+            "from": current,
+            "to": new_status,
+            "at": now,
+            "actor": actor,
+            "event_type": event_type,
+        }
+    )
+    metadata["lifecycle"] = lifecycle[-50:]
+    conn.execute(
+        """
+        UPDATE batons
+        SET status = ?, summary = COALESCE(NULLIF(?, ''), summary), metadata_json = ?
+        WHERE id = ?
+        """,
+        (new_status, summary, json_dump(metadata), baton_id),
+    )
+    emit_event(
+        conn,
+        event_type=event_type,
+        actor=actor,
+        run_id=run_id,
+        baton_id=baton_id,
+        summary=summary,
+        payload={"from_status": current, "to_status": new_status, **(payload or {})},
+    )
+    return True
+
+
+def ensure_baton_in_progress(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    baton_id: str | None,
+    actor: str,
+    session_id: str | None = None,
+) -> bool:
+    if not baton_id:
+        return False
+    return transition_baton_status(
+        conn,
+        run_id=run_id,
+        baton_id=baton_id,
+        new_status="in_progress",
+        actor=actor,
+        event_type="baton.in_progress",
+        summary=f"{baton_id} moved to in_progress",
+        payload={"session_id": session_id or "", "source": "agent_spawn"},
+        allowed_from={"assigned", "active", "patch_required"},
+    )
+
+
+def ensure_baton_review_started(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    baton_id: str | None,
+    actor: str,
+    session_id: str | None = None,
+) -> bool:
+    if not baton_id:
+        return False
+    return transition_baton_status(
+        conn,
+        run_id=run_id,
+        baton_id=baton_id,
+        new_status="review",
+        actor=actor,
+        event_type="review.started",
+        summary=f"{baton_id} review started",
+        payload={"session_id": session_id or "", "source": "agent_spawn"},
+        allowed_from={"handed_off", "ready_for_acceptance"},
+    )
+
+
+def apply_spawn_lifecycle_transition(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    role: str,
+    baton_id: str | None,
+    actor: str,
+    session_id: str,
+) -> bool:
+    if role == "builder":
+        return ensure_baton_in_progress(
+            conn,
+            run_id=run_id,
+            baton_id=baton_id,
+            actor=actor,
+            session_id=session_id,
+        )
+    if role == "reviewer":
+        return ensure_baton_review_started(
+            conn,
+            run_id=run_id,
+            baton_id=baton_id,
+            actor=actor,
+            session_id=session_id,
+        )
+    return False
+
+
+def ensure_baton_ready_for_acceptance(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    baton_id: str,
+    actor: str,
+    review_id: int,
+    review_status: str,
+) -> bool:
+    return transition_baton_status(
+        conn,
+        run_id=run_id,
+        baton_id=baton_id,
+        new_status="ready_for_acceptance",
+        actor=actor,
+        event_type="baton.ready_for_acceptance",
+        summary=f"{baton_id} is ready for acceptance",
+        payload={"review_id": review_id, "review_status": review_status},
+        allowed_from={"review", "handed_off"},
+    )
+
+
+def ensure_baton_patch_required(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    baton_id: str,
+    actor: str,
+    review_id: int,
+    review_status: str,
+) -> bool:
+    return transition_baton_status(
+        conn,
+        run_id=run_id,
+        baton_id=baton_id,
+        new_status="patch_required",
+        actor=actor,
+        event_type="baton.patch_required",
+        summary=f"{baton_id} requires patching",
+        payload={"review_id": review_id, "review_status": review_status},
+        allowed_from={"review", "handed_off", "ready_for_acceptance"},
+    )
 
 
 def markdown_cell(value: Any) -> str:
@@ -1407,6 +1753,7 @@ def build_agent_packet(
             "config": config["verification_policy"],
         },
         "worker_policy": worker_policy_for(role, args.write_policy),
+        "permission_profile": permission_profile(getattr(args, "permission_profile", "")),
         "handoff_schema": handoff_schema_for(role),
         "recording_commands": recording_commands_for(
             prefix=prefix,
@@ -1435,6 +1782,7 @@ def format_agent_packet_markdown(packet: dict[str, Any]) -> str:
     baton = packet.get("baton") or {}
     scope = packet["scope"]
     worker_policy = packet["worker_policy"]
+    permission = packet.get("permission_profile") or {}
     verification_policy = packet["verification_policy"]
     status = packet["current_status"]
     lines = [
@@ -1452,6 +1800,7 @@ def format_agent_packet_markdown(packet: dict[str, Any]) -> str:
         f"- File write policy: {worker_policy['write_policy']}",
         f"- May run commands: {worker_policy['may_run_commands']}",
         f"- May record CLI evidence: {worker_policy['may_record_cli_evidence']}",
+        f"- Permission profile: {permission.get('name') or 'none'}",
         "- If CLI access is unavailable, return the required evidence to the lead agent.",
         "",
         "## Current State",
@@ -1499,6 +1848,17 @@ def format_agent_packet_markdown(packet: dict[str, Any]) -> str:
             "",
             "Required checks:",
             *markdown_bullets(scope["required_checks"], empty="none specified"),
+            "",
+            "Permission profile:",
+            *markdown_bullets(
+                [
+                    f"mode: {permission.get('mode')}",
+                    f"write_policy: {permission.get('write_policy')}",
+                    *[f"allow command: {value}" for value in permission.get("allow_commands", [])],
+                    *[f"deny command: {value}" for value in permission.get("deny_commands", [])],
+                ] if permission else [],
+                empty="none selected",
+            ),
             "",
             "## Verification Policy",
             "",
@@ -1557,6 +1917,97 @@ def cmd_agent_packet(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_agent_adapter_list(args: argparse.Namespace) -> int:
+    adapters = [adapter_capabilities(adapter) for adapter in sorted(AGENT_SPAWN_ADAPTERS)]
+    if args.json:
+        print_json({"count": len(adapters), "adapters": adapters})
+    else:
+        print_table(
+            adapters,
+            [
+                ("adapter", "Adapter"),
+                ("background_sessions", "Background"),
+                ("status_sync", "Sync"),
+                ("attach", "Attach"),
+                ("permission_flags", "Permissions"),
+                ("live_send", "Live Send"),
+            ],
+            empty="No adapters available.",
+        )
+    return 0
+
+
+def cmd_agent_adapter_doctor(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    capabilities = adapter_capabilities(args.adapter)
+    findings: list[dict[str, Any]] = [{"level": "ok", "check": "capabilities", "message": "Adapter metadata loaded."}]
+    exit_code = 0
+
+    def add(level: str, check: str, message: str) -> None:
+        nonlocal exit_code
+        findings.append({"level": level, "check": check, "message": message})
+        if level == "fail":
+            exit_code = 1
+
+    if args.adapter == "claude-code":
+        version = run_spawn_command(
+            command=[args.claude_bin, "--version"],
+            stdin=None,
+            root=root,
+            timeout_seconds=5,
+            output_limit=4000,
+        )
+        if version["returncode"] == 0:
+            add("ok", "claude", shorten(version["stdout"] or "Claude Code CLI available", 200))
+        else:
+            add("fail", "claude", version["stderr"] or "Claude Code CLI is unavailable.")
+    elif args.adapter == "codex-cli":
+        version = run_spawn_command(
+            command=[args.codex_bin, "--version"],
+            stdin=None,
+            root=root,
+            timeout_seconds=5,
+            output_limit=4000,
+        )
+        if version["returncode"] == 0:
+            add("ok", "codex", shorten(version["stdout"] or "Codex CLI available", 200))
+        else:
+            add("fail", "codex", version["stderr"] or "Codex CLI is unavailable.")
+    else:
+        add("warn", "custom", "Custom adapters cannot be checked without a concrete --command dry-run.")
+
+    payload = {"adapter": args.adapter, "capabilities": capabilities, "findings": findings}
+    if args.json:
+        print_json(payload)
+    else:
+        print_table(findings, [("level", "Level"), ("check", "Check"), ("message", "Message")], empty="No findings.")
+    return exit_code
+
+
+def cmd_agent_permissions_list(args: argparse.Namespace) -> int:
+    profiles = [copy.deepcopy(PERMISSION_PROFILES[name]) for name in sorted(PERMISSION_PROFILES)]
+    if args.json:
+        print_json({"count": len(profiles), "profiles": profiles})
+    else:
+        print_table(
+            profiles,
+            [
+                ("name", "Profile"),
+                ("mode", "Mode"),
+                ("write_policy", "Write"),
+                ("network", "Network"),
+            ],
+            empty="No permission profiles configured.",
+        )
+    return 0
+
+
+def cmd_agent_permissions_plan(args: argparse.Namespace) -> int:
+    report = permission_translation_report(args.adapter, args.profile)
+    print_json(report)
+    return 0
+
+
 def agent_packet_text(packet: dict[str, Any], packet_format: str) -> str:
     if packet_format == "json":
         return json.dumps(packet, indent=2, sort_keys=True) + "\n"
@@ -1587,6 +2038,125 @@ def write_agent_packet_file(root: Path, packet: dict[str, Any], packet_format: s
     return path
 
 
+def adapter_capabilities(adapter: str) -> dict[str, Any]:
+    capabilities = {
+        "claude-code": {
+            "adapter": "claude-code",
+            "background_sessions": True,
+            "status_sync": True,
+            "logs": True,
+            "stop": True,
+            "attach": True,
+            "live_send": False,
+            "permission_flags": True,
+            "settings_file": True,
+            "isolated_worktree": True,
+        },
+        "codex-cli": {
+            "adapter": "codex-cli",
+            "background_sessions": False,
+            "status_sync": False,
+            "logs": "captured_output",
+            "stop": False,
+            "attach": False,
+            "live_send": False,
+            "permission_flags": True,
+            "settings_file": False,
+            "isolated_worktree": False,
+        },
+        "custom": {
+            "adapter": "custom",
+            "background_sessions": False,
+            "status_sync": False,
+            "logs": "captured_output",
+            "stop": False,
+            "attach": False,
+            "live_send": False,
+            "permission_flags": False,
+            "settings_file": False,
+            "isolated_worktree": "external",
+        },
+    }
+    if adapter not in capabilities:
+        raise FactoryError(f"--adapter must be one of {', '.join(sorted(AGENT_SPAWN_ADAPTERS))}")
+    return capabilities[adapter]
+
+
+def permission_profile(name: str) -> dict[str, Any]:
+    profile_name = name.strip() or ""
+    if not profile_name:
+        return {}
+    if profile_name not in PERMISSION_PROFILES:
+        raise FactoryError(f"Unknown permission profile: {profile_name}")
+    return copy.deepcopy(PERMISSION_PROFILES[profile_name])
+
+
+def claude_tool_name(tool: str) -> str:
+    normalized = tool.strip().lower()
+    mapping = {"read": "Read", "edit": "Edit", "write": "Write", "bash": "Bash"}
+    return mapping.get(normalized, tool.strip())
+
+
+def claude_tools_for_profile(profile: dict[str, Any]) -> tuple[list[str], list[str]]:
+    allowed: list[str] = []
+    denied: list[str] = []
+    for tool in profile.get("allow_tools", []):
+        if str(tool).strip().lower() == "bash":
+            continue
+        allowed.append(claude_tool_name(str(tool)))
+    for command in profile.get("allow_commands", []):
+        allowed.append(f"Bash({command})")
+    for command in profile.get("deny_commands", []):
+        denied.append(f"Bash({command})")
+    return unique_values(allowed), unique_values(denied)
+
+
+def permission_translation_report(adapter: str, profile_name: str) -> dict[str, Any]:
+    profile = permission_profile(profile_name)
+    if not profile:
+        return {
+            "profile": "",
+            "adapter": adapter,
+            "enforced": [],
+            "advisory": [],
+            "unsupported": [],
+            "translated": {},
+        }
+    capabilities = adapter_capabilities(adapter)
+    enforced: list[str] = []
+    advisory: list[str] = []
+    unsupported: list[str] = []
+    translated: dict[str, Any] = {}
+    if adapter == "claude-code":
+        allowed, denied = claude_tools_for_profile(profile)
+        translated = {
+            "permission_mode": CLAUDE_PERMISSION_PROFILE_MODES.get(profile_name, ""),
+            "allowed_tools": allowed,
+            "disallowed_tools": denied,
+        }
+        enforced.extend(["permission_mode", "allowed_tools", "disallowed_tools"])
+        advisory.extend(["write_policy", "network"])
+    elif adapter == "codex-cli":
+        sandbox = "read-only" if profile.get("mode") == "read_only" else "workspace-write"
+        translated = {"sandbox": sandbox, "approval": "never"}
+        enforced.extend(["sandbox", "approval"])
+        advisory.extend(["allow_commands", "deny_commands", "write_policy"])
+    else:
+        translated = {"packet_profile": profile}
+        advisory.extend(["allow_commands", "deny_commands", "allow_tools", "write_policy", "network"])
+        if not capabilities.get("permission_flags"):
+            unsupported.append("native_permission_flags")
+    return {
+        "profile": profile_name,
+        "adapter": adapter,
+        "enforced": enforced,
+        "advisory": advisory,
+        "unsupported": unsupported,
+        "translated": translated,
+        "profile_detail": profile,
+    }
+
+
 def has_held_baton_lock(conn: sqlite3.Connection, run_id: str, baton_id: str | None) -> bool:
     if not baton_id:
         return False
@@ -1603,6 +2173,9 @@ def has_held_baton_lock(conn: sqlite3.Connection, run_id: str, baton_id: str | N
 
 def build_codex_spawn_command(root: Path, packet: dict[str, Any], args: argparse.Namespace) -> list[str]:
     sandbox = args.codex_sandbox
+    profile_report = permission_translation_report("codex-cli", getattr(args, "permission_profile", ""))
+    if sandbox == "auto" and profile_report["translated"].get("sandbox"):
+        sandbox = str(profile_report["translated"]["sandbox"])
     if sandbox == "auto":
         sandbox = "workspace-write" if packet["worker_policy"]["may_edit_files"] else "read-only"
     command = [
@@ -1653,10 +2226,19 @@ def claude_background_prompt(packet_path: Path, packet: dict[str, Any]) -> str:
 
 def build_claude_spawn_command(root: Path, packet: dict[str, Any], packet_path: Path, args: argparse.Namespace) -> list[str]:
     command = [args.claude_bin]
+    profile_report = permission_translation_report("claude-code", getattr(args, "permission_profile", ""))
+    translated = profile_report["translated"]
     if args.claude_model:
         command.extend(["--model", args.claude_model])
-    if args.claude_permission_mode:
-        command.extend(["--permission-mode", args.claude_permission_mode])
+    permission_mode = args.claude_permission_mode or str(translated.get("permission_mode") or "")
+    if permission_mode:
+        command.extend(["--permission-mode", permission_mode])
+    allowed_tools = unique_values([*translated.get("allowed_tools", []), *(args.claude_allowed_tool or [])])
+    disallowed_tools = unique_values([*translated.get("disallowed_tools", []), *(args.claude_disallowed_tool or [])])
+    if allowed_tools:
+        command.extend(["--allowedTools", ",".join(allowed_tools)])
+    if disallowed_tools:
+        command.extend(["--disallowedTools", ",".join(disallowed_tools)])
     if args.claude_agent:
         command.extend(["--agent", args.claude_agent])
     if args.claude_worktree:
@@ -2147,6 +2729,7 @@ def cmd_agent_spawn(args: argparse.Namespace) -> int:
             raise FactoryError("Write-capable spawn requires a held lock for --baton, or pass --allow-unlocked.")
     packet_path = write_agent_packet_file(root, packet, args.packet_format, args.packet_dir)
     command, stdin = build_spawn_command(root, packet, packet_path, args)
+    permission_report = permission_translation_report(args.adapter, getattr(args, "permission_profile", ""))
     session_id = "" if args.dry_run else make_agent_session_id(role=args.role, baton_id=args.baton)
     result: dict[str, Any] = {
         "adapter": args.adapter,
@@ -2160,6 +2743,7 @@ def cmd_agent_spawn(args: argparse.Namespace) -> int:
         "experimental": args.experimental,
         "dry_run": args.dry_run,
         "events_recorded": False,
+        "permission_profile": permission_report,
     }
     if args.dry_run:
         result.update({"status": "dry_run", "returncode": 0})
@@ -2193,6 +2777,7 @@ def cmd_agent_spawn(args: argparse.Namespace) -> int:
                 "`claude attach <id>`, `claude logs <id>`, or `claude stop <id>` "
                 "for live control."
             ),
+            "permission_profile": permission_report,
         }
         create_agent_session_record(
             conn,
@@ -2213,6 +2798,16 @@ def cmd_agent_spawn(args: argparse.Namespace) -> int:
             ),
             metadata=metadata,
         )
+        lifecycle_transition = False
+        if launch["returncode"] == 0:
+            lifecycle_transition = apply_spawn_lifecycle_transition(
+                conn,
+                run_id=run["id"],
+                role=args.role,
+                baton_id=args.baton,
+                actor=args.actor,
+                session_id=session_id,
+            )
         conn.commit()
         if not args.no_event:
             emit_event(
@@ -2265,6 +2860,7 @@ def cmd_agent_spawn(args: argparse.Namespace) -> int:
         result.update(launch)
         result["control_mode"] = "claude_bg"
         result["control_ref"] = control_ref
+        result["lifecycle_transition_recorded"] = lifecycle_transition
         print_json(result)
         return int(launch["returncode"])
 
@@ -2278,6 +2874,15 @@ def cmd_agent_spawn(args: argparse.Namespace) -> int:
         packet_path=packet_path,
         command=command,
         timeout_seconds=timeout_seconds,
+        metadata={"permission_profile": permission_report},
+    )
+    lifecycle_transition = apply_spawn_lifecycle_transition(
+        conn,
+        run_id=run["id"],
+        role=args.role,
+        baton_id=args.baton,
+        actor=args.actor,
+        session_id=session_id,
     )
     conn.commit()
 
@@ -2310,6 +2915,7 @@ def cmd_agent_spawn(args: argparse.Namespace) -> int:
         output_limit=output_limit,
     )
     result.update(execution)
+    result["lifecycle_transition_recorded"] = lifecycle_transition
     update_agent_session_record(conn, session_id=session_id, execution=execution, output_limit=output_limit)
     conn.commit()
 
@@ -2592,6 +3198,189 @@ def cmd_agent_session_stop(args: argparse.Namespace) -> int:
     return int(execution["returncode"])
 
 
+def message_where_clauses(args: argparse.Namespace, run_id: str) -> tuple[list[str], list[Any]]:
+    where = ["run_id = ?"]
+    params: list[Any] = [run_id]
+    if getattr(args, "target_type", ""):
+        where.append("target_type = ?")
+        params.append(args.target_type)
+    if getattr(args, "target_id", ""):
+        where.append("target_id = ?")
+        params.append(args.target_id)
+    if getattr(args, "baton", None):
+        where.append("baton_id = ?")
+        params.append(args.baton)
+    statuses = csv_values(getattr(args, "status", []))
+    if statuses:
+        invalid = sorted(set(statuses) - CONTROL_MESSAGE_STATUSES)
+        if invalid:
+            raise FactoryError(f"Invalid message status: {', '.join(invalid)}")
+        where.append(f"status IN ({','.join('?' for _ in statuses)})")
+        params.extend(statuses)
+    return where, params
+
+
+def collect_message_rows(conn: sqlite3.Connection, args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
+    recent = require_limit(args.recent, field="recent")
+    where, params = message_where_clauses(args, run_id)
+    params.append(recent)
+    rows = list(
+        conn.execute(
+            f"""
+            SELECT *
+            FROM control_messages
+            WHERE {' AND '.join(where)}
+            ORDER BY created_at ASC, id ASC
+            LIMIT ?
+            """,
+            params,
+        )
+    )
+    return [row for row in (control_message_public(row) for row in rows) if row is not None]
+
+
+def claim_messages(
+    conn: sqlite3.Connection,
+    *,
+    messages: list[dict[str, Any]],
+    actor: str,
+    target_status: str,
+) -> int:
+    if target_status not in {"read", "handling"}:
+        raise FactoryError("--claim-status must be read or handling.")
+    now = utc_now()
+    updated = 0
+    for message in messages:
+        if message.get("status") not in CONTROL_MESSAGE_ACTIVE_STATUSES:
+            continue
+        conn.execute(
+            """
+            UPDATE control_messages
+            SET status = ?, updated_at = ?, claimed_at = COALESCE(claimed_at, ?), claimed_by = ?
+            WHERE id = ?
+            """,
+            (target_status, now, now, actor, message["id"]),
+        )
+        emit_event(
+            conn,
+            event_type="control_message.claimed",
+            actor=actor,
+            run_id=message["run_id"],
+            baton_id=message.get("baton_id"),
+            summary=f"{message['public_id']} claimed as {target_status}",
+            payload={
+                "message_id": message["public_id"],
+                "target_type": message["target_type"],
+                "target_id": message["target_id"],
+                "status": target_status,
+            },
+        )
+        updated += 1
+    return updated
+
+
+def cmd_messages_list(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    conn = connect(root, args.db)
+    run = require_run(conn)
+    messages = collect_message_rows(conn, args, run["id"])
+    if args.json:
+        print_json({"count": len(messages), "messages": messages})
+    else:
+        print_table(
+            messages,
+            [
+                ("public_id", "Message"),
+                ("status", "Status"),
+                ("target_type", "Target"),
+                ("target_label", "Label"),
+                ("created_at", "Created"),
+                ("message", "Message"),
+            ],
+            empty="No control messages found.",
+        )
+    return 0
+
+
+def cmd_messages_inbox(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    conn = connect(root, args.db)
+    run = require_run(conn)
+    if not args.status:
+        args.status = sorted(CONTROL_MESSAGE_ACTIVE_STATUSES)
+    messages = collect_message_rows(conn, args, run["id"])
+    claimed = 0
+    if args.claim:
+        claimed = claim_messages(
+            conn,
+            messages=messages,
+            actor=args.actor,
+            target_status=args.claim_status,
+        )
+        conn.commit()
+        messages = collect_message_rows(conn, args, run["id"])
+    payload = {"count": len(messages), "claimed": claimed, "messages": messages}
+    if args.json:
+        print_json(payload)
+    else:
+        if claimed:
+            print(f"Claimed {claimed} message(s).")
+        print_table(
+            messages,
+            [
+                ("public_id", "Message"),
+                ("status", "Status"),
+                ("target_type", "Target"),
+                ("target_label", "Label"),
+                ("message", "Message"),
+            ],
+            empty="No active messages found.",
+        )
+    return 0
+
+
+def cmd_messages_ack(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    conn = connect(root, args.db)
+    run = require_run(conn)
+    if args.status not in CONTROL_MESSAGE_STATUSES:
+        raise FactoryError(f"--status must be one of {', '.join(sorted(CONTROL_MESSAGE_STATUSES))}")
+    message_id = parse_message_id(args.message_id)
+    message = conn.execute(
+        "SELECT * FROM control_messages WHERE id = ? AND run_id = ?",
+        (message_id, run["id"]),
+    ).fetchone()
+    if message is None:
+        raise FactoryError(f"Unknown message: {args.message_id}")
+    now = utc_now()
+    handled_at = now if args.status in {"handled", "failed", "expired", "cancelled"} else message["handled_at"]
+    conn.execute(
+        """
+        UPDATE control_messages
+        SET status = ?, updated_at = ?, handled_at = ?, summary = COALESCE(NULLIF(?, ''), summary)
+        WHERE id = ?
+        """,
+        (args.status, now, handled_at, args.summary, message_id),
+    )
+    emit_event(
+        conn,
+        event_type="control_message.acknowledged",
+        actor=args.actor,
+        run_id=run["id"],
+        baton_id=message["baton_id"],
+        summary=f"{public_message_id(message_id)} marked {args.status}",
+        payload={
+            "message_id": public_message_id(message_id),
+            "status": args.status,
+            "summary": args.summary,
+        },
+    )
+    conn.commit()
+    updated = conn.execute("SELECT * FROM control_messages WHERE id = ?", (message_id,)).fetchone()
+    print_json({"status": "updated", "message": control_message_public(updated)})
+    return 0
+
+
 def cmd_event_append(args: argparse.Namespace) -> int:
     root = resolve_root(args.root)
     conn = connect(root, args.db)
@@ -2719,7 +3508,19 @@ def cmd_baton_handoff(args: argparse.Namespace) -> int:
     config = config_for_args(root, args)
     conn = connect(root, args.db)
     run = require_run(conn)
-    baton = require_baton(conn, args.baton_id)
+    baton = require_current_baton(conn, run, args.baton_id)
+    if baton["status"] in {"assigned", "active", "patch_required"}:
+        ensure_baton_in_progress(
+            conn,
+            run_id=run["id"],
+            baton_id=args.baton_id,
+            actor=args.owner or args.actor,
+        )
+        baton = require_current_baton(conn, run, args.baton_id)
+    if baton["status"] not in {"in_progress", "handed_off"}:
+        raise FactoryError(
+            f"Cannot hand off baton {args.baton_id} from status {baton['status']}; expected in_progress."
+        )
     lock_name = args.lock_name or config["default_lock_name"]
     files = csv_values(args.files)
     commands = csv_values(args.commands)
@@ -2779,7 +3580,11 @@ def cmd_baton_accept(args: argparse.Namespace) -> int:
     config = config_for_args(root, args)
     conn = connect(root, args.db)
     run = require_run(conn)
-    baton = require_baton(conn, args.baton_id)
+    baton = require_current_baton(conn, run, args.baton_id)
+    if baton["status"] != "ready_for_acceptance" and not args.override:
+        raise FactoryError(
+            f"Cannot accept baton {args.baton_id} from status {baton['status']}; expected ready_for_acceptance or pass --override."
+        )
     lock_name = args.lock_name or config["default_lock_name"]
     now = utc_now()
     conn.execute(
@@ -2893,7 +3698,23 @@ def cmd_review_record(args: argparse.Namespace) -> int:
     root = resolve_root(args.root)
     conn = connect(root, args.db)
     run = require_run(conn)
-    require_baton(conn, args.baton)
+    baton = require_current_baton(conn, run, args.baton)
+    if baton["status"] == "handed_off":
+        transition_baton_status(
+            conn,
+            run_id=run["id"],
+            baton_id=args.baton,
+            new_status="review",
+            actor=args.reviewer or args.actor,
+            event_type="review.started",
+            summary=f"{args.baton} review started",
+            payload={"source": "review_record"},
+            allowed_from={"handed_off"},
+        )
+    elif baton["status"] not in {"review", "ready_for_acceptance", "patch_required"}:
+        raise FactoryError(
+            f"Cannot record review for baton {args.baton} from status {baton['status']}; expected handed_off or review."
+        )
     now = utc_now()
     cur = conn.execute(
         """
@@ -2938,6 +3759,25 @@ def cmd_review_record(args: argparse.Namespace) -> int:
         summary=args.summary or f"Review {args.status}",
         payload={"review_id": review_id, "findings": findings},
     )
+    normalized_status = args.status.strip().lower()
+    if normalized_status in REVIEW_ACCEPTED_STATUSES:
+        ensure_baton_ready_for_acceptance(
+            conn,
+            run_id=run["id"],
+            baton_id=args.baton,
+            actor=args.reviewer or args.actor,
+            review_id=review_id,
+            review_status=args.status,
+        )
+    elif normalized_status in REVIEW_PATCH_REQUIRED_STATUSES:
+        ensure_baton_patch_required(
+            conn,
+            run_id=run["id"],
+            baton_id=args.baton,
+            actor=args.reviewer or args.actor,
+            review_id=review_id,
+            review_status=args.status,
+        )
     conn.commit()
     print_json({"status": "recorded", "review_id": review_id, "findings": len(findings)})
     return 0
@@ -3221,6 +4061,113 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return exit_code
 
 
+def flow_doctor_check(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], int]:
+    run = require_run(conn)
+    findings: list[dict[str, Any]] = []
+    exit_code = 0
+
+    def add(level: str, check: str, message: str, repair: str = "") -> None:
+        nonlocal exit_code
+        findings.append({"level": level, "check": check, "message": message, "repair": repair})
+        if level == "fail":
+            exit_code = 1
+
+    rows = list(
+        conn.execute(
+            """
+            SELECT s.id AS session_id, s.role, s.status AS session_status, b.id AS baton_id, b.status AS baton_status
+            FROM agent_sessions s
+            JOIN batons b ON b.id = s.baton_id
+            WHERE s.run_id = ? AND s.role = 'builder' AND s.status IN ('planned', 'running', 'waiting', 'blocked')
+              AND b.status IN ('assigned', 'active')
+            """,
+            (run["id"],),
+        )
+    )
+    for row in rows:
+        add(
+            "fail",
+            "builder_without_in_progress",
+            f"Builder session {row['session_id']} is active while baton {row['baton_id']} is {row['baton_status']}.",
+            f"factory.py event append --type baton.in_progress --baton {row['baton_id']} --summary 'Recovered missing in_progress'",
+        )
+
+    rows = list(
+        conn.execute(
+            """
+            SELECT s.id AS session_id, b.id AS baton_id, b.status AS baton_status
+            FROM agent_sessions s
+            JOIN batons b ON b.id = s.baton_id
+            WHERE s.run_id = ? AND s.role = 'reviewer' AND s.status IN ('planned', 'running', 'waiting', 'blocked')
+              AND b.status = 'handed_off'
+            """,
+            (run["id"],),
+        )
+    )
+    for row in rows:
+        add(
+            "fail",
+            "reviewer_without_review_state",
+            f"Reviewer session {row['session_id']} is active while baton {row['baton_id']} is still handed_off.",
+            f"factory.py event append --type review.started --baton {row['baton_id']} --summary 'Recovered missing review state'",
+        )
+
+    rows = list(
+        conn.execute(
+            """
+            SELECT r.id AS review_id, r.baton_id, r.status AS review_status, b.status AS baton_status
+            FROM reviews r
+            JOIN batons b ON b.id = r.baton_id
+            WHERE b.run_id = ? AND lower(r.status) IN ('accepted', 'approved', 'pass', 'passed', 'clean')
+              AND b.status NOT IN ('ready_for_acceptance', 'accepted')
+            """,
+            (run["id"],),
+        )
+    )
+    for row in rows:
+        add(
+            "fail",
+            "accepted_review_not_ready",
+            f"Review {row['review_id']} accepted baton {row['baton_id']}, but baton status is {row['baton_status']}.",
+            f"factory.py baton accept {row['baton_id']} after moving to ready_for_acceptance",
+        )
+
+    queued = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM control_messages
+        WHERE run_id = ? AND status IN ('queued', 'delivered', 'read', 'handling')
+        """,
+        (run["id"],),
+    ).fetchone()["count"]
+    if queued:
+        add(
+            "warn",
+            "active_control_messages",
+            f"{queued} control message(s) are not handled.",
+            "factory.py messages inbox --claim --json",
+        )
+    else:
+        add("ok", "active_control_messages", "No active control messages.")
+
+    if not any(finding["level"] == "fail" for finding in findings):
+        add("ok", "lifecycle", "No lifecycle violations detected.")
+    return findings, exit_code
+
+
+def cmd_flow_doctor(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    conn = connect(root, args.db)
+    findings, exit_code = flow_doctor_check(conn)
+    if args.json:
+        print_json({"status": "fail" if exit_code else "ok", "findings": findings})
+    else:
+        for finding in findings:
+            repair = f" repair={finding['repair']}" if finding.get("repair") else ""
+            print(f"[{finding['level']}] {finding['check']}: {finding['message']}{repair}")
+    return exit_code
+
+
 def topology_operator_specs(run: sqlite3.Row) -> list[dict[str, Any]]:
     metadata = run_metadata(run)
     topology = str(run["topology"] or "").strip()
@@ -3438,24 +4385,28 @@ def record_operator_message(
         "operator_id": operator_id,
         "role": operator["role"],
         "name": operator["name"],
-        "message": text,
-        "delivery": "recorded_only",
-        "control_mode": "operator_event",
     }
     now = utc_now()
-    emit_event(
+    message_row = record_control_message(
         conn,
+        run_id=run_id,
+        baton_id=None,
+        target_type="operator",
+        target_id=operator_id,
+        target_label=str(operator["role"] or operator["name"] or "Operator"),
         event_type="operator.message.requested",
         actor=actor or "Dashboard",
-        run_id=run_id,
-        summary=f"{operator['role']}: {shorten(text, 100)}",
+        message=text,
+        delivery="recorded_only",
+        control_mode="operator_event",
         payload=payload,
+        summary=f"{operator['role']}: {shorten(text, 100)}",
     )
     conn.execute(
         "UPDATE actors SET updated_at = ?, status = ? WHERE id = ?",
         (now, "messaged", int(operator_id)),
     )
-    return payload
+    return message_row
 
 
 def record_baton_message(
@@ -3477,20 +4428,22 @@ def record_baton_message(
     payload = {
         "baton_id": baton_id,
         "owner": baton["owner"],
-        "message": text,
-        "delivery": "recorded_only",
-        "control_mode": "baton_event",
     }
-    emit_event(
+    return record_control_message(
         conn,
-        event_type="baton.message.requested",
-        actor=actor or "Dashboard",
         run_id=run_id,
         baton_id=baton_id,
-        summary=f"{baton_id}: {shorten(text, 100)}",
+        target_type="baton",
+        target_id=baton_id,
+        target_label=f"{baton['owner'] or 'Baton owner'} · {baton_id}",
+        event_type="baton.message.requested",
+        actor=actor or "Dashboard",
+        message=text,
+        delivery="recorded_only",
+        control_mode="baton_event",
         payload=payload,
+        summary=f"{baton_id}: {shorten(text, 100)}",
     )
-    return payload
 
 
 def collect_agent_sessions(conn: sqlite3.Connection, run_id: str, recent: int) -> list[dict[str, Any]]:
@@ -3588,62 +4541,31 @@ def collect_baton_workers(batons: list[dict[str, Any]], sessions: list[dict[str,
     return workers
 
 
-def control_message_from_event(event: dict[str, Any]) -> dict[str, Any]:
-    event_type = str(event.get("event_type") or "")
-    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-    payload = payload if isinstance(payload, dict) else {}
-    target_type = "factory"
-    target_id = ""
-    target_label = "Factory"
-    if event_type == "operator.message.requested":
-        target_type = "operator"
-        target_id = str(payload.get("operator_id") or "")
-        target_label = str(payload.get("role") or payload.get("name") or "Operator")
-    elif event_type == "agent.message.requested":
-        target_type = "session"
-        target_id = str(payload.get("session_id") or "")
-        target_label = target_id or "Agent session"
-    elif event_type == "baton.message.requested":
-        target_type = "baton"
-        target_id = str(payload.get("baton_id") or event.get("baton_id") or "")
-        owner = str(payload.get("owner") or "Baton owner")
-        target_label = f"{owner} · {target_id}" if target_id else owner
-    return {
-        "id": event.get("id"),
-        "occurred_at": event.get("occurred_at"),
-        "actor": event.get("actor"),
-        "event_type": event_type,
-        "target_type": target_type,
-        "target_id": target_id,
-        "target_label": target_label,
-        "baton_id": event.get("baton_id") or payload.get("baton_id"),
-        "message": payload.get("message") or event.get("summary") or "",
-        "delivery": payload.get("delivery") or "recorded_only",
-        "control_mode": payload.get("control_mode") or "event",
-        "status": "queued",
-    }
-
-
 def collect_control_messages(conn: sqlite3.Connection, run_id: str, recent: int) -> list[dict[str, Any]]:
-    placeholders = ",".join("?" for _ in CONTROL_MESSAGE_EVENT_TYPES)
     rows = [
         row
         for row in (
             row_to_public_dict(row)
             for row in conn.execute(
-                f"""
+                """
                 SELECT *
-                FROM events
-                WHERE run_id = ? AND event_type IN ({placeholders})
-                ORDER BY occurred_at DESC, id DESC
+                FROM control_messages
+                WHERE run_id = ?
+                ORDER BY created_at DESC, id DESC
                 LIMIT ?
                 """,
-                (run_id, *sorted(CONTROL_MESSAGE_EVENT_TYPES), recent),
+                (run_id, recent),
             )
         )
         if row is not None
     ]
-    return [control_message_from_event(row) for row in rows]
+    messages: list[dict[str, Any]] = []
+    for row in rows:
+        public = row
+        public["public_id"] = public_message_id(public["id"])
+        public["occurred_at"] = public.get("created_at")
+        messages.append(public)
+    return messages
 
 
 def collect_recent_verification(conn: sqlite3.Connection, run_id: str, recent: int) -> list[dict[str, Any]]:
@@ -3706,6 +4628,7 @@ def collect_dashboard_metrics(
         "recent_events": len(events),
         "workers": len(workers),
         "control_messages": len(control_messages),
+        "active_control_messages": sum(1 for row in control_messages if row.get("status") in CONTROL_MESSAGE_ACTIVE_STATUSES),
         "queued_control_messages": sum(1 for row in control_messages if row.get("status") == "queued"),
     }
 
@@ -3832,20 +4755,25 @@ def record_agent_session_message(
     session = require_agent_session(conn, run_id, session_id)
     payload = {
         "session_id": session_id,
-        "message": text,
-        "delivery": "recorded_only",
         "control_mode": session["control_mode"],
         "control_ref": session["control_ref"],
     }
     now = utc_now()
-    emit_event(
+    message_row = record_control_message(
         conn,
-        event_type="agent.message.requested",
-        actor=actor or "Dashboard",
         run_id=run_id,
         baton_id=session["baton_id"],
-        summary=shorten(text, 120),
+        target_type="session",
+        target_id=session_id,
+        target_label=session["label"] or session_id,
+        event_type="agent.message.requested",
+        actor=actor or "Dashboard",
+        message=text,
+        delivery="recorded_only",
+        control_mode=session["control_mode"],
+        control_ref=session["control_ref"],
         payload=payload,
+        summary=shorten(text, 120),
     )
     conn.execute(
         """
@@ -3855,7 +4783,7 @@ def record_agent_session_message(
         """,
         (now, "Dashboard message requested", session_id),
     )
-    return payload
+    return message_row
 
 
 def cmd_dashboard_snapshot(args: argparse.Namespace) -> int:
@@ -3863,6 +4791,55 @@ def cmd_dashboard_snapshot(args: argparse.Namespace) -> int:
     conn = connect(root, args.db)
     snapshot = collect_dashboard_snapshot(conn, root, args.db, args.recent)
     print_json(snapshot)
+    return 0
+
+
+def dashboard_registry_status(root: Path) -> dict[str, Any]:
+    payload = read_dashboard_registry(root)
+    if not payload:
+        return {"registered": False, "running": False, "registry": str(dashboard_registry_path(root))}
+    pid = int(payload.get("pid") or 0)
+    running = process_is_running(pid)
+    return {"registered": True, "running": running, "registry": str(dashboard_registry_path(root)), **payload}
+
+
+def cmd_dashboard_status(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    payload = dashboard_registry_status(root)
+    if args.json:
+        print_json(payload)
+    else:
+        print(f"Registered: {payload['registered']}")
+        print(f"Running: {payload['running']}")
+        if payload.get("url"):
+            print(f"Dashboard: {payload['url']}")
+        if payload.get("pid"):
+            print(f"PID: {payload['pid']}")
+        print(f"Registry: {payload['registry']}")
+    return 0 if payload.get("running") or not args.require_running else 1
+
+
+def cmd_dashboard_stop(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    payload = dashboard_registry_status(root)
+    if not payload.get("registered"):
+        print_json({"status": "not_registered", "registry": payload["registry"]})
+        return 0
+    pid = int(payload.get("pid") or 0)
+    if payload.get("running"):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError as exc:
+            raise FactoryError(f"Unable to stop dashboard process {pid}: {exc}") from exc
+        stopped = True
+    else:
+        stopped = False
+    if args.clean:
+        try:
+            dashboard_registry_path(root).unlink()
+        except FileNotFoundError:
+            pass
+    print_json({"status": "stopped" if stopped else "not_running", "pid": pid, "cleaned": args.clean})
     return 0
 
 
@@ -3906,6 +4883,61 @@ def resolve_dashboard_port(host: str, requested_port: int | None) -> int:
 def dashboard_url(host: str, port: int, token: str) -> str:
     display_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
     return f"http://{display_host}:{port}/?token={token}"
+
+
+def dashboard_registry_path(root: Path) -> Path:
+    return root / DEFAULT_DB_DIR / "dashboard.json"
+
+
+def process_is_running(pid: int) -> bool:
+    if pid < 1:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def read_dashboard_registry(root: Path) -> dict[str, Any]:
+    path = dashboard_registry_path(root)
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def write_dashboard_registry(
+    *,
+    root: Path,
+    run_id: str | None,
+    db: str | None,
+    host: str,
+    port: int,
+    token: str,
+    url: str,
+    pid: int,
+    control_enabled: bool,
+) -> None:
+    path = dashboard_registry_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "pid": pid,
+        "host": host,
+        "port": port,
+        "token": token,
+        "url": url,
+        "root": str(root),
+        "db": str(db_path_for(root, db)),
+        "run_id": run_id or "",
+        "control_enabled": control_enabled,
+        "started_at": utc_now(),
+        "last_seen_at": utc_now(),
+    }
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def wait_for_dashboard_port(host: str, port: int, proc: subprocess.Popen[Any], timeout_seconds: float = 5.0) -> None:
@@ -4033,6 +5065,17 @@ def cmd_dashboard_serve(args: argparse.Namespace) -> int:
         source="dashboard serve",
     )
     conn.commit()
+    write_dashboard_registry(
+        root=root,
+        run_id=run["id"] if run is not None else None,
+        db=args.db,
+        host=args.host,
+        port=port,
+        token=token,
+        url=url,
+        pid=os.getpid(),
+        control_enabled=control_enabled,
+    )
     print(f"Agentic Factory dashboard: {url}")
     print(f"Project root: {root}")
     print(f"Control actions: {'enabled' if control_enabled else 'read-only'}")
@@ -4202,6 +5245,17 @@ def cmd_up(args: argparse.Namespace) -> int:
         conn.commit()
         conn.close()
         payload["dashboard_pid"] = proc.pid
+        write_dashboard_registry(
+            root=root,
+            run_id=run["id"],
+            db=args.db,
+            host=args.host,
+            port=port,
+            token=token,
+            url=url,
+            pid=proc.pid,
+            control_enabled=control_enabled,
+        )
         payload["message"] = (
             "Factory floor is ready and the dashboard server is running in the background. "
             "Present this URL to the user and wait for readiness before assigning work."
@@ -4236,6 +5290,17 @@ def cmd_up(args: argparse.Namespace) -> int:
     )
     conn.commit()
 
+    write_dashboard_registry(
+        root=root,
+        run_id=run["id"],
+        db=args.db,
+        host=args.host,
+        port=port,
+        token=token,
+        url=url,
+        pid=os.getpid(),
+        control_enabled=control_enabled,
+    )
     print("Factory floor is ready.")
     print(f"Dashboard: {url}")
     print(f"Run ID: {run['id']}")
@@ -4328,6 +5393,14 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard_snapshot = dashboard_sub.add_parser("snapshot", help="Print the dashboard read model as JSON.")
     dashboard_snapshot.add_argument("--recent", type=int, default=50)
     dashboard_snapshot.set_defaults(func=cmd_dashboard_snapshot)
+    dashboard_status = dashboard_sub.add_parser("status", help="Show the registered dashboard process.")
+    dashboard_status.add_argument("--json", action="store_true")
+    dashboard_status.add_argument("--require-running", action="store_true")
+    dashboard_status.set_defaults(func=cmd_dashboard_status)
+    dashboard_stop = dashboard_sub.add_parser("stop", help="Stop the registered dashboard process.")
+    dashboard_stop.add_argument("--clean", action="store_true", default=True, help="Remove the dashboard registry after stopping.")
+    dashboard_stop.add_argument("--keep-registry", dest="clean", action="store_false")
+    dashboard_stop.set_defaults(func=cmd_dashboard_stop)
     dashboard_serve = dashboard_sub.add_parser("serve", help="Serve the local dashboard UI.")
     dashboard_serve.add_argument("--host", default="127.0.0.1")
     dashboard_serve.add_argument("--port", type=int, default=None, help=f"Dashboard port; defaults to first free port from {DEFAULT_DASHBOARD_PORT}.")
@@ -4350,6 +5423,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     agent = subparsers.add_parser("agent", help="Generate packets and manage spawned agent sessions.")
     agent_sub = agent.add_subparsers(dest="agent_command", required=True)
+    agent_adapter = agent_sub.add_parser("adapter", help="Inspect adapter capabilities.")
+    agent_adapter_sub = agent_adapter.add_subparsers(dest="agent_adapter_command", required=True)
+    agent_adapter_list = agent_adapter_sub.add_parser("list", help="List supported adapters and capabilities.")
+    agent_adapter_list.add_argument("--json", action="store_true")
+    agent_adapter_list.set_defaults(func=cmd_agent_adapter_list)
+    agent_adapter_doctor = agent_adapter_sub.add_parser("doctor", help="Check whether an adapter is locally available.")
+    agent_adapter_doctor.add_argument("--adapter", required=True, choices=sorted(AGENT_SPAWN_ADAPTERS))
+    agent_adapter_doctor.add_argument("--claude-bin", default="claude")
+    agent_adapter_doctor.add_argument("--codex-bin", default="codex")
+    agent_adapter_doctor.add_argument("--json", action="store_true")
+    agent_adapter_doctor.set_defaults(func=cmd_agent_adapter_doctor)
+
+    agent_permissions = agent_sub.add_parser("permissions", help="Inspect adapter-neutral permission profiles.")
+    agent_permissions_sub = agent_permissions.add_subparsers(dest="agent_permissions_command", required=True)
+    agent_permissions_list = agent_permissions_sub.add_parser("list", help="List permission profiles.")
+    agent_permissions_list.add_argument("--json", action="store_true")
+    agent_permissions_list.set_defaults(func=cmd_agent_permissions_list)
+    agent_permissions_plan = agent_permissions_sub.add_parser("plan", help="Show how an adapter translates a permission profile.")
+    agent_permissions_plan.add_argument("--adapter", required=True, choices=sorted(AGENT_SPAWN_ADAPTERS))
+    agent_permissions_plan.add_argument("--profile", required=True, choices=sorted(PERMISSION_PROFILE_NAMES))
+    agent_permissions_plan.set_defaults(func=cmd_agent_permissions_plan)
+
     agent_packet = agent_sub.add_parser("packet", help="Generate a role packet for delegation.")
     agent_packet.add_argument("--role", required=True, choices=sorted(AGENT_PACKET_ROLES))
     agent_packet.add_argument("--baton", default=None)
@@ -4361,6 +5456,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="agent_cli_subagents",
     )
     agent_packet.add_argument("--write-policy", choices=sorted(AGENT_PACKET_WRITE_POLICIES), default="auto")
+    agent_packet.add_argument("--permission-profile", choices=sorted(PERMISSION_PROFILE_NAMES), default="")
     agent_packet.add_argument("--allowed", action="append", default=[], help="Allowed file or area; repeat or comma-separate.")
     agent_packet.add_argument(
         "--restricted",
@@ -4405,6 +5501,7 @@ def build_parser() -> argparse.ArgumentParser:
     agent_spawn.add_argument("--allow-unlocked", action="store_true", help="Allow write-capable spawn without a held baton lock.")
     agent_spawn.add_argument("--no-event", action="store_true", help="Do not record agent.spawn events.")
     agent_spawn.add_argument("--actor", default="Executive")
+    agent_spawn.add_argument("--permission-profile", choices=sorted(PERMISSION_PROFILE_NAMES), default="")
     agent_spawn.add_argument("--codex-bin", default="codex")
     agent_spawn.add_argument("--codex-model", default="")
     agent_spawn.add_argument("--codex-profile", default="")
@@ -4417,6 +5514,8 @@ def build_parser() -> argparse.ArgumentParser:
     agent_spawn.add_argument("--claude-model", default="")
     agent_spawn.add_argument("--claude-agent", default="", help="Claude Code subagent name to run as the session's main agent.")
     agent_spawn.add_argument("--claude-permission-mode", default="", help="Optional Claude Code permission mode.")
+    agent_spawn.add_argument("--claude-allowed-tool", action="append", default=[], help="Additional Claude Code allowedTools entry.")
+    agent_spawn.add_argument("--claude-disallowed-tool", action="append", default=[], help="Additional Claude Code disallowedTools entry.")
     agent_spawn.add_argument(
         "--claude-worktree",
         nargs="?",
@@ -4485,6 +5584,40 @@ def build_parser() -> argparse.ArgumentParser:
     agent_session_stop.add_argument("--actor", default="Executive")
     agent_session_stop.set_defaults(func=cmd_agent_session_stop)
 
+    messages = subparsers.add_parser("messages", help="Inspect and acknowledge dashboard/control messages.")
+    messages_sub = messages.add_subparsers(dest="messages_command", required=True)
+    messages_list = messages_sub.add_parser("list", help="List control messages.")
+    messages_list.add_argument("--recent", type=int, default=DEFAULT_LIST_LIMIT)
+    messages_list.add_argument("--target-type", choices=["operator", "session", "baton"], default="")
+    messages_list.add_argument("--target-id", default="")
+    messages_list.add_argument("--baton", default=None)
+    messages_list.add_argument("--status", action="append", default=[], help="Filter by status; repeat or comma-separate.")
+    messages_list.add_argument("--json", action="store_true")
+    messages_list.set_defaults(func=cmd_messages_list)
+    messages_inbox = messages_sub.add_parser("inbox", help="List active messages and optionally claim them.")
+    messages_inbox.add_argument("--recent", type=int, default=DEFAULT_LIST_LIMIT)
+    messages_inbox.add_argument("--target-type", choices=["operator", "session", "baton"], default="")
+    messages_inbox.add_argument("--target-id", default="")
+    messages_inbox.add_argument("--baton", default=None)
+    messages_inbox.add_argument("--status", action="append", default=[])
+    messages_inbox.add_argument("--claim", action="store_true", help="Mark returned active messages as read or handling.")
+    messages_inbox.add_argument("--claim-status", choices=["read", "handling"], default="handling")
+    messages_inbox.add_argument("--actor", default="Agent")
+    messages_inbox.add_argument("--json", action="store_true")
+    messages_inbox.set_defaults(func=cmd_messages_inbox)
+    messages_ack = messages_sub.add_parser("ack", help="Acknowledge one control message.")
+    messages_ack.add_argument("message_id")
+    messages_ack.add_argument("--status", required=True, choices=sorted(CONTROL_MESSAGE_STATUSES))
+    messages_ack.add_argument("--summary", default="")
+    messages_ack.add_argument("--actor", default="Agent")
+    messages_ack.set_defaults(func=cmd_messages_ack)
+
+    flow = subparsers.add_parser("flow", help="Inspect guarded factory lifecycle state.")
+    flow_sub = flow.add_subparsers(dest="flow_command", required=True)
+    flow_doctor = flow_sub.add_parser("doctor", help="Check baton/session/message lifecycle integrity.")
+    flow_doctor.add_argument("--json", action="store_true")
+    flow_doctor.set_defaults(func=cmd_flow_doctor)
+
     event = subparsers.add_parser("event", help="Record a raw event.")
     event_sub = event.add_subparsers(dest="event_command", required=True)
     event_append = event_sub.add_parser("append", help="Append a structured event.")
@@ -4550,6 +5683,7 @@ def build_parser() -> argparse.ArgumentParser:
     baton_accept.add_argument("--pushed-status", default="unknown")
     baton_accept.add_argument("--summary", default="")
     baton_accept.add_argument("--actor", default="Executive")
+    baton_accept.add_argument("--override", action="store_true", help="Accept even if the baton is not ready_for_acceptance.")
     baton_accept.add_argument("--release-lock", action="store_true", default=True)
     baton_accept.add_argument("--keep-lock", dest="release_lock", action="store_false")
     baton_accept.add_argument("--lock-name", default=None)

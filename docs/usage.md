@@ -144,6 +144,15 @@ Adapters are optional session/process bridges for runtimes that need to launch
 an external agent CLI with a packet file. Prefer Codex-native orchestration
 when available.
 
+Inspect adapter capabilities and permission translation before spawning:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py agent adapter list --json
+python3 /path/to/agentic-factory/scripts/factory.py agent permissions plan \
+  --adapter claude-code \
+  --profile node-builder
+```
+
 Claude Code background session:
 
 ```bash
@@ -151,8 +160,13 @@ python3 /path/to/agentic-factory/scripts/factory.py agent spawn \
   --adapter claude-code \
   --role builder \
   --baton B-001 \
+  --permission-profile node-builder \
   --experimental
 ```
+
+Successful Builder spawns move the baton to `in_progress`. Successful Reviewer
+spawns move a handed-off baton to `review`. These lifecycle transitions are
+core factory state, not optional lead-agent bookkeeping.
 
 Refresh and inspect sessions:
 
@@ -210,20 +224,33 @@ python3 /path/to/agentic-factory/scripts/factory.py dashboard serve \
 ```
 
 For process adapters and Claude Code background sessions, dashboard session
-messages are recorded as `agent.message.requested` events. Operator
-command-seat messages are recorded as `operator.message.requested` events.
-Selected baton messages are recorded as `baton.message.requested` events. They
-are not live terminal input. Attach to a live Claude session when direct
-conversation is needed.
+messages are durable control-message rows. Compatibility events are also
+emitted, but the message state lives in the DB as `queued`, `read`,
+`handling`, `handled`, or another explicit status. Attach to a live Claude
+session when direct conversation is needed.
 
 In agent CLI workflows, the lead agent should inspect new dashboard control
-events before creating batons, accepting work, or continuing after handoffs:
+messages before creating batons, accepting work, or continuing after handoffs:
 
 ```bash
-python3 /path/to/agentic-factory/scripts/factory.py events list \
-  --type operator.message.requested \
-  --recent 20 \
+python3 /path/to/agentic-factory/scripts/factory.py messages inbox \
+  --claim \
+  --actor "Lead Agent" \
   --json
+```
+
+After handling a message:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py messages ack M-0001 \
+  --status handled \
+  --summary "Handled during checkpoint"
+```
+
+Run lifecycle integrity checks:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py flow doctor --json
 ```
 
 For automation without the web server:

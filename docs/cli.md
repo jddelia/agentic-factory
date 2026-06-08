@@ -19,18 +19,20 @@ The CLI is local-first and stdlib-only. It does not execute shell input from com
 
 ```text
 usage: factory.py [-h] [--root ROOT] [--db DB] [--config CONFIG]
-                  {config,init,up,status,dashboard,agent,event,baton,verify,review,pause,resume,lock,events,verification,render-ledger,doctor} ...
+                  {config,init,up,status,dashboard,agent,messages,flow,event,baton,verify,review,pause,resume,lock,events,verification,render-ledger,doctor} ...
 
 SQLite-backed software factory CLI.
 
 positional arguments:
-  {config,init,up,status,dashboard,agent,event,baton,verify,review,pause,resume,lock,events,verification,render-ledger,doctor}
+  {config,init,up,status,dashboard,agent,messages,flow,event,baton,verify,review,pause,resume,lock,events,verification,render-ledger,doctor}
     config              Create or show project config.
     init                Initialize a factory DB.
     up                  Initialize the factory floor and serve the local dashboard.
     status              Show current factory state.
     dashboard           Inspect or serve the local factory dashboard.
     agent               Generate packets and manage spawned agent sessions.
+    messages            Inspect and acknowledge dashboard/control messages.
+    flow                Inspect guarded factory lifecycle state.
     event               Record a raw event.
     baton               Create, hand off, or accept batons.
     verify              Record verification commands.
@@ -276,15 +278,17 @@ Common failures:
 ## `factory.py dashboard`
 
 ```text
-usage: factory.py dashboard [-h] {snapshot,serve} ...
+usage: factory.py dashboard [-h] {snapshot,status,stop,serve} ...
 
 positional arguments:
-  {snapshot,serve}
-    snapshot        Print the dashboard read model as JSON.
-    serve           Serve the local dashboard UI.
+  {snapshot,status,stop,serve}
+    snapshot            Print the dashboard read model as JSON.
+    status              Show the registered dashboard process.
+    stop                Stop the registered dashboard process.
+    serve               Serve the local dashboard UI.
 
 options:
-  -h, --help        show this help message and exit
+  -h, --help            show this help message and exit
 ```
 
 ## `factory.py dashboard snapshot`
@@ -365,10 +369,12 @@ Common failures:
 ## `factory.py agent`
 
 ```text
-usage: factory.py agent [-h] {packet,spawn,session} ...
+usage: factory.py agent [-h] {adapter,permissions,packet,spawn,session} ...
 
 positional arguments:
-  {packet,spawn,session}
+  {adapter,permissions,packet,spawn,session}
+    adapter             Inspect adapter capabilities.
+    permissions         Inspect adapter-neutral permission profiles.
     packet              Generate a role packet for delegation.
     spawn               Spawn a packet through a session or process adapter.
     session             Inspect and control spawned agent sessions.
@@ -383,9 +389,11 @@ options:
 usage: factory.py agent packet [-h] --role {builder,executive,reviewer} [--baton BATON]
                                [--recent RECENT] [--format {json,markdown}]
                                [--runtime-mode {adapter_spawn,agent_cli_subagents,codex_native,manual_protocol,serial_single_agent}]
-                               [--write-policy {auto,read-only,write}] [--allowed ALLOWED]
-                               [--restricted RESTRICTED] [--invariant INVARIANT]
-                               [--required-check REQUIRED_CHECK] [--non-goal NON_GOAL]
+                               [--write-policy {auto,read-only,write}]
+                               [--permission-profile {node-builder,node-reviewer,read-only,workspace-builder}]
+                               [--allowed ALLOWED] [--restricted RESTRICTED]
+                               [--invariant INVARIANT] [--required-check REQUIRED_CHECK]
+                               [--non-goal NON_GOAL]
 
 options:
   -h, --help            show this help message and exit
@@ -395,6 +403,7 @@ options:
   --format {json,markdown}
   --runtime-mode {adapter_spawn,agent_cli_subagents,codex_native,manual_protocol,serial_single_agent}
   --write-policy {auto,read-only,write}
+  --permission-profile {node-builder,node-reviewer,read-only,workspace-builder}
   --allowed ALLOWED     Allowed file or area; repeat or comma-separate.
   --restricted RESTRICTED
                         Restricted file or area; repeat or comma-separate.
@@ -446,6 +455,7 @@ usage: factory.py agent spawn [-h] --adapter {claude-code,codex-cli,custom} [--e
                               [--non-goal NON_GOAL] [--command COMMAND]
                               [--timeout-seconds TIMEOUT_SECONDS] [--output-limit OUTPUT_LIMIT]
                               [--allow-unlocked] [--no-event] [--actor ACTOR]
+                              [--permission-profile {node-builder,node-reviewer,read-only,workspace-builder}]
                               [--codex-bin CODEX_BIN] [--codex-model CODEX_MODEL]
                               [--codex-profile CODEX_PROFILE]
                               [--codex-sandbox {auto,read-only,workspace-write}]
@@ -453,6 +463,8 @@ usage: factory.py agent spawn [-h] --adapter {claude-code,codex-cli,custom} [--e
                               [--codex-skip-git-repo-check] [--claude-bin CLAUDE_BIN]
                               [--claude-model CLAUDE_MODEL] [--claude-agent CLAUDE_AGENT]
                               [--claude-permission-mode CLAUDE_PERMISSION_MODE]
+                              [--claude-allowed-tool CLAUDE_ALLOWED_TOOL]
+                              [--claude-disallowed-tool CLAUDE_DISALLOWED_TOOL]
                               [--claude-worktree [CLAUDE_WORKTREE]]
                               [--claude-plugin-dir CLAUDE_PLUGIN_DIR] [--claude-no-plugin-dir]
                               [--claude-add-dir CLAUDE_ADD_DIR]
@@ -482,6 +494,7 @@ options:
   --allow-unlocked      Allow write-capable spawn without a held baton lock.
   --no-event            Do not record agent.spawn events.
   --actor ACTOR
+  --permission-profile {node-builder,node-reviewer,read-only,workspace-builder}
   --codex-bin CODEX_BIN
   --codex-model CODEX_MODEL
   --codex-profile CODEX_PROFILE
@@ -494,6 +507,10 @@ options:
                         Claude Code subagent name to run as the session's main agent.
   --claude-permission-mode CLAUDE_PERMISSION_MODE
                         Optional Claude Code permission mode.
+  --claude-allowed-tool CLAUDE_ALLOWED_TOOL
+                        Additional Claude Code allowedTools entry.
+  --claude-disallowed-tool CLAUDE_DISALLOWED_TOOL
+                        Additional Claude Code disallowedTools entry.
   --claude-worktree [CLAUDE_WORKTREE]
                         Start the Claude Code session in an isolated worktree; omit the value for
                         an auto-generated name.
@@ -778,7 +795,7 @@ Common failures:
 ```text
 usage: factory.py baton accept [-h] [--commit COMMIT] [--message MESSAGE]
                                [--pushed-status PUSHED_STATUS] [--summary SUMMARY] [--actor ACTOR]
-                               [--release-lock] [--keep-lock] [--lock-name LOCK_NAME]
+                               [--override] [--release-lock] [--keep-lock] [--lock-name LOCK_NAME]
                                baton_id
 
 positional arguments:
@@ -791,6 +808,7 @@ options:
   --pushed-status PUSHED_STATUS
   --summary SUMMARY
   --actor ACTOR
+  --override            Accept even if the baton is not ready_for_acceptance.
   --release-lock
   --keep-lock
   --lock-name LOCK_NAME

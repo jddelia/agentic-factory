@@ -80,6 +80,7 @@ python3 /path/to/agentic-factory/scripts/factory.py agent spawn \
   --adapter claude-code \
   --role builder \
   --baton B-001 \
+  --permission-profile node-builder \
   --experimental
 ```
 
@@ -100,6 +101,7 @@ Useful options:
 --claude-model sonnet
 --claude-agent builder
 --claude-permission-mode plan
+--permission-profile node-builder
 --claude-worktree
 --claude-worktree feature-baton-001
 --claude-plugin-dir /path/to/another-plugin
@@ -115,6 +117,38 @@ The adapter follows the current Claude Code CLI background-session contract:
 `claude --bg` starts a visible background session, `claude agents --json`
 reports session state, and `claude attach`, `claude logs`, and `claude stop`
 control that session.
+
+## Adapter Capabilities And Permissions
+
+Inspect adapter capabilities:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py agent adapter list --json
+python3 /path/to/agentic-factory/scripts/factory.py agent adapter doctor --adapter claude-code
+```
+
+Permission profiles are adapter-neutral:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py agent permissions list --json
+python3 /path/to/agentic-factory/scripts/factory.py agent permissions plan \
+  --adapter claude-code \
+  --profile node-builder
+```
+
+Current built-in profiles include:
+
+- `read-only`
+- `node-builder`
+- `node-reviewer`
+- `workspace-builder`
+
+Each adapter returns a translation report with `enforced`, `advisory`, and
+`unsupported` fields. Claude Code profiles translate to native permission
+flags such as permission mode, allowed tools, and disallowed tools. Codex CLI
+profiles translate to sandbox/approval choices where possible. Custom adapters
+receive the profile inside the packet, but most fields are advisory unless the
+custom runner enforces them.
 
 ## Codex CLI Adapter
 

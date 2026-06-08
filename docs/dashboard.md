@@ -15,7 +15,7 @@ The dashboard has two layers:
 
 - State layer: reads the existing SQLite database and renders a bounded
   snapshot of runs, top-level operators, batons, sessions, events,
-  verification, reviews, locks, and ledger state.
+  verification, reviews, locks, control messages, and ledger state.
 - Control layer: local endpoints for human control actions. Control is enabled
   by default for the dashboard use case and can be disabled with `--read-only`.
 
@@ -72,6 +72,14 @@ Use `--read-only` when the UI should observe without recording control
 requests. Use `--no-serve` only for tests that intentionally do not need a
 running dashboard server.
 
+`up --background` records the active dashboard process in
+`.agentic-factory/dashboard.json`. Inspect or stop the registered dashboard:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py dashboard status --json
+python3 /path/to/agentic-factory/scripts/factory.py dashboard stop
+```
+
 ## Direct Dashboard Start
 
 From the target project root, after `factory.py init` or `factory.py up`:
@@ -122,6 +130,7 @@ The first dashboard version includes:
 - operator list for Executive, Ledger, Principal Partner, Lead Agent, or Solo
   Operator records;
 - current factory state summary and control queue count;
+- active control message count and message statuses;
 - active factory metrics;
 - baton board grouped by status;
 - selected baton detail with scope, owner, evidence, related events, and baton
@@ -177,11 +186,12 @@ present.
 
 ## Message Controls
 
-When the dashboard is started in control mode, the operator command seat can
-record `operator.message.requested` events, selected batons can record
-`baton.message.requested` events, and session detail panes can record
-`agent.message.requested` events. For process adapters and Claude Code
-background sessions, dashboard message delivery is `recorded_only`.
+When the dashboard is started in control mode, the operator command seat,
+selected batons, and session detail panes create durable `control_messages`
+rows. Compatibility events are still emitted as `operator.message.requested`,
+`baton.message.requested`, or `agent.message.requested`. For process adapters
+and Claude Code background sessions, dashboard message delivery is
+`recorded_only`.
 
 That is intentional. The dashboard does not pretend that a completed or
 noninteractive process can receive live input. For Claude Code background
@@ -189,10 +199,17 @@ sessions, attach to the live session through Claude's own session UI or
 `claude attach <id>` when a true conversation is needed. Future transport
 adapters can upgrade the same control path to direct live delivery.
 
-The dashboard also renders a control inbox from recent message events. In
-generic agent CLI workflows, the lead agent must poll or inspect those control
-events during operation and respond in chat; the browser cannot force a
-separate agent process to answer unless a live transport exists.
+The dashboard renders a control inbox from recent `control_messages`. In
+generic agent CLI workflows, the lead agent or worker should claim and
+acknowledge messages:
+
+```bash
+python3 /path/to/agentic-factory/scripts/factory.py messages inbox --claim --json
+python3 /path/to/agentic-factory/scripts/factory.py messages ack M-0001 --status handled
+```
+
+The browser cannot force a separate agent process to answer unless a live
+transport exists.
 
 ## Security
 

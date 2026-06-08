@@ -42,4 +42,7 @@ logs, and stop commands.
 - Commit `dashboard/dist` so users do not need Node to open the dashboard.
 - Keep SQLite as the durable local state contract.
 - Keep reads bounded, token-gated, and loopback-first.
-- Keep process adapters experimental and opt-in.
+- Keep adapter capabilities explicit and truthful.
+- Keep permission profiles adapter-neutral, with per-adapter enforcement reports.
+- Keep baton lifecycle transitions guarded in core CLI commands.
+- Keep dashboard messages durable with claim and acknowledgement receipts.

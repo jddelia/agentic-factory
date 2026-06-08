@@ -215,6 +215,7 @@ type DashboardSnapshot = {
     recent_events?: number;
     workers?: number;
     control_messages?: number;
+    active_control_messages?: number;
     queued_control_messages?: number;
   };
   batons: Baton[];
@@ -304,10 +305,23 @@ function formatTime(value?: string | null): string {
 
 function statusClass(status?: string | null): string {
   const normalized = (status ?? "").toLowerCase();
-  if (["active", "assigned", "running", "in_progress", "handed_off", "review"].includes(normalized)) {
+  if (
+    [
+      "active",
+      "assigned",
+      "running",
+      "in_progress",
+      "handed_off",
+      "review",
+      "queued",
+      "delivered",
+      "read",
+      "handling",
+    ].includes(normalized)
+  ) {
     return "status active";
   }
-  if (["accepted", "completed", "pass", "ok"].includes(normalized)) return "status good";
+  if (["accepted", "completed", "pass", "ok", "handled", "ready_for_acceptance"].includes(normalized)) return "status good";
   if (["fail", "failed", "rejected", "timed_out"].includes(normalized)) return "status bad";
   if (["blocked", "patch_required", "paused", "not_run"].includes(normalized)) return "status warn";
   return "status";
@@ -375,7 +389,7 @@ function Metrics({ snapshot }: { snapshot: DashboardSnapshot }) {
       value: (metrics.failed_verification ?? 0) + (metrics.blocked_verification ?? 0),
       icon: TriangleAlert,
     },
-    { label: "Control Queue", value: metrics.queued_control_messages ?? 0, icon: Bell },
+    { label: "Active Messages", value: metrics.active_control_messages ?? metrics.queued_control_messages ?? 0, icon: Bell },
   ];
   return (
     <section className="metric-strip" aria-label="Factory metrics">
@@ -395,13 +409,15 @@ function Metrics({ snapshot }: { snapshot: DashboardSnapshot }) {
 function FactoryStatePanel({ snapshot }: { snapshot: DashboardSnapshot }) {
   const run = snapshot.status?.run;
   const activeBaton = snapshot.status?.active_batons?.[0] ?? snapshot.batons.find((baton) =>
-    ["assigned", "active", "in_progress", "handed_off", "review"].includes(baton.status),
+    ["assigned", "active", "in_progress", "handed_off", "review", "patch_required", "ready_for_acceptance"].includes(baton.status),
   );
   const latest = snapshot.events[0] ?? snapshot.status?.latest_event;
-  const queued = snapshot.control_messages.length;
+  const activeMessages = snapshot.control_messages.filter((message) =>
+    ["queued", "delivered", "read", "handling"].includes(message.status),
+  ).length;
   const heldLocks = snapshot.status?.held_locks?.length ?? 0;
-  const nextAction = queued
-    ? "Lead should inspect the dashboard control queue."
+  const nextAction = activeMessages
+    ? "Lead should inspect active dashboard messages."
     : activeBaton
       ? `Continue or review ${activeBaton.id}.`
       : run
@@ -426,8 +442,8 @@ function FactoryStatePanel({ snapshot }: { snapshot: DashboardSnapshot }) {
           <strong>{activeBaton ? `${activeBaton.id} · ${activeBaton.status}` : "none"}</strong>
         </div>
         <div>
-          <span>Control queue</span>
-          <strong>{queued}</strong>
+          <span>Active messages</span>
+          <strong>{activeMessages}</strong>
         </div>
         <div>
           <span>Held locks</span>
@@ -873,7 +889,7 @@ function ControlInbox({ messages }: { messages: ControlMessage[] }) {
       <div className="panel-heading">
         <div>
           <p className="eyebrow">Control Inbox</p>
-          <h2>{messages.length ? `${messages.length} queued requests` : "No queued requests"}</h2>
+          <h2>{messages.length ? `${messages.length} recent messages` : "No control messages"}</h2>
         </div>
         <Bell size={18} strokeWidth={1.8} />
       </div>

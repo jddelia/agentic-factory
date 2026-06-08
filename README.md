@@ -29,6 +29,9 @@ debugging.
 - Agent packet generation for portable Builder, Reviewer, and Executive handoffs
 - Session/process adapter spawning for packet-based external agent CLI delegation
 - Claude Code background-session adapter with sync, logs, and stop commands
+- Adapter-neutral permission profiles with per-adapter translation reports
+- Durable control-message inbox with claim/ack receipts
+- Guarded baton lifecycle transitions and `flow doctor`
 - Dependency-free local dashboard for agent-CLI factory-floor visibility
 - Top-level operator command seat derived from runtime mode and topology
 - Project-local config through `.agentic-factory/config.json`
@@ -55,6 +58,15 @@ Until this repository is published through a Codex plugin directory or
 marketplace, use it as a local plugin source and run the CLI directly from the
 clone. The repo contains the plugin manifest, bundled skill, assets, scripts,
 and validation checks needed for distribution.
+
+## Runtime Maturity
+
+The primary, best-supported experience is Codex app orchestration. The
+non-Codex agent CLI path is under active development: the dashboard, agent
+packets, lifecycle guards, permission profiles, and session adapters are being
+hardened quickly, but adapter behavior can vary by host CLI and may change as
+the runtime contracts mature. Treat non-Codex CLI use as a first-class
+work-in-progress path rather than a finished compatibility layer.
 
 For general Codex plugin and skill concepts, see OpenAI's
 [Plugins and skills overview](https://openai.com/academy/codex-plugins-and-skills/).

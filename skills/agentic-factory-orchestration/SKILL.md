@@ -172,23 +172,26 @@ available.
 
 ## Dashboard Control Loop
 
-In agent-CLI dashboard workflows, dashboard messages are durable control
-events, not guaranteed live terminal input. The lead agent must actively
-consume them.
+In agent-CLI dashboard workflows, dashboard messages are durable
+`control_messages`, not guaranteed live terminal input. The lead agent must
+actively consume and acknowledge them.
 
 Before creating a baton, after every worker handoff, before acceptance, and at
 least once per visible dashboard checkpoint:
 
 ```bash
-python3 <plugin-root>/scripts/factory.py events list --type operator.message.requested --recent 20 --json
-python3 <plugin-root>/scripts/factory.py events list --type baton.message.requested --recent 20 --json
-python3 <plugin-root>/scripts/factory.py events list --type agent.message.requested --recent 20 --json
+python3 <plugin-root>/scripts/factory.py messages inbox --claim --actor "Lead Agent" --json
 ```
 
 If a new dashboard message requests pause, scope change, status, review,
 handoff, or cancellation, respond in chat and record the appropriate factory
-event or baton transition before continuing. Do not silently ignore dashboard
-control events.
+event or baton transition before continuing. Acknowledge handled messages:
+
+```bash
+python3 <plugin-root>/scripts/factory.py messages ack M-0001 --status handled --summary "Handled"
+```
+
+Do not silently ignore dashboard control messages.
 
 ## Capability Preflight
 
@@ -224,7 +227,8 @@ For every delegated worker:
    `factory.py agent packet` when the runtime needs a portable delegation
    prompt.
 3. State whether the worker may edit files, run commands, and record CLI
-   evidence directly.
+   evidence directly. Prefer a named permission profile such as `node-builder`
+   or `node-reviewer` when spawning external sessions.
 4. Require compact handoff output: files, behavior, contracts, commands,
    passing checks, failing checks, skipped checks, risks, and recommendation.
 5. If the worker cannot use the CLI safely, the Executive/Ledger records its
@@ -241,6 +245,7 @@ python3 <plugin-root>/scripts/factory.py agent spawn \
   --adapter claude-code \
   --role builder \
   --baton B-001 \
+  --permission-profile node-builder \
   --experimental
 ```
 
@@ -254,6 +259,17 @@ python3 <plugin-root>/scripts/factory.py agent session logs <session-id>
 Use `--claude-worktree` for isolated write-capable workers only when the merge
 plan is clear. Dashboard messages to Claude sessions are durable DB requests;
 attach to the Claude session for true live conversation.
+
+Run flow integrity checks before acceptance and after recovering from a stalled
+worker:
+
+```bash
+python3 <plugin-root>/scripts/factory.py flow doctor --json
+```
+
+Do not use raw `event append` for normal lifecycle transitions. Builder spawn,
+handoff, reviewer spawn, review record, and accept commands are guarded and
+emit required lifecycle events automatically.
 
 ## Work Modes
 

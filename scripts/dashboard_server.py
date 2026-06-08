@@ -94,8 +94,8 @@ def create_handler(
                         "control_enabled": control_enabled,
                         "live_terminal_supported": False,
                         "control_note": (
-                            "Messages are recorded as factory events unless a future "
-                            "session-backed adapter provides live delivery."
+                            "Messages are recorded in the factory inbox unless an adapter "
+                            "can prove live delivery."
                         ),
                     }
                     self._send_json(payload)
