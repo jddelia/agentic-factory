@@ -7,6 +7,9 @@ stdlib-only Python CLI, a SQLite event store, structured baton state, review and
 verification records, pause/resume checkpoints, doctor checks, and markdown
 ledger rendering.
 
+Software Factory website and topology examples:
+<https://softwarefactoryskill.com/>
+
 The plugin is self-contained. It ships one skill for durable CLI/state
 operations and one skill for full software-factory orchestration. Earlier local
 versions referenced a private `software-factory-v2` skill; this repository does
